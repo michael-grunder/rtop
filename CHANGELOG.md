@@ -2,6 +2,10 @@
 
 ### Added
 
+- Add a Commandstats column picker on `c`, `v`, or `F7`, with the same
+  visibility toggles and reordering controls as overview columns. Keep its
+  column selection and order independently for the current session.
+
 - Add Vim `h`/`j`/`k`/`l` navigation and numeric motion counts across overview,
   detail panes, and pickers. Add `NSpace` range selection and counted vertical
   motion followed by Space within 500 ms to select from the original row.

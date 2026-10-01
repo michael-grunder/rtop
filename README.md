@@ -36,7 +36,7 @@
 - `f` or `/`: edit the overview filter, keeping existing text
 - `t`: cycle Tree / Flat / Primary (overview)
 - `s`: open Sort By to choose from currently visible overview columns
-- `c`: open the overview column picker for toggling and reordering columns
+- `c`: open the column picker for the overview or the active `Commandstats` pane
 - `Space`: toggle selection of the focused overview server
 - `a`: enter one username and password and retry all selected servers
 - `K`: open the kill picker for selected servers; `Enter` chooses the action,
@@ -48,7 +48,7 @@
   close the active overlay window, go back from detail/help, or stop filter editing
 - `h` / `l` or `Left` / `Right`: cycle detail tabs (`Tab` also advances)
 - `S` / `L` / `I` / `C` / `B` / `K`: jump to `Summary` / `Latency` / `Info Raw` / `Commandstats` / `Bigkeys` / `Hotkeys` in detail view
-- `Shift+Up/Down`: reorder columns inside the overview column picker
+- `Shift+Up/Down`: reorder columns inside the column picker
 - `o` / `O`: toggle host rendering (default auto-hides host when all targets share one host)
 - `/`: start filter input in overview, or filter the active detail pane in detail view (`Summary`, `Latency`, `Info Raw`, `Commandstats`, `Bigkeys`, or `Hotkeys`)
 - `C` / `N`: start CPU or NET sampling while the `Hotkeys` tab is open
@@ -64,6 +64,13 @@ and kill pickers. Help remains on `H`, `F1`, and `?`.
 Function keys remain available as aliases: `F1` help, `F5` view mode, `F6`
 Sort By, `F7` columns, `F8` auth, and `F9` kill. `v` also opens columns.
 `F3` starts overview search input; `F4` starts filtering with an empty filter.
+
+In `Commandstats`, use `c`, `v`, or `F7` to choose from `Command`, `Calls`,
+`Usec`, and `Usec/Call`. Use `Up/Down` or `j/k` to select a column,
+`Enter/Space` to toggle it, `Shift+Up/Down` to reorder it, and `Esc/q` to close
+the picker. At least one column stays visible. Choices apply to all servers'
+commandstats for the current session, independently of overview columns.
+Rows remain sorted by calls even when the `Calls` column is hidden.
 
 Prefix a motion with a positive count: `10j` moves down ten rows, `3k` moves
 up three, and `2l` advances two detail tabs. Counts also work with arrow keys;

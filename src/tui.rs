@@ -379,7 +379,9 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, launch: LaunchCon
                 continue;
             }
 
-            if handle_overview_shortcut(&mut app, key) {
+            if handle_commandstats_shortcut(&mut app, key)
+                || handle_overview_shortcut(&mut app, key)
+            {
                 continue;
             }
 
@@ -458,6 +460,26 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, launch: LaunchCon
     }
 
     Ok(())
+}
+
+fn handle_commandstats_shortcut(app: &mut AppState, key: KeyEvent) -> bool {
+    if !is_commandstats_detail(app)
+        || app.commandstats_view.is_filtering
+        || app.overview_modal != OverviewModal::None
+        || app.show_help
+        || key.kind != KeyEventKind::Press
+        || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        || !matches!(
+            key.code,
+            KeyCode::F(7) | KeyCode::Char('c' | 'C' | 'v' | 'V')
+        )
+    {
+        return false;
+    }
+    app.open_column_picker();
+    true
 }
 
 /// Handle overview commands after text inputs and modal dialogs have consumed their keys.
@@ -1222,6 +1244,8 @@ fn draw_commandstats(
     area: Rect,
     stats: &[crate::model::CommandStat],
 ) {
+    use crate::commandstats::CommandstatsColumn;
+
     if stats.is_empty() {
         frame.render_widget(
             Paragraph::new("INFO COMMANDSTATS not available")
@@ -1259,43 +1283,49 @@ fn draw_commandstats(
         .scroll_offset
         .min(visible_stats.len().saturating_sub(page_len.max(1)));
     let end = (start + page_len).min(visible_stats.len());
+    let columns = app.visible_commandstats_columns();
     let rows: Vec<Row<'_>> = visible_stats[start..end]
         .iter()
         .map(|stat| {
-            Row::new(vec![
-                Cell::from(stat.command.clone()),
-                Cell::from(Line::from(format_with_commas(stat.calls)).right_aligned()),
-                Cell::from(Line::from(format_with_commas(stat.usec)).right_aligned()),
-                Cell::from(Line::from(format!("{:.2}", stat.usec_per_call)).right_aligned()),
-            ])
+            Row::new(columns.iter().map(|column| match column {
+                CommandstatsColumn::Command => Cell::from(stat.command.clone()),
+                CommandstatsColumn::Calls => {
+                    Cell::from(Line::from(format_with_commas(stat.calls)).right_aligned())
+                }
+                CommandstatsColumn::Usec => {
+                    Cell::from(Line::from(format_with_commas(stat.usec)).right_aligned())
+                }
+                CommandstatsColumn::UsecPerCall => {
+                    Cell::from(Line::from(format!("{:.2}", stat.usec_per_call)).right_aligned())
+                }
+            }))
         })
         .collect();
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Min(20),
-            Constraint::Length(14),
-            Constraint::Length(14),
-            Constraint::Length(15),
-        ],
-    )
-    .header(
-        Row::new(vec![
-            Cell::from("Command"),
-            Cell::from(Line::from("Calls").right_aligned()),
-            Cell::from(Line::from("Usec").right_aligned()),
-            Cell::from(Line::from("Usec/Call").right_aligned()),
-        ])
-        .style(base_style(app).add_modifier(Modifier::BOLD)),
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(commandstats_title(app, start, end, visible_stats.len()))
-            .style(base_style(app)),
-    )
-    .style(base_style(app))
-    .column_spacing(1);
+    let widths = columns.iter().map(|column| match column {
+        CommandstatsColumn::Command => Constraint::Min(20),
+        CommandstatsColumn::Calls | CommandstatsColumn::Usec => Constraint::Length(14),
+        CommandstatsColumn::UsecPerCall => Constraint::Length(15),
+    });
+    let table = Table::new(rows, widths)
+        .header(
+            Row::new(columns.iter().map(|column| {
+                let header = Line::from(column.header());
+                Cell::from(if *column == CommandstatsColumn::Command {
+                    header
+                } else {
+                    header.right_aligned()
+                })
+            }))
+            .style(base_style(app).add_modifier(Modifier::BOLD)),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(commandstats_title(app, start, end, visible_stats.len()))
+                .style(base_style(app)),
+        )
+        .style(base_style(app))
+        .column_spacing(1);
 
     frame.render_widget(table, area);
 }
@@ -1973,6 +2003,9 @@ fn detail_footer_actions(app: &AppState) -> Line<'static> {
                 .map(|span| span.style(style)),
         );
     }
+    if is_commandstats_detail(app) {
+        spans.push(Span::raw("  [F7]Columns"));
+    }
     Line::from(spans)
 }
 
@@ -1983,7 +2016,10 @@ const fn help_bindings() -> &'static [(&'static str, &'static str)] {
         ("H / F1", "Open full help page"),
         ("t / F5", "Cycle Tree, Flat, and Primary view in overview"),
         ("s / F6", "Choose sort column in overview"),
-        ("c / F7 / v", "Toggle and reorder visible overview columns"),
+        (
+            "c / F7 / v",
+            "Toggle and reorder overview or Commandstats columns",
+        ),
         (
             "a / F8",
             "Enter credentials for selected servers (or the focused server)",
@@ -2140,28 +2176,14 @@ fn draw_column_picker(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState
         height,
     };
     let rows: Vec<Row<'_>> = app
-        .available_overview_columns()
+        .column_picker_entries()
         .iter()
-        .map(|column_key| {
-            let checked = if app.is_column_visible(column_key) {
-                "[x]"
-            } else {
-                "[ ]"
-            };
-            let label = app
-                .column_registry
-                .column(column_key)
-                .map_or_else(|| column_key.clone(), |column| column.header().to_string());
-            let suffix = app
-                .column_auto_hidden_suffix(column_key)
-                .unwrap_or_else(|| {
-                    if column_key == &app.sort_by {
-                        " (sort)"
-                    } else {
-                        ""
-                    }
-                });
-            Row::new(vec![Cell::from(format!("{checked} {label}{suffix}"))])
+        .map(|entry| {
+            let checked = if entry.visible { "[x]" } else { "[ ]" };
+            Row::new(vec![Cell::from(format!(
+                "{checked} {}{}",
+                entry.label, entry.suffix
+            ))])
         })
         .collect();
     let table = Table::new(rows, [Constraint::Percentage(100)])
@@ -2507,8 +2529,9 @@ mod tests {
         background_color, bigkeys_age_title, carat_color, commandstats_page_len,
         compute_column_widths, detail_tab_index_for_shortcut, detail_tabs_widget, draw,
         draw_status_bar, format_aligned_rows, format_with_commas, handle_column_picker_key,
-        handle_overlay_quit_key, handle_overview_shortcut, handle_primary_view_quit_key,
-        help_bindings, is_force_quit_key, ratatui_color_from_cluster, selected_signal_supported,
+        handle_commandstats_shortcut, handle_overlay_quit_key, handle_overview_shortcut,
+        handle_primary_view_quit_key, help_bindings, is_force_quit_key, ratatui_color_from_cluster,
+        selected_signal_supported,
     };
     use crate::app::{ActiveView, AppState, OverviewModal};
     use crate::column::{Align, CellText, Column, RenderCtx, SortCtx, SortKey, WidthHint};
@@ -3498,6 +3521,127 @@ mod tests {
                 .modifier
                 .contains(Modifier::BOLD)
         );
+    }
+
+    #[test]
+    fn commandstats_column_shortcuts_open_only_in_the_active_pane() {
+        let mut app = AppState::new(default_settings(), test_registry());
+        for code in [
+            KeyCode::Char('c'),
+            KeyCode::Char('C'),
+            KeyCode::Char('v'),
+            KeyCode::Char('V'),
+            KeyCode::F(7),
+        ] {
+            app.active_view = ActiveView::Detail;
+            for tab in 0..6 {
+                app.detail_tab = tab;
+                let opened =
+                    handle_commandstats_shortcut(&mut app, KeyEvent::new(code, KeyModifiers::NONE));
+                assert_eq!(opened, tab == 3);
+                if opened {
+                    assert_eq!(app.overview_modal, OverviewModal::ColumnPicker);
+                    assert_eq!(app.column_picker_entries().len(), 4);
+                    assert_eq!(app.column_picker_entries()[0].label, "Command");
+                    app.close_overview_modal();
+                }
+            }
+            app.detail_tab = 3;
+            for view in [ActiveView::Overview, ActiveView::Help] {
+                app.active_view = view;
+                assert!(!handle_commandstats_shortcut(
+                    &mut app,
+                    KeyEvent::new(code, KeyModifiers::NONE)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn commandstats_column_shortcuts_respect_filters_overlays_and_modifiers() {
+        let mut app = AppState::new(default_settings(), test_registry());
+        app.active_view = ActiveView::Detail;
+        app.detail_tab = 3;
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        app.commandstats_view.is_filtering = true;
+        assert!(!handle_commandstats_shortcut(&mut app, key));
+        app.commandstats_view.is_filtering = false;
+        app.show_help = true;
+        assert!(!handle_commandstats_shortcut(&mut app, key));
+        app.show_help = false;
+        app.overview_modal = OverviewModal::ColumnPicker;
+        assert!(!handle_commandstats_shortcut(&mut app, key));
+        app.close_overview_modal();
+        for kind in [KeyEventKind::Release, KeyEventKind::Repeat] {
+            assert!(!handle_commandstats_shortcut(
+                &mut app,
+                KeyEvent::new_with_kind(key.code, key.modifiers, kind)
+            ));
+        }
+        for modifier in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+        ] {
+            assert!(!handle_commandstats_shortcut(
+                &mut app,
+                KeyEvent::new(key.code, modifier)
+            ));
+        }
+        assert_eq!(app.overview_modal, OverviewModal::None);
+    }
+
+    #[test]
+    fn commandstats_picker_renders_checkboxes_and_selected_columns_in_order() {
+        let mut app = AppState::new(default_settings(), test_registry());
+        app.active_view = ActiveView::Detail;
+        app.detail_tab = 3;
+        let mut instance = InstanceState::new("a".into(), "127.0.0.1:6379".into());
+        instance.detail.commandstats = vec![CommandStat {
+            command: "get".into(),
+            calls: 123_456,
+            usec: 987_654,
+            usec_per_call: 7.89,
+        }];
+        app.apply_update(instance);
+        app.open_column_picker();
+        app.move_column_picker_selection(2);
+        handle_column_picker_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        );
+        app.move_column_picker_selection(1);
+        app.move_selected_column(-3);
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("picker draw");
+        let lines = buffer_lines(terminal.backend().buffer());
+        assert!(lines.iter().any(|line| line.contains("[x] Command")));
+        assert!(lines.iter().any(|line| line.contains("[ ] Usec")));
+        assert!(lines.iter().any(|line| line.contains("[x] Usec/Call")));
+
+        handle_column_picker_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.active_view, ActiveView::Detail);
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("table draw");
+        let lines = buffer_lines(terminal.backend().buffer());
+        let header = lines
+            .iter()
+            .find(|line| line.contains("Usec/Call"))
+            .expect("header");
+        assert!(char_column(header, "Usec/Call") < char_column(header, "Command"));
+        assert!(char_column(header, "Command") < char_column(header, "Calls"));
+        let row = lines
+            .iter()
+            .find(|line| line.contains("123,456"))
+            .expect("row");
+        assert!(char_column(row, "7.89") < char_column(row, "get"));
+        assert!(char_column(row, "get") < char_column(row, "123,456"));
+        assert!(!row.contains("987,654"));
+        assert!(lines.iter().any(|line| line.contains("[F7]Columns")));
     }
 
     #[test]

@@ -447,6 +447,35 @@ mod tests {
     }
 
     #[test]
+    fn commandstats_picker_navigation_moves_columns_without_scrolling_or_switching_tabs() {
+        use crate::commandstats::CommandstatsColumn::{Calls, Command, Usec, UsecPerCall};
+
+        let mut app = app();
+        app.active_view = ActiveView::Detail;
+        app.detail_tab = 3;
+        app.open_column_picker();
+        let mut nav = Navigation::default();
+        let now = Instant::now();
+        type_keys(&mut nav, &mut app, "2jkh", now);
+        assert_eq!(app.column_picker_index, 1);
+        assert_eq!(app.detail_tab, 3);
+        assert_eq!(app.commandstats_view.scroll_offset, 0);
+        assert!(nav.handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+            20,
+            now
+        ));
+        assert_eq!(app.column_picker_index, 2);
+        assert_eq!(
+            app.visible_commandstats_columns(),
+            [Command, Usec, Calls, UsecPerCall]
+        );
+        assert_eq!(app.commandstats_view.scroll_offset, 0);
+        assert!(app.column_picker_reorder_mode);
+    }
+
+    #[test]
     fn pickers_accept_counts_without_selecting_servers_or_submitting_actions() {
         for modal in [
             OverviewModal::SortPicker,

@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::column::{Emphasis, EmphasisLifetime, RenderCtx, SortCtx, SortKey};
+use crate::commandstats::CommandstatsColumn;
 use crate::discovery::{DiscoveryEvent, DiscoveryStatus, VerifiedInstance};
 use crate::model::{
     InstanceState, InstanceType, KillAction, RuntimeSettings, SortDirection, ViewMode,
@@ -31,6 +32,18 @@ pub enum OverviewModal {
     KillPicker,
     KillConfirmation,
     AuthForm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnPickerTarget {
+    Overview,
+    Commandstats,
+}
+
+pub struct ColumnPickerEntry {
+    pub label: String,
+    pub visible: bool,
+    pub suffix: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +101,9 @@ pub struct AppState {
     pub kill_target_keys: Vec<String>,
     pub auth_form: Option<AuthFormState>,
     pub column_picker_reorder_mode: bool,
+    column_picker_target: ColumnPickerTarget,
+    commandstats_column_order: Vec<CommandstatsColumn>,
+    visible_commandstats_columns: Vec<CommandstatsColumn>,
     pub filter: String,
     pub is_filtering: bool,
     pub filter_prompt_mode: FilterPromptMode,
@@ -134,6 +150,9 @@ impl AppState {
             kill_target_keys: Vec::new(),
             auth_form: None,
             column_picker_reorder_mode: false,
+            column_picker_target: ColumnPickerTarget::Overview,
+            commandstats_column_order: CommandstatsColumn::ALL.to_vec(),
+            visible_commandstats_columns: CommandstatsColumn::ALL.to_vec(),
             settings,
             filter: String::new(),
             is_filtering: false,
@@ -646,17 +665,55 @@ impl AppState {
     }
 
     pub fn open_column_picker(&mut self) {
-        let columns = self.available_overview_columns();
-        self.column_picker_index = columns
+        self.column_picker_target =
+            if self.active_view == ActiveView::Detail && self.detail_tab == 3 {
+                ColumnPickerTarget::Commandstats
+            } else {
+                ColumnPickerTarget::Overview
+            };
+        self.column_picker_index = self
+            .column_picker_entries()
             .iter()
-            .position(|key| {
-                self.runtime_visible_overview
-                    .iter()
-                    .any(|visible| visible == key)
-            })
+            .position(|entry| entry.visible)
             .unwrap_or(0);
         self.column_picker_reorder_mode = false;
         self.overview_modal = OverviewModal::ColumnPicker;
+    }
+
+    pub fn visible_commandstats_columns(&self) -> Vec<CommandstatsColumn> {
+        self.commandstats_column_order
+            .iter()
+            .copied()
+            .filter(|column| self.visible_commandstats_columns.contains(column))
+            .collect()
+    }
+
+    pub fn column_picker_entries(&self) -> Vec<ColumnPickerEntry> {
+        match self.column_picker_target {
+            ColumnPickerTarget::Commandstats => self
+                .commandstats_column_order
+                .iter()
+                .map(|column| ColumnPickerEntry {
+                    label: column.header().to_string(),
+                    visible: self.visible_commandstats_columns.contains(column),
+                    suffix: "",
+                })
+                .collect(),
+            ColumnPickerTarget::Overview => self
+                .available_overview_columns()
+                .into_iter()
+                .map(|key| ColumnPickerEntry {
+                    label: self
+                        .column_registry
+                        .column(&key)
+                        .map_or_else(|| key.clone(), |column| column.header().to_string()),
+                    visible: self.is_column_visible(&key),
+                    suffix: self
+                        .column_auto_hidden_suffix(&key)
+                        .unwrap_or_else(|| if key == self.sort_by { " (sort)" } else { "" }),
+                })
+                .collect(),
+        }
     }
 
     pub fn open_kill_picker(&mut self) {
@@ -775,7 +832,7 @@ impl AppState {
     }
 
     pub fn move_column_picker_selection(&mut self, delta: isize) {
-        let columns = self.available_overview_columns();
+        let columns = self.column_picker_entries();
         if columns.is_empty() {
             self.column_picker_index = 0;
             return;
@@ -798,6 +855,14 @@ impl AppState {
     }
 
     pub fn move_selected_column(&mut self, delta: isize) {
+        if self.column_picker_target == ColumnPickerTarget::Commandstats {
+            self.column_picker_index = move_ordered_column(
+                &mut self.commandstats_column_order,
+                self.column_picker_index,
+                delta,
+            );
+            return;
+        }
         let columns = self.available_overview_columns();
         let Some(chosen_key) = columns.get(self.column_picker_index).cloned() else {
             return;
@@ -810,22 +875,28 @@ impl AppState {
             return;
         };
 
-        let current = isize::try_from(chosen_order_idx).unwrap_or(isize::MAX);
-        let max_index = isize::try_from(self.runtime_overview_column_order.len().saturating_sub(1))
-            .unwrap_or(0);
-        let next = current.saturating_add(delta).clamp(0, max_index);
-        let next_order_idx = usize::try_from(next).unwrap_or(chosen_order_idx);
-        if next_order_idx == chosen_order_idx {
-            return;
-        }
-
-        let key = self.runtime_overview_column_order.remove(chosen_order_idx);
-        self.runtime_overview_column_order
-            .insert(next_order_idx, key);
-        self.column_picker_index = next_order_idx;
+        self.column_picker_index = move_ordered_column(
+            &mut self.runtime_overview_column_order,
+            chosen_order_idx,
+            delta,
+        );
     }
 
     pub fn toggle_selected_column_visibility(&mut self) {
+        if self.column_picker_target == ColumnPickerTarget::Commandstats {
+            let Some(column) = self.commandstats_column_order.get(self.column_picker_index) else {
+                return;
+            };
+            if self.visible_commandstats_columns.contains(column) {
+                if self.visible_commandstats_columns.len() > 1 {
+                    self.visible_commandstats_columns
+                        .retain(|visible| visible != column);
+                }
+            } else {
+                self.visible_commandstats_columns.push(*column);
+            }
+            return;
+        }
         let columns = self.available_overview_columns();
         let Some(chosen_key) = columns.get(self.column_picker_index).cloned() else {
             return;
@@ -1254,6 +1325,20 @@ impl AppState {
             self.sort_direction = default_sort_direction_for_column(&self.sort_by);
         }
     }
+}
+
+fn move_ordered_column<T>(columns: &mut Vec<T>, index: usize, delta: isize) -> usize {
+    if index >= columns.len() {
+        return index;
+    }
+    let current = isize::try_from(index).unwrap_or(isize::MAX);
+    let max_index = isize::try_from(columns.len() - 1).unwrap_or(isize::MAX);
+    let next = usize::try_from(current.saturating_add(delta).clamp(0, max_index)).unwrap_or(index);
+    if next != index {
+        let column = columns.remove(index);
+        columns.insert(next, column);
+    }
+    next
 }
 
 fn sort_instances(
@@ -1749,6 +1834,82 @@ mod tests {
 
         assert_eq!(app.sort_by, "status");
         assert_eq!(app.sort_direction, SortDirection::Desc);
+    }
+
+    #[test]
+    fn commandstats_columns_are_independent_and_survive_detail_changes() {
+        use crate::commandstats::CommandstatsColumn::{Calls, Command, Usec, UsecPerCall};
+
+        let mut app = app_with_servers();
+        let overview_order = app.available_overview_columns();
+        let overview_visible = app.visible_column_keys();
+        let overview_sort = (app.sort_by.clone(), app.sort_direction);
+        app.active_view = ActiveView::Detail;
+        app.detail_tab = 3;
+        app.open_column_picker();
+        assert_eq!(
+            app.visible_commandstats_columns(),
+            [Command, Calls, Usec, UsecPerCall]
+        );
+
+        app.move_column_picker_selection(1);
+        app.toggle_selected_column_visibility();
+        app.move_selected_column(2); // Hidden columns can also be reordered.
+        assert_eq!(app.column_picker_index, 3);
+        assert!(!app.column_picker_entries()[3].visible);
+        app.toggle_selected_column_visibility();
+        assert_eq!(
+            app.visible_commandstats_columns(),
+            [Command, Usec, UsecPerCall, Calls]
+        );
+        app.toggle_selected_column_visibility();
+        app.close_overview_modal();
+        app.close_detail_view();
+
+        app.open_column_picker();
+        assert_eq!(app.available_overview_columns(), overview_order);
+        assert_eq!(app.visible_column_keys(), overview_visible);
+        assert_eq!((app.sort_by.clone(), app.sort_direction), overview_sort);
+        app.close_overview_modal();
+        app.move_selection(1);
+        app.active_view = ActiveView::Detail;
+        app.detail_tab = 3;
+        app.apply_update(InstanceState::new("new".into(), "127.0.0.1:6382".into()));
+        app.open_column_picker();
+        assert_eq!(
+            app.visible_commandstats_columns(),
+            [Command, Usec, UsecPerCall]
+        );
+        assert!(!app.column_picker_entries()[3].visible);
+    }
+
+    #[test]
+    fn commandstats_picker_keeps_one_column_and_clamps_movement() {
+        use crate::commandstats::CommandstatsColumn::UsecPerCall;
+
+        let mut app = app();
+        app.active_view = ActiveView::Detail;
+        app.detail_tab = 3;
+        app.open_column_picker();
+        for index in 0..4 {
+            app.column_picker_index = index;
+            app.toggle_selected_column_visibility();
+        }
+        assert_eq!(app.visible_commandstats_columns(), [UsecPerCall]);
+        app.close_overview_modal();
+        app.open_column_picker();
+        assert_eq!(app.column_picker_index, 3);
+        app.move_selected_column(isize::MIN);
+        assert_eq!(app.column_picker_index, 0);
+        assert_eq!(app.column_picker_entries()[0].label, "Usec/Call");
+        app.toggle_selected_column_visibility();
+        assert_eq!(app.visible_commandstats_columns(), [UsecPerCall]);
+        app.move_column_picker_selection(isize::MAX);
+        assert_eq!(app.column_picker_index, 3);
+        app.move_selected_column(isize::MAX);
+        assert_eq!(app.column_picker_index, 3);
+        app.move_column_picker_selection(isize::MIN);
+        assert_eq!(app.column_picker_index, 0);
     }
 
     #[test]

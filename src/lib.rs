@@ -11,6 +11,7 @@ pub mod cli;
 pub mod cluster;
 pub mod column;
 pub mod columns;
+pub mod commandstats;
 pub mod config;
 pub mod credentials;
 pub mod discovery;
