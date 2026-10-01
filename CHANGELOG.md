@@ -98,7 +98,7 @@
   usage for scanning multiple hosts in one session.
 - Add an available `connected_clients` overview column backed by Redis `INFO`
   clients output.
-- Move the default config file lookup to flat `redis-top.toml` files under
+- Move the default config file lookup to flat `rtop.toml` files under
   `$XDG_CONFIG_HOME` or `~/.config`, and reuse configured TCP credentials during
   autodiscovery for matching endpoints.
 

@@ -679,7 +679,7 @@ mod tests {
     #[test]
     fn explicit_cli_targets_do_not_load_unmatched_config_targets() {
         let dir = tempdir().expect("tempdir should work");
-        let config_path = dir.path().join("redis-top.toml");
+        let config_path = dir.path().join("rtop.toml");
         fs::write(
             &config_path,
             r#"
@@ -712,7 +712,7 @@ password = "secret"
     #[test]
     fn explicit_cli_targets_reuse_matching_config_credentials() {
         let dir = tempdir().expect("tempdir should work");
-        let config_path = dir.path().join("redis-top.toml");
+        let config_path = dir.path().join("rtop.toml");
         fs::write(
             &config_path,
             r#"

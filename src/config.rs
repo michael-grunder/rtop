@@ -200,14 +200,14 @@ fn find_default_config_path() -> Option<PathBuf> {
     let mut candidates = Vec::new();
 
     if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
-        candidates.push(PathBuf::from(xdg).join("redis-top.toml"));
+        candidates.push(PathBuf::from(xdg).join("rtop.toml"));
     }
 
     if let Some(home) = env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join(".config").join("redis-top.toml"));
+        candidates.push(PathBuf::from(home).join(".config").join("rtop.toml"));
     }
 
-    candidates.push(PathBuf::from("redis-top.toml"));
+    candidates.push(PathBuf::from("rtop.toml"));
 
     candidates.into_iter().find(|path| path.exists())
 }
@@ -504,7 +504,7 @@ still_autodiscover = false
         let dir = tempfile::tempdir().expect("temp dir");
         let xdg = dir.path().join("xdg");
         std::fs::create_dir_all(&xdg).expect("xdg dir");
-        let config_path = xdg.join("redis-top.toml");
+        let config_path = xdg.join("rtop.toml");
         std::fs::write(&config_path, "").expect("write config");
 
         let old_xdg = std::env::var_os("XDG_CONFIG_HOME");

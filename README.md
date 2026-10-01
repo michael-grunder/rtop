@@ -129,7 +129,7 @@ rtop --once
 rtop --output json
 rtop --output json --once
 rtop --autodiscover 10.0.0.12 --once
-rtop --config ~/.config/redis-top.toml
+rtop --config ~/.config/rtop.toml
 rtop -c config.toml 127.0.0.1:6379
 ```
 
@@ -142,7 +142,7 @@ hosts, not fixed monitored instances. Exact TCP targets such as `6379` or
 requested server(s).
 
 When you provide explicit targets, `rtop` does not also add unrelated
-`[[targets]]` entries from `redis-top.toml`. If an explicit target matches a
+`[[targets]]` entries from `rtop.toml`. If an explicit target matches a
 configured TCP or Unix target, `rtop` still reuses that target's context
 such as alias, username, password, and tags.
 
@@ -278,9 +278,9 @@ early and the rest of the suite still runs.
 
 Search order when `--config` is not provided:
 
-1. `$XDG_CONFIG_HOME/redis-top.toml`
-2. `~/.config/redis-top.toml`
-3. `./redis-top.toml`
+1. `$XDG_CONFIG_HOME/rtop.toml`
+2. `~/.config/rtop.toml`
+3. `./rtop.toml`
 
 Example:
 
