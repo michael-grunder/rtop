@@ -37,11 +37,13 @@
 - `t`: cycle Tree / Flat / Primary (overview)
 - `s`: open Sort By to choose from currently visible overview columns
 - `c`: open the overview column picker for toggling and reordering columns
-- `a`: enter a username and password for the selected server and retry it
-- `k`: open the kill picker for the selected overview row; `Enter` executes the chosen action
+- `Space`: toggle selection of the focused overview server
+- `a`: enter one username and password and retry all selected servers
+- `k`: open the kill picker for selected servers; `Enter` chooses the action,
+  with an additional confirmation when stopping more than one server
 - `?`: toggle help
-- `Up/Down`: move selection in overview, or scroll the active detail pane when it has more rows than fit
-- `Enter`: open detail
+- `Up/Down`: move focus in overview, or scroll the active detail pane when it has more rows than fit
+- `Enter`: open detail for the focused server
 - `Esc`: quit from the overview, close the active overlay window, go back from detail/help, stop filter editing, or leave detail view and clear its active pane filters
 - `Tab` / `Left` / `Right`: cycle detail tabs
 - `S` / `L` / `I` / `C` / `B` / `K`: jump to `Summary` / `Latency` / `Info Raw` / `Commandstats` / `Bigkeys` / `Hotkeys` in detail view
@@ -60,7 +62,17 @@ Function keys remain available as aliases: `F1` help, `F5` view mode, `F6`
 Sort By, `F7` columns, `F8` auth, and `F9` kill. `v` also opens columns.
 `F3` starts overview search input; `F4` starts filtering with an empty filter.
 
-When a discovered server shows `AUTH`, select it and press `a`. The username
+Use `Space` to select or deselect servers. The caret gutter shows `●` for a
+selected server, `>` for the focused server, or a bold `▶` when the focused
+server is also selected. Other rows leave the gutter blank, and the overview
+title shows the selected count. Selections persist across refreshes,
+sorting, filtering, and view changes, including servers temporarily hidden by
+the filter or Primary view. Auth and kill act on all selected servers, falling
+back to the focused server when none are selected. Tree, Sort By, and Columns
+always apply globally; detail view still opens the focused server.
+
+When discovered servers show `AUTH`, select them and press `a` to try the same
+credentials on each selected server. The username
 defaults to Redis' `default` user and may be cleared for password-only
 authentication. The password is masked while it is entered, and the submitted
 credentials are kept only for the current process. For compatibility with
@@ -72,6 +84,9 @@ The `k` kill picker offers `SHUTDOWN SAVE`, `SHUTDOWN NOSAVE`, `SIGINT`,
 `SIGTERM`, `SIGQUIT`, and `SIGKILL`. The Redis shutdown commands work over the
 current connection, while the signal-based options require a local TCP or Unix
 socket target plus `process_id` from `INFO server`.
+For multiple servers, choosing an action opens `Stop <N> servers with <how>?`;
+press `Enter` again to confirm, or `Esc`/`q` to cancel. Each server is attempted
+independently, so one failure does not prevent attempts on the others.
 
 The `Bigkeys` detail tab mirrors `redis-cli --bigkeys`: it scans the keyspace with
 `SCAN`, fetches each key's type, runs the matching cardinality/length command

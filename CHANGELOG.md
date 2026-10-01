@@ -2,6 +2,9 @@
 
 ### Added
 
+- Add Space selection of overview servers, with row markers and a selected
+  count that persist across refreshes, sorting, filtering, and view changes.
+
 - Add available `slots_total` (`#Slots`) and `slots` (`Slots`) overview columns
   that report cluster hash slot coverage parsed from `CLUSTER SHARDS`. Both are
   populated for cluster primaries only, since replicas serve their primary's
@@ -40,6 +43,14 @@
   progress.
 
 ### Changed
+
+- Share the overview caret gutter with compact selection markers: `●` for
+  selected servers and a bold `▶` for the focused selected server, replacing
+  the separate checkbox column.
+
+- Apply auth and kill to all selected servers, falling back to the focused
+  server when none are selected. Confirm multi-server stops with
+  `Stop <N> servers with <how>?`. Tree, Sort By, and Columns remain global.
 
 - Lead overview controls and help with mnemonic shortcuts: `a` for auth,
   `f` or `/` for filtering, `t` for view mode, `s` for Sort By, `c` for columns,

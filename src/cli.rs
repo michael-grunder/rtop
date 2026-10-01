@@ -552,7 +552,7 @@ mod tests {
             password: None,
         }));
 
-        assert!(discovered.is_empty());
+        assert_eq!(discovered, Vec::new());
     }
 
     #[test]
@@ -565,7 +565,7 @@ mod tests {
             password: None,
         }));
 
-        assert!(discovered.is_empty());
+        assert_eq!(discovered, Vec::new());
     }
 
     #[test]
@@ -604,7 +604,7 @@ mod tests {
         let launch = super::build_launch_config_from(cli).expect("launch config should parse");
 
         assert_eq!(launch.targets.len(), 2);
-        assert!(launch.discovery_targets.is_empty());
+        assert_eq!(launch.discovery_targets, Vec::new());
         assert!(launch.discovery_seed_targets.is_empty());
     }
 
@@ -706,7 +706,7 @@ password = "secret"
         assert_eq!(launch.targets.len(), 1);
         assert_eq!(launch.targets[0].addr, "127.0.0.1:6379");
         assert_eq!(launch.targets[0].alias.as_deref(), Some("local-6379"));
-        assert!(launch.discovery_targets.is_empty());
+        assert_eq!(launch.discovery_targets, Vec::new());
     }
 
     #[test]

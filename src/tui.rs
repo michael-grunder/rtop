@@ -212,14 +212,18 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, launch: LaunchCon
                                 .is_some_and(|form| form.active_field == AuthField::Username);
                             if is_username {
                                 app.toggle_auth_field();
-                            } else if let Some((key, username, password)) =
+                            } else if let Some((keys, username, password)) =
                                 app.take_auth_credentials()
                             {
-                                let _ = request_tx.try_send(PollerRequest::AuthenticateTarget {
-                                    key,
-                                    username,
-                                    password,
-                                });
+                                request_tx
+                                    .try_send(PollerRequest::AuthenticateTargets {
+                                        keys,
+                                        username,
+                                        password,
+                                    })
+                                    .map_err(|_| {
+                                        anyhow::anyhow!("Unable to queue authentication request")
+                                    })?;
                             }
                         }
                         KeyCode::Backspace => {
@@ -356,21 +360,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, launch: LaunchCon
                 continue;
             }
 
-            if app.is_kill_picker_open() {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => app.close_overview_modal(),
-                    KeyCode::Up => app.move_kill_picker_selection(-1),
-                    KeyCode::Down => app.move_kill_picker_selection(1),
-                    KeyCode::Enter => {
-                        if let (Some(key), Some(action)) =
-                            (app.selected_key(), app.selected_kill_action())
-                        {
-                            let _ = request_tx.try_send(PollerRequest::KillTarget { key, action });
-                        }
-                        app.close_overview_modal();
-                    }
-                    _ => {}
-                }
+            if handle_kill_key(&mut app, key, &request_tx)? {
                 continue;
             }
 
@@ -536,15 +526,12 @@ fn handle_overview_shortcut(app: &mut AppState, key: KeyEvent) -> bool {
     }
 
     match key.code {
+        KeyCode::Char(' ') => app.toggle_server_selection(),
         KeyCode::F(5) | KeyCode::Char('t' | 'T') => app.cycle_view_mode(),
         KeyCode::F(6) | KeyCode::Char('s' | 'S') => app.open_sort_picker(),
         KeyCode::F(7) | KeyCode::Char('c' | 'C' | 'v') => app.open_column_picker(),
         KeyCode::F(8) | KeyCode::Char('a' | 'A') => app.open_auth_form(),
-        KeyCode::F(9) | KeyCode::Char('k' | 'K') => {
-            if app.selected_key().is_some() {
-                app.open_kill_picker();
-            }
-        }
+        KeyCode::F(9) | KeyCode::Char('k' | 'K') => app.open_kill_picker(),
         KeyCode::Char('h') => {
             app.toggle_host_rendering();
             app.clamp_selection();
@@ -812,7 +799,7 @@ fn handle_overlay_quit_key(app: &mut AppState, key: KeyEvent) -> bool {
         return true;
     }
 
-    if app.is_sort_picker_open() || app.is_column_picker_open() || app.is_kill_picker_open() {
+    if app.overview_modal != OverviewModal::None {
         app.close_overview_modal();
         return true;
     }
@@ -865,6 +852,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut AppState) {
 
     if app.is_kill_picker_open() {
         draw_kill_picker(frame, area, app);
+    }
+
+    if app.overview_modal == OverviewModal::KillConfirmation {
+        draw_kill_confirmation(frame, area, app);
     }
 
     if app.is_auth_form_open() {
@@ -935,6 +926,8 @@ fn style_from_emphasis(emphasis_style: EmphasisStyle) -> Style {
 #[allow(clippy::too_many_lines)]
 fn draw_overview(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) {
     const TABLE_COLUMN_SPACING: u16 = 1;
+    // Borders, shared focus/selection gutter, cluster gutter, and their two gaps.
+    const TABLE_DECORATION_WIDTH: u16 = 2 + 1 + 1 + 2 * TABLE_COLUMN_SPACING;
     let overview = app.build_overview_frame();
 
     let chunks = Layout::default()
@@ -968,7 +961,10 @@ fn draw_overview(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect)
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Overview")
+            .title(format!(
+                "Overview ({} selected)",
+                app.selected_server_count()
+            ))
             .style(base_style(app)),
     );
     frame.render_widget(header, chunks[0]);
@@ -983,7 +979,7 @@ fn draw_overview(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect)
         .filter_map(|key| app.column_registry.column(key.as_str()))
         .collect();
     let widths = compute_column_widths(
-        chunks[1].width.saturating_sub(2),
+        chunks[1].width.saturating_sub(TABLE_DECORATION_WIDTH),
         &columns,
         TABLE_COLUMN_SPACING,
     );
@@ -992,7 +988,21 @@ fn draw_overview(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect)
         .rows
         .iter()
         .map(|row| {
-            let mut cells = Vec::with_capacity(overview.columns.len() + 1);
+            let mut cells = Vec::with_capacity(overview.columns.len() + 2);
+            let marker = match (row.selected, app.is_server_selected(&row.key)) {
+                (true, true) => "▶",
+                (true, false) => ">",
+                (false, true) => "●",
+                (false, false) => " ",
+            };
+            let marker_style = if row.selected {
+                base_style(app)
+                    .fg(carat_color(app))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                base_style(app)
+            };
+            cells.push(Cell::from(Span::styled(marker, marker_style)));
             cells.push(overview_cluster_gutter_cell(row.cluster_gutter.as_ref()));
             cells.extend(row.cells.iter().enumerate().map(|(idx, cell)| {
                 let width = widths[idx];
@@ -1015,11 +1025,12 @@ fn draw_overview(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect)
         })
         .collect();
 
-    let constraints: Vec<Constraint> = std::iter::once(Constraint::Length(1))
+    let constraints: Vec<Constraint> = [Constraint::Length(1), Constraint::Length(1)]
+        .into_iter()
         .chain(widths.iter().copied().map(Constraint::Length))
         .collect();
     let header = Row::new(
-        std::iter::once(Cell::from(" ")).chain(
+        [Cell::from(""), Cell::from(" ")].into_iter().chain(
             columns
                 .iter()
                 .zip(column_keys.iter())
@@ -1043,7 +1054,7 @@ fn draw_overview(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect)
         )
         .column_spacing(TABLE_COLUMN_SPACING)
         .row_highlight_style(selected_style)
-        .highlight_symbol("> ");
+        .highlight_spacing(ratatui::widgets::HighlightSpacing::Never);
 
     let mut state = ratatui::widgets::TableState::default().with_selected(Some(app.selected_index));
     frame.render_stateful_widget(table, chunks[1], &mut state);
@@ -1965,7 +1976,7 @@ fn status_bar_actions(app: &AppState) -> Line<'static> {
     }
 
     let footer_actions = format!(
-        "[H]elp  [F]ilter /  [T]ree:{}  [S]ortBy  [C]olumns  [A]uth  [K]ill",
+        "[H]elp  [F]ilter /  [T]ree:{}  [S]ortBy  [C]olumns  [A]uth  [K]ill  [Space]Select",
         app.view_mode.footer_label()
     );
     let footer = app.discovery_status.footer_summary().map_or_else(
@@ -2011,15 +2022,16 @@ const fn help_bindings() -> &'static [(&'static str, &'static str)] {
         ("c / F7 / v", "Toggle and reorder visible overview columns"),
         (
             "a / F8",
-            "Enter credentials for the selected overview server",
+            "Enter credentials for selected servers (or the focused server)",
         ),
         (
             "k / F9",
-            "Open the kill picker for the selected overview row",
+            "Stop selected servers (or the focused server); confirm batch stops",
         ),
+        ("Space", "Toggle selection of the focused overview server"),
         ("f or /", "Edit the overview filter (keeps existing text)"),
         ("Esc", "Back from detail/help or stop filter editing"),
-        ("Enter", "Open detail view from overview"),
+        ("Enter", "Open detail view for the focused server"),
         ("Tab/Right", "Next detail panel"),
         ("Left", "Previous detail panel"),
         (
@@ -2028,7 +2040,7 @@ const fn help_bindings() -> &'static [(&'static str, &'static str)] {
         ),
         (
             "Up/Down",
-            "Move selection in overview or scroll detail panes with long content",
+            "Move focus in overview or scroll detail panes with long content",
         ),
         ("?", "Toggle help overlay"),
         (
@@ -2257,15 +2269,7 @@ fn draw_auth_form(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(5), Constraint::Length(3)])
         .split(popup);
-    let target = app.instances.get(&form.target_key).map_or_else(
-        || form.target_key.clone(),
-        |instance| {
-            instance
-                .alias
-                .clone()
-                .unwrap_or_else(|| instance.addr.clone())
-        },
-    );
+    let target = action_targets_label(app, &form.target_keys);
     let password_mask = "•".repeat(form.password.chars().count());
     let rows = vec![
         Row::new(vec![
@@ -2308,39 +2312,107 @@ fn draw_auth_form(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
 }
 
 fn kill_picker_title(app: &AppState) -> String {
-    let selected = app
-        .selected_key()
-        .and_then(|key| app.instances.get(&key))
-        .map_or_else(
-            || "selected server".to_string(),
+    let selected = action_targets_label(app, &app.kill_target_keys);
+    format!("Kill {selected} (Enter select, Esc cancel)")
+}
+
+fn action_targets_label(app: &AppState, keys: &[String]) -> String {
+    if let [key] = keys {
+        app.instances.get(key).map_or_else(
+            || key.clone(),
             |instance| {
                 instance
                     .alias
                     .clone()
                     .unwrap_or_else(|| instance.addr.clone())
             },
-        );
-    format!("Kill {selected} (Enter select, Esc cancel)")
+        )
+    } else {
+        format!("{} servers", keys.len())
+    }
 }
 
 fn selected_signal_supported(app: &AppState) -> bool {
-    let Some(key) = app.selected_key() else {
-        return false;
+    let keys = if app.kill_target_keys.is_empty() {
+        app.action_target_keys()
+    } else {
+        app.kill_target_keys.clone()
     };
-    let Some(instance) = app.instances.get(&key) else {
-        return false;
+    !keys.is_empty()
+        && keys.iter().all(|key| {
+            let Some(instance) = app.instances.get(key) else {
+                return false;
+            };
+            instance.detail.process_id.is_some()
+                && if instance.addr.contains('/') {
+                    true
+                } else {
+                    tcp_host(&instance.addr).is_some_and(|host| {
+                        host.eq_ignore_ascii_case("localhost")
+                            || host
+                                .parse::<std::net::IpAddr>()
+                                .is_ok_and(|ip| ip.is_loopback())
+                    })
+                }
+        })
+}
+
+fn draw_kill_confirmation(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
+    let Some(action) = app.selected_kill_action() else {
+        return;
     };
-    instance.detail.process_id.is_some()
-        && if instance.addr.contains('/') {
-            true
-        } else {
-            tcp_host(&instance.addr).is_some_and(|host| {
-                host.eq_ignore_ascii_case("localhost")
-                    || host
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|ip| ip.is_loopback())
-            })
+    let width = area.width.min(64);
+    let height = area.height.min(6);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let prompt = format!(
+        "Stop {} servers with {}?\n\nEnter confirms; Esc or q cancels.",
+        app.kill_target_keys.len(),
+        action.label(),
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(prompt)
+            .block(Block::default().borders(Borders::ALL).title("Confirm stop"))
+            .style(base_style(app))
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+fn handle_kill_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    request_tx: &tokio::sync::mpsc::Sender<PollerRequest>,
+) -> Result<bool> {
+    if !matches!(
+        app.overview_modal,
+        OverviewModal::KillPicker | OverviewModal::KillConfirmation
+    ) {
+        return Ok(false);
+    }
+    // Repeated Enter events must not accept the additional confirmation.
+    if key.kind != KeyEventKind::Press {
+        return Ok(true);
+    }
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.close_overview_modal(),
+        KeyCode::Up if app.is_kill_picker_open() => app.move_kill_picker_selection(-1),
+        KeyCode::Down if app.is_kill_picker_open() => app.move_kill_picker_selection(1),
+        KeyCode::Enter => {
+            if let Some((keys, action)) = app.submit_kill() {
+                request_tx
+                    .try_send(PollerRequest::KillTargets { keys, action })
+                    .map_err(|_| anyhow::anyhow!("Unable to queue stop request"))?;
+            }
         }
+        _ => {}
+    }
+    Ok(true)
 }
 
 fn handle_column_picker_key(app: &mut AppState, key: KeyEvent) -> bool {
@@ -2511,6 +2583,173 @@ mod tests {
     fn char_column(line: &str, needle: &str) -> usize {
         let byte_idx = line.find(needle).expect("needle rendered in line");
         line[..byte_idx].chars().count()
+    }
+
+    fn app_with_selected_servers() -> AppState {
+        let mut app = AppState::new(default_settings(), test_registry());
+        for port in [6379, 6380, 6381] {
+            let addr = format!("127.0.0.1:{port}");
+            app.apply_update(InstanceState::new(addr.clone(), addr));
+        }
+        for _ in 0..2 {
+            assert!(handle_overview_shortcut(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            ));
+            app.move_selection(1);
+        }
+        app
+    }
+
+    #[test]
+    fn overview_shows_marked_servers_separately_from_focus() {
+        let mut app = app_with_selected_servers();
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let lines = buffer_lines(terminal.backend().buffer());
+        assert!(lines.iter().any(|line| line.contains("2 selected")));
+        assert!(lines.iter().any(|line| line.contains("[Space]Select")));
+        for port in ["6379", "6380"] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(port) && line.chars().nth(1) == Some('●'))
+            );
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("6381") && line.chars().nth(1) == Some('>'))
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("[x]") || line.contains("[ ]"))
+        );
+
+        app.move_selection(-2);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+        for (port, marker) in [("6379", '▶'), ("6380", '●'), ("6381", ' ')] {
+            let row = lines.iter().position(|line| line.contains(port)).unwrap();
+            assert_eq!(lines[row].chars().nth(1), Some(marker));
+            if marker == '▶' {
+                let cell = &buffer[(1, u16::try_from(row).unwrap())];
+                assert_eq!(cell.fg, carat_color(&app));
+                assert!(cell.modifier.contains(Modifier::BOLD));
+            }
+        }
+
+        app.toggle_server_selection();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            buffer_lines(terminal.backend().buffer())
+                .iter()
+                .any(|line| { line.contains("6379") && line.chars().nth(1) == Some('>') })
+        );
+        app.toggle_server_selection();
+        app.open_auth_form();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            buffer_lines(terminal.backend().buffer())
+                .join("\n")
+                .contains("Authenticate 2 servers")
+        );
+    }
+
+    #[test]
+    fn batch_stop_requires_a_second_press_and_preserves_targets_and_action() {
+        let mut app = app_with_selected_servers();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        app.open_kill_picker();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        super::handle_kill_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &tx,
+        )
+        .unwrap();
+        super::handle_kill_key(&mut app, enter, &tx).unwrap();
+        assert_eq!(app.overview_modal, OverviewModal::KillConfirmation);
+        assert!(rx.try_recv().is_err());
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            buffer_lines(terminal.backend().buffer())
+                .join("\n")
+                .contains("Stop 2 servers with SHUTDOWN NOSAVE?")
+        );
+
+        super::handle_kill_key(
+            &mut app,
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Repeat),
+            &tx,
+        )
+        .unwrap();
+        super::handle_kill_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &tx,
+        )
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+        app.sort_direction = crate::model::SortDirection::Desc;
+        app.remove_instance("127.0.0.1:6379");
+        super::handle_kill_key(&mut app, enter, &tx).unwrap();
+        let crate::poller::PollerRequest::KillTargets { keys, action } = rx.try_recv().unwrap()
+        else {
+            panic!("expected batch stop request");
+        };
+        assert_eq!(keys, ["127.0.0.1:6379", "127.0.0.1:6380"]);
+        assert_eq!(action, crate::model::KillAction::ShutdownNosave);
+        assert_eq!(app.overview_modal, OverviewModal::None);
+    }
+
+    #[test]
+    fn batch_stop_cancellation_never_queues_a_request() {
+        for code in [KeyCode::Esc, KeyCode::Char('q')] {
+            let mut app = app_with_selected_servers();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            app.open_kill_picker();
+            super::handle_kill_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &tx,
+            )
+            .unwrap();
+            assert!(handle_overlay_quit_key(
+                &mut app,
+                KeyEvent::new(code, KeyModifiers::NONE)
+            ));
+            assert!(rx.try_recv().is_err());
+            assert_eq!(app.overview_modal, OverviewModal::None);
+            assert_eq!(app.kill_target_keys, Vec::<String>::new());
+            assert_eq!(app.selected_server_count(), 2);
+            assert!(!app.should_quit);
+        }
+    }
+
+    #[test]
+    fn space_only_selects_servers_in_overview_without_an_input_or_modal() {
+        let mut app = app_with_selected_servers();
+        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        app.is_filtering = true;
+        assert!(!handle_overview_shortcut(&mut app, space));
+        app.is_filtering = false;
+        app.active_view = ActiveView::Detail;
+        assert!(!handle_overview_shortcut(&mut app, space));
+        app.active_view = ActiveView::Overview;
+        for modal in [
+            OverviewModal::AuthForm,
+            OverviewModal::ColumnPicker,
+            OverviewModal::KillConfirmation,
+        ] {
+            app.overview_modal = modal;
+            assert!(!handle_overview_shortcut(&mut app, space));
+        }
+        assert_eq!(app.selected_server_count(), 2);
     }
 
     #[test]

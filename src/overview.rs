@@ -525,7 +525,7 @@ mod tests {
             .split('.')
             .collect::<Vec<_>>();
         assert_eq!(parts.len(), 2);
-        assert!(!parts[0].is_empty());
+        assert_ne!(parts[0], "");
         assert_eq!(parts[1].len(), 6);
         assert_eq!(json["header"]["view_mode"], "flat");
         assert_eq!(json["header"]["filter"], "alp");

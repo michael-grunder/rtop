@@ -29,6 +29,7 @@ pub enum OverviewModal {
     SortPicker,
     ColumnPicker,
     KillPicker,
+    KillConfirmation,
     AuthForm,
 }
 
@@ -40,7 +41,7 @@ pub enum AuthField {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct AuthFormState {
-    pub target_key: String,
+    pub target_keys: Vec<String>,
     pub username: String,
     pub password: String,
     pub active_field: AuthField,
@@ -84,6 +85,7 @@ pub struct AppState {
     pub sort_picker_index: usize,
     pub column_picker_index: usize,
     pub kill_picker_index: usize,
+    pub kill_target_keys: Vec<String>,
     pub auth_form: Option<AuthFormState>,
     pub column_picker_reorder_mode: bool,
     pub filter: String,
@@ -93,6 +95,7 @@ pub struct AppState {
     pub active_view: ActiveView,
     pub previous_view: ActiveView,
     pub selected_index: usize,
+    marked_keys: BTreeSet<String>,
     pub detail_tab: usize,
     pub summary_view: DetailTextViewState,
     pub latency_view: DetailTextViewState,
@@ -128,6 +131,7 @@ impl AppState {
             sort_picker_index: 0,
             column_picker_index: 0,
             kill_picker_index: 0,
+            kill_target_keys: Vec::new(),
             auth_form: None,
             column_picker_reorder_mode: false,
             settings,
@@ -138,6 +142,7 @@ impl AppState {
             active_view: ActiveView::Overview,
             previous_view: ActiveView::Overview,
             selected_index: 0,
+            marked_keys: BTreeSet::new(),
             detail_tab: 0,
             summary_view: DetailTextViewState::default(),
             latency_view: DetailTextViewState::default(),
@@ -172,6 +177,7 @@ impl AppState {
 
     pub fn remove_instance(&mut self, key: &str) {
         self.instances.remove(key);
+        self.marked_keys.remove(key);
         self.hotkeys_locally_reset.remove(key);
         self.pending_transient_emphasis
             .retain(|_, winner| winner != key);
@@ -202,6 +208,31 @@ impl AppState {
         self.visible_rows()
             .get(self.selected_index)
             .map(|row| row.key.clone())
+    }
+
+    pub fn toggle_server_selection(&mut self) {
+        if let Some(key) = self.selected_key()
+            && !self.marked_keys.remove(&key)
+        {
+            self.marked_keys.insert(key);
+        }
+    }
+
+    pub fn is_server_selected(&self, key: &str) -> bool {
+        self.marked_keys.contains(key)
+    }
+
+    pub fn selected_server_count(&self) -> usize {
+        self.marked_keys.len()
+    }
+
+    /// Explicit selections take precedence, including servers hidden by the current view.
+    pub fn action_target_keys(&self) -> Vec<String> {
+        if self.marked_keys.is_empty() {
+            self.selected_key().into_iter().collect()
+        } else {
+            self.marked_keys.iter().cloned().collect()
+        }
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -607,17 +638,41 @@ impl AppState {
         self.overview_modal = OverviewModal::ColumnPicker;
     }
 
-    pub const fn open_kill_picker(&mut self) {
+    pub fn open_kill_picker(&mut self) {
+        self.kill_target_keys = self.action_target_keys();
+        if self.kill_target_keys.is_empty() {
+            return;
+        }
         self.kill_picker_index = 0;
         self.overview_modal = OverviewModal::KillPicker;
     }
 
+    /// Freeze targets when the picker opens so polling and sorting cannot retarget a stop.
+    pub fn submit_kill(&mut self) -> Option<(Vec<String>, KillAction)> {
+        if !matches!(
+            self.overview_modal,
+            OverviewModal::KillPicker | OverviewModal::KillConfirmation
+        ) || self.kill_target_keys.is_empty()
+        {
+            return None;
+        }
+        let action = self.selected_kill_action()?;
+        if self.overview_modal == OverviewModal::KillPicker && self.kill_target_keys.len() > 1 {
+            self.overview_modal = OverviewModal::KillConfirmation;
+            return None;
+        }
+        let keys = std::mem::take(&mut self.kill_target_keys);
+        self.close_overview_modal();
+        Some((keys, action))
+    }
+
     pub fn open_auth_form(&mut self) {
-        let Some(target_key) = self.selected_key() else {
+        let target_keys = self.action_target_keys();
+        if target_keys.is_empty() {
             return;
-        };
+        }
         self.auth_form = Some(AuthFormState {
-            target_key,
+            target_keys,
             username: "default".to_string(),
             password: String::new(),
             active_field: AuthField::Username,
@@ -649,18 +704,19 @@ impl AppState {
         }
     }
 
-    pub fn take_auth_credentials(&mut self) -> Option<(String, Option<String>, String)> {
+    pub fn take_auth_credentials(&mut self) -> Option<(Vec<String>, Option<String>, String)> {
         let form = self.auth_form.as_ref()?;
         if form.password.is_empty() {
             return None;
         }
         let username = (!form.username.is_empty()).then(|| form.username.clone());
-        let submission = (form.target_key.clone(), username, form.password.clone());
+        let submission = (form.target_keys.clone(), username, form.password.clone());
         self.close_auth_form();
         Some(submission)
     }
 
     pub fn close_overview_modal(&mut self) {
+        self.kill_target_keys.clear();
         self.column_picker_reorder_mode = false;
         if let Some(mut form) = self.auth_form.take() {
             form.password.clear();
@@ -1316,6 +1372,104 @@ mod tests {
         )
     }
 
+    fn app_with_servers() -> AppState {
+        let mut app = app();
+        for port in [6379, 6380, 6381] {
+            let addr = format!("127.0.0.1:{port}");
+            app.apply_update(InstanceState::new(addr.clone(), addr));
+        }
+        app
+    }
+
+    #[test]
+    fn server_selection_toggles_and_overrides_focus_for_actions() {
+        let mut app = app_with_servers();
+        assert_eq!(app.action_target_keys(), ["127.0.0.1:6379"]);
+        app.toggle_server_selection();
+        app.move_selection(1);
+        assert_eq!(app.action_target_keys(), ["127.0.0.1:6379"]);
+        app.toggle_server_selection();
+        assert_eq!(
+            app.action_target_keys(),
+            ["127.0.0.1:6379", "127.0.0.1:6380"]
+        );
+        app.toggle_server_selection();
+        app.move_selection(-1);
+        app.toggle_server_selection();
+        assert_eq!(app.selected_server_count(), 0);
+        app.move_selection(2);
+        assert_eq!(app.action_target_keys(), ["127.0.0.1:6381"]);
+    }
+
+    #[test]
+    fn server_selection_survives_updates_sorting_filtering_and_global_actions() {
+        let mut app = app_with_servers();
+        app.toggle_server_selection();
+        let targets = app.action_target_keys();
+        app.sort_direction = SortDirection::Desc;
+        app.apply_update(InstanceState::new(targets[0].clone(), targets[0].clone()));
+        app.cycle_view_mode();
+        app.open_sort_picker();
+        app.close_overview_modal();
+        app.open_column_picker();
+        app.close_overview_modal();
+        app.filter = "no matches".to_string();
+        assert!(app.visible_rows().is_empty());
+        app.toggle_server_selection();
+        assert_eq!(app.action_target_keys(), targets);
+        app.open_auth_form();
+        assert_eq!(app.auth_form.as_ref().unwrap().target_keys, targets);
+        app.close_auth_form();
+        app.open_kill_picker();
+        assert_eq!(app.kill_target_keys, targets);
+        app.close_overview_modal();
+        app.remove_instance(&targets[0]);
+        assert_eq!(app.selected_server_count(), 0);
+        assert_eq!(app.action_target_keys(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn auth_form_captures_all_selected_targets_and_shared_credentials() {
+        let mut app = app_with_servers();
+        app.toggle_server_selection();
+        app.move_selection(1);
+        app.toggle_server_selection();
+        app.open_auth_form();
+        app.move_selection(1);
+        app.filter = "6381".to_string();
+        let form = app.auth_form.as_mut().unwrap();
+        form.username = "operator".to_string();
+        form.password = "secret".to_string();
+        assert_eq!(
+            app.take_auth_credentials(),
+            Some((
+                vec!["127.0.0.1:6379".to_string(), "127.0.0.1:6380".to_string()],
+                Some("operator".to_string()),
+                "secret".to_string(),
+            ))
+        );
+        assert!(app.auth_form.is_none());
+        assert_eq!(app.selected_server_count(), 2);
+    }
+
+    #[test]
+    fn single_stop_uses_captured_target_without_extra_confirmation() {
+        let mut app = app_with_servers();
+        app.open_kill_picker();
+        app.move_selection(1);
+        let (keys, _) = app.submit_kill().expect("single target submits directly");
+        assert_eq!(keys, ["127.0.0.1:6379"]);
+        assert_eq!(app.overview_modal, OverviewModal::None);
+
+        app.toggle_server_selection();
+        app.move_selection(1);
+        app.open_kill_picker();
+        let (keys, _) = app
+            .submit_kill()
+            .expect("one marked target submits directly");
+        assert_eq!(keys, ["127.0.0.1:6380"]);
+    }
+
     #[test]
     fn auth_form_defaults_username_and_requires_a_password() {
         let mut app = app();
@@ -1327,7 +1481,7 @@ mod tests {
         app.open_auth_form();
 
         let form = app.auth_form.as_mut().expect("auth form should open");
-        assert_eq!(form.target_key, "127.0.0.1:6380");
+        assert_eq!(form.target_keys, ["127.0.0.1:6380"]);
         assert_eq!(form.username, "default");
         assert_eq!(form.active_field, AuthField::Username);
         assert_eq!(app.take_auth_credentials(), None);
@@ -1339,7 +1493,7 @@ mod tests {
         assert_eq!(
             app.take_auth_credentials(),
             Some((
-                "127.0.0.1:6380".to_string(),
+                vec!["127.0.0.1:6380".to_string()],
                 Some("default".to_string()),
                 "secret".to_string(),
             ))
@@ -1546,7 +1700,7 @@ mod tests {
         app.start_filter_input(FilterPromptMode::Filter, true);
         assert!(app.is_filtering);
         assert_eq!(app.filter_prompt_mode, FilterPromptMode::Filter);
-        assert!(app.filter.is_empty());
+        assert_eq!(app.filter, "");
     }
 
     #[test]
@@ -1987,7 +2141,7 @@ mod tests {
 
         app.start_bigkeys_filter_input(true);
         assert!(app.bigkeys_view.is_filtering);
-        assert!(app.bigkeys_view.filter.is_empty());
+        assert_eq!(app.bigkeys_view.filter, "");
         assert_eq!(app.bigkeys_view.scroll_offset, 0);
     }
 
@@ -2038,7 +2192,7 @@ mod tests {
 
         app.start_detail_text_filter_input(true);
         assert!(app.info_raw_view.is_filtering);
-        assert!(app.info_raw_view.filter.is_empty());
+        assert_eq!(app.info_raw_view.filter, "");
         assert_eq!(app.info_raw_view.scroll_offset, 0);
     }
 
@@ -2087,7 +2241,7 @@ mod tests {
         app.commandstats_view.scroll_offset = 7;
         app.start_active_detail_filter_input(true);
         assert!(app.commandstats_view.is_filtering);
-        assert!(app.commandstats_view.filter.is_empty());
+        assert_eq!(app.commandstats_view.filter, "");
         assert_eq!(app.commandstats_view.scroll_offset, 0);
 
         app.detail_tab = 4;
@@ -2127,7 +2281,7 @@ mod tests {
             let view = app
                 .detail_pane_view(detail_tab)
                 .expect("detail pane should exist");
-            assert!(view.filter.is_empty());
+            assert_eq!(view.filter, "");
             assert!(!view.is_filtering);
             assert_eq!(view.scroll_offset, 0);
         }
@@ -2181,7 +2335,7 @@ mod tests {
             .hotkeys;
         assert_eq!(hotkeys.status, HotkeysStatus::Idle);
         assert!(hotkeys.selected_metric.is_none());
-        assert!(hotkeys.entries.is_empty());
+        assert_eq!(hotkeys.entries, Vec::new());
     }
 
     #[test]

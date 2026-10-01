@@ -41,12 +41,12 @@ pub enum PollerRequest {
     StopHotkeys {
         key: String,
     },
-    KillTarget {
-        key: String,
+    KillTargets {
+        keys: Vec<String>,
         action: KillAction,
     },
-    AuthenticateTarget {
-        key: String,
+    AuthenticateTargets {
+        keys: Vec<String>,
         username: Option<String>,
         password: String,
     },
@@ -235,68 +235,72 @@ pub fn start(
                     };
                     let _ = task.stop_tx.send(());
                 }
-                PollerRequest::KillTarget { key, action } => {
-                    let Some(target) = target_map.get(&key) else {
-                        continue;
-                    };
-                    let Some(prior) = known_states.get(&key).cloned() else {
-                        continue;
-                    };
+                PollerRequest::KillTargets { keys, action } => {
+                    for key in keys {
+                        let Some(target) = target_map.get(&key) else {
+                            continue;
+                        };
+                        let Some(prior) = known_states.get(&key).cloned() else {
+                            continue;
+                        };
 
-                    if let Some(task) = hotkeys_tasks.remove(&key) {
-                        let _ = task.stop_tx.send(());
-                        task.handle.abort();
-                    }
-
-                    let updated = {
-                        let _permit = semaphore.clone().acquire_owned().await.ok();
-                        kill_target(target, &settings, prior, action).await
-                    };
-                    match updated {
-                        PollerUpdate::State(state) => {
-                            known_states.insert(state.key.clone(), (*state).clone());
-                            if update_tx.send(PollerUpdate::State(state)).await.is_err() {
-                                return;
-                            }
+                        if let Some(task) = hotkeys_tasks.remove(&key) {
+                            let _ = task.stop_tx.send(());
+                            task.handle.abort();
                         }
-                        PollerUpdate::Remove { key } => {
-                            known_states.remove(&key);
-                            target_map.remove(&key);
-                            if update_tx.send(PollerUpdate::Remove { key }).await.is_err() {
-                                return;
+
+                        let updated = {
+                            let _permit = semaphore.clone().acquire_owned().await.ok();
+                            kill_target(target, &settings, prior, action).await
+                        };
+                        match updated {
+                            PollerUpdate::State(state) => {
+                                known_states.insert(state.key.clone(), (*state).clone());
+                                if update_tx.send(PollerUpdate::State(state)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            PollerUpdate::Remove { key } => {
+                                known_states.remove(&key);
+                                target_map.remove(&key);
+                                if update_tx.send(PollerUpdate::Remove { key }).await.is_err() {
+                                    return;
+                                }
                             }
                         }
                     }
                 }
-                PollerRequest::AuthenticateTarget {
-                    key,
+                PollerRequest::AuthenticateTargets {
+                    keys,
                     username,
                     password,
                 } => {
-                    let Some(target) = target_map.get_mut(&key) else {
-                        continue;
-                    };
-                    target.username = username;
-                    target.password = Some(password);
-                    let target = target.clone();
+                    for key in keys {
+                        let Some(target) = target_map.get_mut(&key) else {
+                            continue;
+                        };
+                        target.username = username.clone();
+                        target.password = Some(password.clone());
+                        let target = target.clone();
 
-                    if let Some(task) = hotkeys_tasks.remove(&key) {
-                        let _ = task.stop_tx.send(());
-                        task.handle.abort();
-                    }
+                        if let Some(task) = hotkeys_tasks.remove(&key) {
+                            let _ = task.stop_tx.send(());
+                            task.handle.abort();
+                        }
 
-                    let updated = {
-                        let _permit = semaphore.clone().acquire_owned().await.ok();
-                        let prior = known_states.get(&key).cloned();
-                        poll_one(&target, &settings, prior).await
-                    };
-                    known_states.insert(updated.key.clone(), updated.clone());
-                    if update_tx
-                        .send(PollerUpdate::State(Box::new(updated)))
-                        .await
-                        .is_err()
-                    {
-                        return;
+                        let updated = {
+                            let _permit = semaphore.clone().acquire_owned().await.ok();
+                            let prior = known_states.get(&key).cloned();
+                            poll_one(&target, &settings, prior).await
+                        };
+                        known_states.insert(updated.key.clone(), updated.clone());
+                        if update_tx
+                            .send(PollerUpdate::State(Box::new(updated)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                 }
             }
@@ -1135,6 +1139,74 @@ mod tests {
     };
     use crate::parse::{ClusterShard, ClusterShardNode, ClusterShardRole, parse_cluster_shards};
 
+    #[tokio::test]
+    async fn batch_actions_attempt_each_target_after_missing_targets_and_connection_errors() {
+        let directory = tempfile::tempdir().expect("temporary socket directory");
+        let targets: Vec<_> = ["first.sock", "second.sock"]
+            .into_iter()
+            .map(|name| Target {
+                alias: None,
+                addr: directory.path().join(name).to_string_lossy().into_owned(),
+                protocol: TargetProtocol::Unix,
+                username: None,
+                password: None,
+                tags: Vec::new(),
+                process_id: None,
+            })
+            .collect();
+        let keys: Vec<_> = targets.iter().map(|target| target.addr.clone()).collect();
+        let mut settings = crate::config::default_settings();
+        settings.refresh_interval = Duration::from_secs(3600);
+        let (mut updates, requests) = super::start(targets, settings);
+
+        // Drain the initial poll before checking updates produced by each action.
+        for _ in &keys {
+            let update = tokio::time::timeout(Duration::from_secs(2), updates.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(update, super::PollerUpdate::State(_)));
+        }
+        let mut batch = vec!["missing target".to_string()];
+        batch.extend(keys.clone());
+        requests
+            .send(super::PollerRequest::AuthenticateTargets {
+                keys: batch.clone(),
+                username: Some("default".to_string()),
+                password: "secret".to_string(),
+            })
+            .await
+            .unwrap();
+        for key in &keys {
+            let update = tokio::time::timeout(Duration::from_secs(2), updates.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let super::PollerUpdate::State(state) = update else {
+                panic!("authentication should report a state for each existing target");
+            };
+            assert_eq!(&state.key, key);
+            assert_eq!(state.status, Status::Down);
+        }
+        requests
+            .send(super::PollerRequest::KillTargets {
+                keys: batch,
+                action: crate::model::KillAction::ShutdownNosave,
+            })
+            .await
+            .unwrap();
+        for expected in keys {
+            let update = tokio::time::timeout(Duration::from_secs(2), updates.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let super::PollerUpdate::Remove { key } = update else {
+                panic!("stopped servers should be removed even after a prior target failed");
+            };
+            assert_eq!(key, expected);
+        }
+    }
+
     #[test]
     fn cluster_signature_is_stable_for_same_membership() {
         let shards_a = vec![ClusterShard {
@@ -1278,7 +1350,7 @@ mod tests {
 
         assert_eq!(state.kind, InstanceType::Replica);
         assert_eq!(state.parent_addr.as_deref(), Some("10.0.0.1:7000"));
-        assert!(state.slots.is_empty());
+        assert_eq!(state.slots, Vec::new());
     }
 
     #[test]
@@ -1291,7 +1363,7 @@ mod tests {
 
         apply_info_to_state(&mut state, "# Replication\r\nrole:master\r\n", None);
 
-        assert!(state.slots.is_empty());
+        assert_eq!(state.slots, Vec::new());
     }
 
     #[test]
