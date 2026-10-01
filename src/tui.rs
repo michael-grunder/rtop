@@ -817,10 +817,22 @@ fn handle_primary_view_quit_key(app: &mut AppState, key: KeyEvent) -> bool {
     }
 
     if app.active_view != ActiveView::Overview
+        || app.is_filtering
         || app.show_help
         || app.overview_modal != OverviewModal::None
     {
         return false;
+    }
+
+    if key.code == KeyCode::Esc {
+        // Clearing selection and exiting require separate presses.
+        if key.kind == KeyEventKind::Repeat {
+            return true;
+        }
+        if app.selected_server_count() > 0 {
+            app.clear_server_selection();
+            return true;
+        }
     }
 
     app.should_quit = true;
@@ -2030,7 +2042,10 @@ const fn help_bindings() -> &'static [(&'static str, &'static str)] {
         ),
         ("Space", "Toggle selection of the focused overview server"),
         ("f or /", "Edit the overview filter (keeps existing text)"),
-        ("Esc", "Back from detail/help or stop filter editing"),
+        (
+            "Esc",
+            "Close overlay/filter/detail/help; clear selection, then quit",
+        ),
         ("Enter", "Open detail view for the focused server"),
         ("Tab/Right", "Next detail panel"),
         ("Left", "Previous detail panel"),
@@ -3146,6 +3161,62 @@ mod tests {
             handle_primary_view_quit_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         assert!(handled);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn esc_clears_all_selections_before_a_second_press_exits() {
+        for count in [1, 2] {
+            let mut app = app_with_selected_servers();
+            if count == 1 {
+                app.move_selection(-1);
+                app.toggle_server_selection();
+            }
+            assert_eq!(app.selected_server_count(), count);
+            // Hidden selections must be cleared too.
+            app.filter = "6381".to_string();
+            app.clamp_selection();
+            let focused = app.selected_key();
+            let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+            assert!(handle_primary_view_quit_key(&mut app, esc));
+            assert_eq!(app.selected_server_count(), 0);
+            assert_eq!(app.selected_key(), focused);
+            assert!(!app.should_quit);
+
+            assert!(handle_primary_view_quit_key(
+                &mut app,
+                KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Repeat),
+            ));
+            assert!(!app.should_quit);
+            assert!(handle_primary_view_quit_key(&mut app, esc));
+            assert!(app.should_quit);
+        }
+    }
+
+    #[test]
+    fn esc_preserves_selection_while_leaving_other_input_contexts() {
+        let mut app = app_with_selected_servers();
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        app.open_column_picker();
+        assert!(!handle_primary_view_quit_key(&mut app, esc));
+        assert!(handle_overlay_quit_key(&mut app, esc));
+        assert_eq!(app.selected_server_count(), 2);
+        app.is_filtering = true;
+        assert!(!handle_primary_view_quit_key(&mut app, esc));
+        app.is_filtering = false;
+        app.active_view = ActiveView::Detail;
+        assert!(!handle_primary_view_quit_key(&mut app, esc));
+        assert_eq!(app.selected_server_count(), 2);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn q_still_exits_with_servers_selected() {
+        let mut app = app_with_selected_servers();
+        assert!(handle_primary_view_quit_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        ));
         assert!(app.should_quit);
     }
 

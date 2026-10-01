@@ -44,7 +44,8 @@
 - `?`: toggle help
 - `Up/Down`: move focus in overview, or scroll the active detail pane when it has more rows than fit
 - `Enter`: open detail for the focused server
-- `Esc`: quit from the overview, close the active overlay window, go back from detail/help, stop filter editing, or leave detail view and clear its active pane filters
+- `Esc`: clear server selections in the overview, or quit if none are selected;
+  close the active overlay window, go back from detail/help, or stop filter editing
 - `Tab` / `Left` / `Right`: cycle detail tabs
 - `S` / `L` / `I` / `C` / `B` / `K`: jump to `Summary` / `Latency` / `Info Raw` / `Commandstats` / `Bigkeys` / `Hotkeys` in detail view
 - `Shift+Up/Down`: reorder columns inside the overview column picker
@@ -70,6 +71,8 @@ sorting, filtering, and view changes, including servers temporarily hidden by
 the filter or Primary view. Auth and kill act on all selected servers, falling
 back to the focused server when none are selected. Tree, Sort By, and Columns
 always apply globally; detail view still opens the focused server.
+Press `Esc` in the overview to clear all selections, including hidden servers;
+press it again to exit. This also applies when only one server is selected.
 
 When discovered servers show `AUTH`, select them and press `a` to try the same
 credentials on each selected server. The username

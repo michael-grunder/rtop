@@ -226,6 +226,10 @@ impl AppState {
         self.marked_keys.len()
     }
 
+    pub fn clear_server_selection(&mut self) {
+        self.marked_keys.clear();
+    }
+
     /// Explicit selections take precedence, including servers hidden by the current view.
     pub fn action_target_keys(&self) -> Vec<String> {
         if self.marked_keys.is_empty() {

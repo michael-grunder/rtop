@@ -44,6 +44,9 @@
 
 ### Changed
 
+- Make `Esc` in the overview clear all server selections before a second press
+  exits, including selections hidden by the current view or filter.
+
 - Share the overview caret gutter with compact selection markers: `●` for
   selected servers and a bold `▶` for the focused selected server, replacing
   the separate checkbox column.
