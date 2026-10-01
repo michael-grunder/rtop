@@ -83,6 +83,7 @@ fn parse_commandstat_entry(key: &str, value: &str) -> Option<CommandStat> {
     let mut calls = None;
     let mut usec = None;
     let mut usec_per_call = None;
+    let mut additional_metrics = std::collections::BTreeMap::new();
 
     for field in value.split(',') {
         let (field_key, field_value) = field.split_once('=')?;
@@ -90,7 +91,9 @@ fn parse_commandstat_entry(key: &str, value: &str) -> Option<CommandStat> {
             "calls" => calls = field_value.parse::<u64>().ok(),
             "usec" => usec = field_value.parse::<u64>().ok(),
             "usec_per_call" => usec_per_call = field_value.parse::<f64>().ok(),
-            _ => {}
+            _ => {
+                additional_metrics.insert(field_key.to_string(), field_value.to_string());
+            }
         }
     }
 
@@ -99,6 +102,7 @@ fn parse_commandstat_entry(key: &str, value: &str) -> Option<CommandStat> {
         calls: calls?,
         usec: usec?,
         usec_per_call: usec_per_call?,
+        additional_metrics,
     })
 }
 
@@ -429,6 +433,29 @@ mod tests {
         assert_eq!(stats[1].command, "get");
         assert_eq!(stats[1].usec, 173_592);
         assert!((stats[2].usec_per_call - 23_996.80).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn commandstats_preserve_additional_metrics_without_loss_of_precision() {
+        let parsed = parse_info(concat!(
+            "# Commandstats\n",
+            "cmdstat_hscan:calls=3,usec=39,usec_per_call=13.00,",
+            "rejected_calls=0,failed_calls=1,",
+            "future_counter=18446744073709551616,future_ratio=0.1234567890123456789,",
+            "future_signed=-42,future_exponent=1.25e+30\n",
+            "cmdstat_get:calls=1,usec=2,usec_per_call=2.00\n",
+        ));
+        let stats = parse_commandstats(&parsed);
+        assert_eq!(stats.len(), 2);
+        let metrics = &stats[0].additional_metrics;
+        assert_eq!(metrics.len(), 6);
+        assert_eq!(metrics["rejected_calls"], "0");
+        assert_eq!(metrics["failed_calls"], "1");
+        assert_eq!(metrics["future_counter"], "18446744073709551616");
+        assert_eq!(metrics["future_ratio"], "0.1234567890123456789");
+        assert_eq!(metrics["future_signed"], "-42");
+        assert_eq!(metrics["future_exponent"], "1.25e+30");
+        assert!(stats[1].additional_metrics.is_empty());
     }
 
     #[test]

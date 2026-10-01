@@ -1287,16 +1287,26 @@ fn draw_commandstats(
     let rows: Vec<Row<'_>> = visible_stats[start..end]
         .iter()
         .map(|stat| {
-            Row::new(columns.iter().map(|column| match column {
-                CommandstatsColumn::Command => Cell::from(stat.command.clone()),
-                CommandstatsColumn::Calls => {
-                    Cell::from(Line::from(format_with_commas(stat.calls)).right_aligned())
-                }
-                CommandstatsColumn::Usec => {
-                    Cell::from(Line::from(format_with_commas(stat.usec)).right_aligned())
-                }
-                CommandstatsColumn::UsecPerCall => {
-                    Cell::from(Line::from(format!("{:.2}", stat.usec_per_call)).right_aligned())
+            Row::new(columns.iter().map(|column| {
+                match column {
+                    CommandstatsColumn::Command => Cell::from(stat.command.clone()),
+                    CommandstatsColumn::Calls => {
+                        Cell::from(Line::from(format_with_commas(stat.calls)).right_aligned())
+                    }
+                    CommandstatsColumn::Usec => {
+                        Cell::from(Line::from(format_with_commas(stat.usec)).right_aligned())
+                    }
+                    CommandstatsColumn::UsecPerCall => {
+                        Cell::from(Line::from(format!("{:.2}", stat.usec_per_call)).right_aligned())
+                    }
+                    CommandstatsColumn::Metric(name) => Cell::from(
+                        Line::from(
+                            stat.additional_metrics
+                                .get(name)
+                                .map_or("-", String::as_str),
+                        )
+                        .right_aligned(),
+                    ),
                 }
             }))
         })
@@ -1305,6 +1315,16 @@ fn draw_commandstats(
         CommandstatsColumn::Command => Constraint::Min(20),
         CommandstatsColumn::Calls | CommandstatsColumn::Usec => Constraint::Length(14),
         CommandstatsColumn::UsecPerCall => Constraint::Length(15),
+        CommandstatsColumn::Metric(name) => {
+            let width = stats
+                .iter()
+                .filter_map(|stat| stat.additional_metrics.get(name))
+                .map(|value| Line::from(value.as_str()).width())
+                .max()
+                .unwrap_or(1)
+                .max(Line::from(name.as_str()).width());
+            Constraint::Length(u16::try_from(width).unwrap_or(u16::MAX))
+        }
     });
     let table = Table::new(rows, widths)
         .header(
@@ -3602,6 +3622,7 @@ mod tests {
             calls: 123_456,
             usec: 987_654,
             usec_per_call: 7.89,
+            additional_metrics: Default::default(),
         }];
         app.apply_update(instance);
         app.open_column_picker();
@@ -3645,6 +3666,56 @@ mod tests {
     }
 
     #[test]
+    fn commandstats_renders_discovered_metrics_right_aligned_with_missing_values() {
+        let mut app = AppState::new(default_settings(), test_registry());
+        app.active_view = ActiveView::Detail;
+        app.detail_tab = 3;
+        let mut instance = InstanceState::new("a".into(), "127.0.0.1:6379".into());
+        instance.detail.commandstats =
+            crate::parse::parse_commandstats(&crate::parse::parse_info(concat!(
+                "# Commandstats\n",
+                "cmdstat_get:calls=3,usec=9,usec_per_call=3.00,",
+                "failed_calls=12,future_metric=18446744073709551616\n",
+                "cmdstat_set:calls=2,usec=8,usec_per_call=4.00,failed_calls=1\n",
+            )));
+        app.apply_update(instance);
+        app.open_column_picker();
+        for label in ["failed_calls", "future_metric"] {
+            app.column_picker_index = app
+                .column_picker_entries()
+                .iter()
+                .position(|entry| entry.label == label)
+                .expect("discovered metric");
+            app.toggle_selected_column_visibility();
+        }
+        app.close_overview_modal();
+        let mut terminal = Terminal::new(TestBackend::new(150, 16)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("detail draw");
+        let lines = buffer_lines(terminal.backend().buffer());
+        let header = lines
+            .iter()
+            .find(|line| line.contains("future_metric"))
+            .expect("header");
+        let get = lines
+            .iter()
+            .find(|line| line.contains("get"))
+            .expect("get row");
+        let set = lines
+            .iter()
+            .find(|line| line.contains("set"))
+            .expect("set row");
+        let failed_end = char_column(header, "failed_calls") + "failed_calls".len();
+        let future_end = char_column(header, "future_metric") + "future_metric".len();
+        assert_eq!(get.chars().nth(failed_end - 2), Some('1'));
+        assert_eq!(get.chars().nth(failed_end - 1), Some('2'));
+        assert_eq!(set.chars().nth(failed_end - 1), Some('1'));
+        assert_eq!(char_column(get, "18446744073709551616") + 20, future_end);
+        assert_eq!(set.chars().nth(future_end - 1), Some('-'));
+    }
+
+    #[test]
     fn detail_commandstats_tab_renders_sorted_table() {
         let mut app = crate::app::AppState::new(
             default_settings(),
@@ -3661,12 +3732,14 @@ mod tests {
                 calls: 2_057,
                 usec: 49_361_425,
                 usec_per_call: 23_996.80,
+                additional_metrics: Default::default(),
             },
             CommandStat {
                 command: "lrange".into(),
                 calls: 400_000,
                 usec: 6_420_146,
                 usec_per_call: 16.05,
+                additional_metrics: Default::default(),
             },
         ];
         app.apply_update(instance);
@@ -3783,12 +3856,14 @@ mod tests {
                 calls: 2_057,
                 usec: 49_361_425,
                 usec_per_call: 23_996.80,
+                additional_metrics: Default::default(),
             },
             CommandStat {
                 command: "lrange".into(),
                 calls: 400_000,
                 usec: 6_420_146,
                 usec_per_call: 16.05,
+                additional_metrics: Default::default(),
             },
         ];
         app.apply_update(instance);
@@ -3823,6 +3898,7 @@ mod tests {
                 calls: u64::try_from(100 - idx).expect("non-negative"),
                 usec: 10,
                 usec_per_call: 1.0,
+                additional_metrics: Default::default(),
             })
             .collect();
         app.apply_update(instance);

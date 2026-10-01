@@ -65,8 +65,14 @@ Function keys remain available as aliases: `F1` help, `F5` view mode, `F6`
 Sort By, `F7` columns, `F8` auth, and `F9` kill. `v` also opens columns.
 `F3` starts overview search input; `F4` starts filtering with an empty filter.
 
-In `Commandstats`, use `c`, `v`, or `F7` to choose from `Command`, `Calls`,
-`Usec`, and `Usec/Call`. Use `Up/Down` or `j/k` to select a column,
+In `Commandstats`, use `c`, `v`, or `F7` to choose columns. `Command`, `Calls`,
+`Usec`, and `Usec/Call` are shown by default. Additional metrics reported by
+`INFO COMMANDSTATS`, such as `rejected_calls` and `failed_calls`, become
+available in the picker automatically and start hidden. Their headers use the
+server's field names, and their values are right-aligned as reported by the
+server. Metrics discovered from any server stay available for the session;
+a command or server that does not report a selected metric shows `-`.
+Use `Up/Down` or `j/k` to select a column,
 `Enter/Space` to toggle it, `Shift+Up/Down` to reorder it, and `Esc/q` to close
 the picker. At least one column stays visible. Choices apply to all servers'
 commandstats for the current session, independently of overview columns.

@@ -2,6 +2,11 @@
 
 ### Added
 
+- Discover additional Commandstats columns from server-reported metrics,
+  including `rejected_calls`, `failed_calls`, and unknown future fields. Keep
+  the four default columns, offer additional metrics unchecked in the picker,
+  and right-align their original values with `-` for missing metrics.
+
 - Add a Commandstats column picker on `c`, `v`, or `F7`, with the same
   visibility toggles and reordering controls as overview columns. Keep its
   column selection and order independently for the current session.

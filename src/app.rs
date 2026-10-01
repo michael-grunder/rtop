@@ -151,8 +151,8 @@ impl AppState {
             auth_form: None,
             column_picker_reorder_mode: false,
             column_picker_target: ColumnPickerTarget::Overview,
-            commandstats_column_order: CommandstatsColumn::ALL.to_vec(),
-            visible_commandstats_columns: CommandstatsColumn::ALL.to_vec(),
+            commandstats_column_order: CommandstatsColumn::DEFAULT.to_vec(),
+            visible_commandstats_columns: CommandstatsColumn::DEFAULT.to_vec(),
             settings,
             filter: String::new(),
             is_filtering: false,
@@ -183,6 +183,19 @@ impl AppState {
     }
 
     pub fn apply_update(&mut self, mut update: InstanceState) {
+        // Append discoveries so polling never moves the picker focus or changes user ordering.
+        let metrics: BTreeSet<_> = update
+            .detail
+            .commandstats
+            .iter()
+            .flat_map(|stat| stat.additional_metrics.keys())
+            .collect();
+        for metric in metrics {
+            let column = CommandstatsColumn::Metric(metric.clone());
+            if !self.commandstats_column_order.contains(&column) {
+                self.commandstats_column_order.push(column);
+            }
+        }
         let key = update.key.clone();
         if self.hotkeys_locally_reset.contains(&key)
             && update.detail.hotkeys.status != crate::hotkeys::HotkeysStatus::Running
@@ -683,8 +696,8 @@ impl AppState {
     pub fn visible_commandstats_columns(&self) -> Vec<CommandstatsColumn> {
         self.commandstats_column_order
             .iter()
-            .copied()
             .filter(|column| self.visible_commandstats_columns.contains(column))
+            .cloned()
             .collect()
     }
 
@@ -893,7 +906,7 @@ impl AppState {
                         .retain(|visible| visible != column);
                 }
             } else {
-                self.visible_commandstats_columns.push(*column);
+                self.visible_commandstats_columns.push(column.clone());
             }
             return;
         }
@@ -1884,6 +1897,62 @@ mod tests {
     }
 
     #[test]
+    fn commandstats_discovers_metrics_without_changing_visibility_order_or_focus() {
+        use crate::commandstats::CommandstatsColumn::{self, Command, Metric};
+
+        let mut app = app();
+        let mut server = InstanceState::new("a".into(), "127.0.0.1:6379".into());
+        server.detail.commandstats = crate::parse::parse_commandstats(&crate::parse::parse_info(
+            "# Commandstats\ncmdstat_get:calls=3,usec=9,usec_per_call=3.00,failed_calls=2\n\
+             cmdstat_set:calls=2,usec=8,usec_per_call=4.00,rejected_calls=1,failed_calls=0\n",
+        ));
+        app.apply_update(server.clone());
+        app.active_view = ActiveView::Detail;
+        app.detail_tab = 3;
+        app.open_column_picker();
+        assert_eq!(
+            app.visible_commandstats_columns(),
+            CommandstatsColumn::DEFAULT
+        );
+        let entries = app.column_picker_entries();
+        assert_eq!(entries.len(), 6);
+        assert_eq!(entries[4].label, "failed_calls");
+        assert_eq!(entries[5].label, "rejected_calls");
+        assert!(!entries[4].visible);
+        assert!(!entries[5].visible);
+
+        app.move_column_picker_selection(4);
+        app.toggle_selected_column_visibility();
+        app.move_selected_column(-3);
+        let expected = app.visible_commandstats_columns();
+        assert_eq!(&expected[..2], &[Command, Metric("failed_calls".into())]);
+        app.apply_update(server); // Repeated metrics are not duplicated.
+        let mut other = InstanceState::new("b".into(), "127.0.0.1:6380".into());
+        other.detail.commandstats = crate::parse::parse_commandstats(&crate::parse::parse_info(
+            "# Commandstats\ncmdstat_get:calls=1,usec=2,usec_per_call=2.00,a_new_metric=123\n",
+        ));
+        app.apply_update(other);
+        assert_eq!(app.column_picker_index, 1);
+        assert_eq!(app.column_picker_entries()[1].label, "failed_calls");
+        assert_eq!(app.column_picker_entries().len(), 7);
+        assert_eq!(app.column_picker_entries()[6].label, "a_new_metric");
+        assert!(!app.column_picker_entries()[6].visible);
+        assert_eq!(app.visible_commandstats_columns(), expected);
+
+        app.remove_instance("a");
+        app.close_overview_modal();
+        app.open_column_picker();
+        assert_eq!(app.visible_commandstats_columns(), expected);
+        assert!(app.column_picker_entries()[1].visible);
+        app.column_picker_index = 1;
+        app.toggle_selected_column_visibility();
+        assert_eq!(
+            app.visible_commandstats_columns(),
+            CommandstatsColumn::DEFAULT
+        );
+    }
+
+    #[test]
     fn commandstats_picker_keeps_one_column_and_clamps_movement() {
         use crate::commandstats::CommandstatsColumn::UsecPerCall;
 
@@ -2254,18 +2323,21 @@ mod tests {
                 calls: 100,
                 usec: 1_000,
                 usec_per_call: 10.0,
+                additional_metrics: Default::default(),
             },
             CommandStat {
                 command: "cluster|shards".into(),
                 calls: 500,
                 usec: 2_000,
                 usec_per_call: 4.0,
+                additional_metrics: Default::default(),
             },
             CommandStat {
                 command: "cluster|info".into(),
                 calls: 50,
                 usec: 500,
                 usec_per_call: 10.0,
+                additional_metrics: Default::default(),
             },
         ];
 
@@ -2286,24 +2358,28 @@ mod tests {
                 calls: 4,
                 usec: 4,
                 usec_per_call: 1.0,
+                additional_metrics: Default::default(),
             },
             CommandStat {
                 command: "b".into(),
                 calls: 3,
                 usec: 3,
                 usec_per_call: 1.0,
+                additional_metrics: Default::default(),
             },
             CommandStat {
                 command: "c".into(),
                 calls: 2,
                 usec: 2,
                 usec_per_call: 1.0,
+                additional_metrics: Default::default(),
             },
             CommandStat {
                 command: "d".into(),
                 calls: 1,
                 usec: 1,
                 usec_per_call: 1.0,
+                additional_metrics: Default::default(),
             },
         ];
 

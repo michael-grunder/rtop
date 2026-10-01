@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -333,6 +333,8 @@ pub struct CommandStat {
     pub calls: u64,
     pub usec: u64,
     pub usec_per_call: f64,
+    /// Unrecognized metrics retain the server's representation without numeric conversion.
+    pub additional_metrics: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
