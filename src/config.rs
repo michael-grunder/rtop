@@ -1,10 +1,12 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::credentials::{self, CredentialStore};
 use crate::model::{RuntimeSettings, SortMode, Target, TargetProtocol, UiColor, UiTheme, ViewMode};
 use crate::target_addr::normalize_tcp_addr;
 
@@ -24,6 +26,7 @@ struct GlobalConfig {
     view_default: Option<String>,
     sort_default: Option<String>,
     still_autodiscover: Option<bool>,
+    remember_auth: Option<bool>,
     leave_killed_servers: Option<bool>,
 }
 
@@ -53,6 +56,7 @@ struct ThemeConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeOverrides {
+    pub credential_store: Option<Arc<CredentialStore>>,
     pub refresh_interval_ms: Option<u64>,
     pub connect_timeout_ms: Option<u64>,
     pub command_timeout_ms: Option<u64>,
@@ -72,6 +76,7 @@ pub struct LoadedConfig {
 
 pub fn default_settings() -> RuntimeSettings {
     RuntimeSettings {
+        credential_store: None,
         refresh_interval: std::time::Duration::from_secs(1),
         connect_timeout: std::time::Duration::from_millis(300),
         command_timeout: std::time::Duration::from_millis(500),
@@ -100,6 +105,7 @@ pub fn load_config(path: Option<&Path>, no_default_config: bool) -> Result<Loade
         .with_context(|| format!("failed to parse TOML config {}", path.display()))?;
 
     let mut targets = Vec::new();
+    let mut configured_auth = Vec::new();
     if let Some(entries) = parsed.targets {
         for entry in entries {
             if entry.enabled == Some(false) {
@@ -113,6 +119,9 @@ pub fn load_config(path: Option<&Path>, no_default_config: bool) -> Result<Loade
                 );
                 continue;
             };
+            let declares_auth = entry.username.is_some()
+                || entry.password.is_some()
+                || entry.password_env.is_some();
             let password = resolve_password(&entry, &path)?;
             let addr = addr.trim().to_string();
             if addr.is_empty() {
@@ -128,7 +137,7 @@ pub fn load_config(path: Option<&Path>, no_default_config: bool) -> Result<Loade
                 TargetProtocol::Tcp => normalize_tcp_addr(&addr)?,
                 TargetProtocol::Unix => addr,
             };
-            targets.push(Target {
+            let target = Target {
                 alias: entry.alias,
                 addr,
                 protocol,
@@ -136,13 +145,26 @@ pub fn load_config(path: Option<&Path>, no_default_config: bool) -> Result<Loade
                 password,
                 tags: entry.tags.unwrap_or_default(),
                 process_id: None,
-            });
+            };
+            if declares_auth {
+                configured_auth.push(target.clone());
+            }
+            targets.push(target);
         }
     }
 
     let global = parsed.global.unwrap_or_default();
+    let credential_store = if global.remember_auth.unwrap_or(false) {
+        Some(Arc::new(CredentialStore::load(
+            credentials::default_path()?,
+            &configured_auth,
+        )?))
+    } else {
+        None
+    };
     Ok(LoadedConfig {
         overrides: RuntimeOverrides {
+            credential_store,
             refresh_interval_ms: global.refresh_interval_ms,
             connect_timeout_ms: global.connect_timeout_ms,
             command_timeout_ms: global.command_timeout_ms,
@@ -158,6 +180,8 @@ pub fn load_config(path: Option<&Path>, no_default_config: bool) -> Result<Loade
 }
 
 pub fn apply_overrides(mut base: RuntimeSettings, overrides: &RuntimeOverrides) -> RuntimeSettings {
+    base.credential_store
+        .clone_from(&overrides.credential_store);
     if let Some(ms) = overrides.refresh_interval_ms {
         base.refresh_interval = std::time::Duration::from_millis(ms);
     }
@@ -499,7 +523,7 @@ still_autodiscover = false
     }
 
     #[test]
-    fn resolve_config_path_prefers_flat_xdg_file() {
+    fn default_config_discovery_and_auth_persistence_respect_opt_in() {
         let _env_lock = ENV_LOCK.lock().expect("env lock");
         let dir = tempfile::tempdir().expect("temp dir");
         let xdg = dir.path().join("xdg");
@@ -518,6 +542,8 @@ still_autodiscover = false
         let resolved = resolve_config_path(None, false);
         assert_eq!(resolved, Some(PathBuf::from(&config_path)));
 
+        check_credential_persistence(&config_path, &xdg);
+
         // SAFETY: restore the prior process environment after the assertion.
         unsafe {
             match old_xdg {
@@ -529,6 +555,64 @@ still_autodiscover = false
                 None => std::env::remove_var("HOME"),
             }
             std::env::remove_var("RTOP_TEST_PASSWORD");
+        }
+    }
+
+    fn check_credential_persistence(config_path: &std::path::Path, xdg: &std::path::Path) {
+        // Disabled persistence must not even parse an existing generated file.
+        let auth_path = xdg.join("rtop-auth.toml");
+        std::fs::write(&auth_path, "password = invalid-toml-secret").unwrap();
+        let loaded = load_config(None, false).unwrap();
+        assert!(loaded.overrides.credential_store.is_none());
+        std::fs::write(config_path, "[global]\nremember_auth = false\n").unwrap();
+        assert!(
+            load_config(None, false)
+                .unwrap()
+                .overrides
+                .credential_store
+                .is_none()
+        );
+        std::fs::write(config_path, "[global]\nremember_auth = true\n").unwrap();
+        let error = load_config(None, false).unwrap_err();
+        assert!(!format!("{error:#}").contains("invalid-toml-secret"));
+        assert!(
+            load_config(None, true)
+                .unwrap()
+                .overrides
+                .credential_store
+                .is_none()
+        );
+
+        std::fs::write(
+            &auth_path,
+            r#"
+[[targets]]
+addr = "localhost:6380"
+protocol = "tcp"
+username = "saved-user"
+password = "saved-password"
+"#,
+        )
+        .unwrap();
+        let original_saved = std::fs::read(&auth_path).unwrap();
+        for (declaration, username, password) in [
+            ("", Some("saved-user"), Some("saved-password")),
+            ("password = \"main-password\"", None, Some("main-password")),
+            ("user = \"main-user\"", Some("main-user"), None),
+            ("password_env = \"RTOP_TEST_AUTH_UNSET_912084\"", None, None),
+        ] {
+            std::fs::write(config_path, format!("[global]\nremember_auth = true\n[[targets]]\naddr = \"127.0.0.1:6380\"\n{declaration}\n")).unwrap();
+            let loaded = load_config(None, false).unwrap();
+            let mut candidate = loaded.targets[0].clone();
+            let settings = apply_overrides(default_settings(), &loaded.overrides);
+            settings
+                .credential_store
+                .unwrap()
+                .apply(&mut candidate)
+                .unwrap();
+            assert_eq!(candidate.username.as_deref(), username);
+            assert_eq!(candidate.password.as_deref(), password);
+            assert_eq!(std::fs::read(&auth_path).unwrap(), original_saved);
         }
     }
 }

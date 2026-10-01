@@ -2,6 +2,11 @@
 
 ### Added
 
+- Add opt-in `[global].remember_auth` to persist credentials only after successful
+  Redis authentication in a private, generated `rtop-auth.toml` under the user
+  config directory. Reuse credentials for matching endpoints while main-config
+  authentication overrides the saved pair; use atomic writes and a file lock.
+
 - Add Space selection of overview servers, with row markers and a selected
   count that persist across refreshes, sorting, filtering, and view changes.
 
@@ -103,6 +108,9 @@
   autodiscovery for matching endpoints.
 
 ### Fixed
+
+- Finish the `rtop` rename in the TUI title and verbose startup output; verify
+  default config discovery uses `rtop.toml`.
 
 - Admit discovery topology expansions inline in the discovery manager loop
   instead of routing them back through its own message channel, so a run seeded

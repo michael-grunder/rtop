@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use redis::{AsyncConnectionConfig, Client, ErrorKind};
 
+use crate::credentials::CredentialStore;
 use crate::model::{RuntimeSettings, Target, TargetProtocol};
 
 /// Open a Redis connection and authenticate it explicitly when credentials are
@@ -9,7 +12,13 @@ pub async fn connect(
     target: &Target,
     settings: &RuntimeSettings,
 ) -> redis::RedisResult<redis::aio::MultiplexedConnection> {
-    let client = Client::open(connection_url(target))?;
+    let mut target = target.clone();
+    if let Some(store) = &settings.credential_store {
+        store
+            .apply(&mut target)
+            .map_err(|error| redis::RedisError::from(std::io::Error::other(error.to_string())))?;
+    }
+    let client = Client::open(connection_url(&target))?;
     let config = AsyncConnectionConfig::new()
         .set_connection_timeout(Some(settings.connect_timeout))
         .set_response_timeout(Some(settings.command_timeout));
@@ -17,8 +26,27 @@ pub async fn connect(
         .get_multiplexed_async_connection_with_config(&config)
         .await?;
 
-    authenticate(&mut connection, target).await?;
+    authenticate_and_remember(&mut connection, &target, settings.credential_store.as_ref()).await?;
     Ok(connection)
+}
+
+async fn authenticate_and_remember(
+    connection: &mut impl redis::aio::ConnectionLike,
+    target: &Target,
+    store: Option<&Arc<CredentialStore>>,
+) -> redis::RedisResult<()> {
+    authenticate(connection, target).await?;
+    if let Some(store) = store.filter(|_| target.password.is_some()) {
+        let store = Arc::clone(store);
+        let target = target.clone();
+        // Disk access and the cross-process file lock must not block the async runtime.
+        match tokio::task::spawn_blocking(move || store.remember_authenticated(&target)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("warning: could not remember authentication: {error:#}"),
+            Err(error) => eprintln!("warning: credential persistence task failed: {error}"),
+        }
+    }
+    Ok(())
 }
 
 async fn authenticate(
@@ -161,5 +189,107 @@ mod tests {
             connection.commands[1],
             b"*2\r\n$4\r\nAUTH\r\n$9\r\nsecret:/?\r\n"
         );
+    }
+
+    #[tokio::test]
+    async fn persistence_requires_successful_auth_and_opt_in() {
+        use crate::credentials::CredentialStore;
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rtop-auth.toml");
+        let store = Arc::new(CredentialStore::load(path.clone(), &[]).unwrap());
+        let target = target(TargetProtocol::Tcp, "localhost:6380");
+        let rejected = || redis::RedisError::from((ErrorKind::AuthenticationFailed, "WRONGPASS"));
+        let mut connection = MockConnection {
+            commands: Vec::new(),
+            responses: VecDeque::from([
+                Err(rejected()),
+                Ok(Value::Okay),
+                Ok(Value::Okay),
+                Err(rejected()),
+            ]),
+        };
+        assert!(
+            super::authenticate_and_remember(&mut connection, &target, Some(&store))
+                .await
+                .is_err()
+        );
+        assert!(!path.exists());
+        super::authenticate_and_remember(&mut connection, &target, None)
+            .await
+            .unwrap();
+        assert!(!path.exists());
+        super::authenticate_and_remember(&mut connection, &target, Some(&store))
+            .await
+            .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut incorrect = target.clone();
+        incorrect.password = Some("wrong".to_owned());
+        assert!(
+            super::authenticate_and_remember(&mut connection, &incorrect, Some(&store))
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn legacy_auth_is_saved_only_after_fallback_succeeds() {
+        use crate::credentials::CredentialStore;
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rtop-auth.toml");
+        let store = Arc::new(CredentialStore::load(path.clone(), &[]).unwrap());
+        let unsupported = || {
+            redis::RedisError::from((
+                ErrorKind::Server(redis::ServerErrorKind::ResponseError),
+                "wrong number of arguments",
+            ))
+        };
+        let mut connection = MockConnection {
+            commands: Vec::new(),
+            responses: VecDeque::from([
+                Err(unsupported()),
+                Err(redis::RedisError::from((
+                    ErrorKind::AuthenticationFailed,
+                    "WRONGPASS",
+                ))),
+                Err(unsupported()),
+                Ok(Value::Okay),
+            ]),
+        };
+        let target = target(TargetProtocol::Tcp, "localhost:6380");
+        assert!(
+            super::authenticate_and_remember(&mut connection, &target, Some(&store))
+                .await
+                .is_err()
+        );
+        assert!(!path.exists());
+        super::authenticate_and_remember(&mut connection, &target, Some(&store))
+            .await
+            .unwrap();
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_does_not_fail_authentication() {
+        use crate::credentials::CredentialStore;
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rtop-auth.toml");
+        let store = Arc::new(CredentialStore::load(path.clone(), &[]).unwrap());
+        std::fs::create_dir(&path).unwrap();
+        let mut connection = MockConnection {
+            commands: Vec::new(),
+            responses: VecDeque::from([Ok(Value::Okay)]),
+        };
+        super::authenticate_and_remember(
+            &mut connection,
+            &target(TargetProtocol::Tcp, "localhost:6380"),
+            Some(&store),
+        )
+        .await
+        .unwrap();
+        assert!(path.is_dir());
     }
 }

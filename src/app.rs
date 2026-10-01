@@ -1358,6 +1358,7 @@ mod tests {
 
     fn settings() -> RuntimeSettings {
         RuntimeSettings {
+            credential_store: None,
             refresh_interval: Duration::from_secs(1),
             connect_timeout: Duration::from_millis(300),
             command_timeout: Duration::from_millis(500),

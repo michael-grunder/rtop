@@ -78,7 +78,9 @@ When discovered servers show `AUTH`, select them and press `a` to try the same
 credentials on each selected server. The username
 defaults to Redis' `default` user and may be cleared for password-only
 authentication. The password is masked while it is entered, and the submitted
-credentials are kept only for the current process. For compatibility with
+credentials are kept only for the current process by default. Enable
+`[global].remember_auth` to reuse successfully authenticated credentials after
+restarting. For compatibility with
 Redis versions before 6.0, `rtop` first tries `AUTH default <password>` and
 retries with `AUTH <password>` when the server reports that the ACL-style form
 is unsupported. A non-default username is sent only with the ACL-style form.
@@ -293,6 +295,7 @@ concurrency_limit = 16
 view_default = "tree"
 sort_default = "address"
 still_autodiscover = true
+remember_auth = false
 
 [theme]
 background_color = "black"
@@ -344,6 +347,33 @@ visible = ["alias", "addr", "role", "slots_total", "used_mem", "ops", "lat_last"
 by = "ops"
 dir = "desc"
 ```
+
+`[global].remember_auth` defaults to `false`. Set it to `true` to save credentials
+only after Redis accepts `AUTH` (including credentials entered in the auth form,
+CLI, or main config). With multiple selected servers, only successful servers
+are saved; failed attempts never replace previously saved credentials. Saving
+happens immediately after authentication, even if a later monitoring command is
+denied by ACLs.
+
+Saved credentials live in the generated `$XDG_CONFIG_HOME/rtop-auth.toml`, or
+`~/.config/rtop-auth.toml` when `XDG_CONFIG_HOME` is unset, empty, or relative.
+This location is independent of `--config`; `rtop` never rewrites `rtop.toml`.
+The file contains **plaintext passwords** and is created with owner-only
+permissions (`0600` on Unix). Writes are atomic and use an adjacent
+`rtop-auth.lock` to coordinate concurrent processes.
+
+Saved credentials apply only to matching TCP addresses or Unix socket paths,
+including servers found by autodiscovery; they do not add targets to the server
+list. Auth declared in a matching main-config target (`user`/`username`,
+`password`, or `password_env`) replaces the entire saved credential pair. An
+unset `password_env` never falls back to a saved password. Explicit connection
+credentials and interactive retries also take precedence over saved credentials.
+
+Disabling `remember_auth` stops both reading and writing the generated file;
+it does not delete existing credentials. Delete `rtop-auth.toml` to forget all
+saved credentials. `--no-config` also disables persistence unless an explicit
+`--config` file enables it. A malformed generated file is reported without
+printing its contents, and write failures warn without failing authentication.
 
 `[theme]` colors support: `black`, `red`, `green`, `yellow`, `blue`,
 `magenta`, `cyan`, `gray`/`grey`, `white`.

@@ -66,7 +66,7 @@ const DETAIL_TABS: [DetailTabSpec; 6] = [
 pub async fn run(launch: LaunchConfig) -> Result<()> {
     if launch.verbose {
         eprintln!(
-            "redis-top: targets={} refresh={} connect_timeout={} command_timeout={}",
+            "rtop: targets={} refresh={} connect_timeout={} command_timeout={}",
             launch.targets.len(),
             humantime::format_duration(launch.settings.refresh_interval),
             humantime::format_duration(launch.settings.connect_timeout),
@@ -948,7 +948,7 @@ fn draw_overview(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect)
         .split(area);
 
     let header = Paragraph::new(format!(
-        "redis-top  refresh={}  view={:?}  sort={} {}  host={}  filter={}{}",
+        "rtop  refresh={}  view={:?}  sort={} {}  host={}  filter={}{}",
         humantime::format_duration(app.settings.refresh_interval),
         app.view_mode,
         overview.header.sort.label,

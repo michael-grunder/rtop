@@ -70,7 +70,8 @@ impl SortDirection {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TargetProtocol {
     Tcp,
     Unix,
@@ -143,6 +144,7 @@ pub struct Target {
 
 #[derive(Debug, Clone)]
 pub struct RuntimeSettings {
+    pub credential_store: Option<std::sync::Arc<crate::credentials::CredentialStore>>,
     pub refresh_interval: Duration,
     pub connect_timeout: Duration,
     pub command_timeout: Duration,

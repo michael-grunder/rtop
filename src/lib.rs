@@ -12,6 +12,7 @@ pub mod cluster;
 pub mod column;
 pub mod columns;
 pub mod config;
+pub mod credentials;
 pub mod discovery;
 pub mod hotkeys;
 pub mod model;
