@@ -10,6 +10,8 @@ use crate::credentials::{self, CredentialStore};
 use crate::model::{RuntimeSettings, SortMode, Target, TargetProtocol, UiColor, UiTheme, ViewMode};
 use crate::target_addr::normalize_tcp_addr;
 
+pub mod command;
+
 #[derive(Debug, Deserialize, Default)]
 struct FileConfig {
     global: Option<GlobalConfig>,

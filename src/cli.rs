@@ -67,8 +67,21 @@ struct Cli {
     )]
     autodiscover_hosts: Vec<String>,
 
-    #[arg(short = 'c', long = "config", value_name = "PATH")]
+    /// Select a config file for monitoring or --config commands.
+    #[arg(short = 'c', long = "config-file", value_name = "PATH")]
     config: Option<PathBuf>,
+
+    /// Inspect settings, get KEY, or set KEY VALUE. Also accepts a legacy config path.
+    #[arg(long = "config", value_name = "get|set|PATH", num_args = 0..=1, default_missing_value = "list")]
+    config_command: Option<String>,
+
+    /// Select an existing config target by alias or address.
+    #[arg(
+        long = "target",
+        value_name = "ALIAS_OR_ADDRESS",
+        requires = "config_command"
+    )]
+    config_target: Option<String>,
 
     #[arg(long = "refresh", value_name = "DURATION")]
     refresh: Option<String>,
@@ -135,12 +148,50 @@ enum CliOutputMode {
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn build_launch_config() -> Result<LaunchConfig> {
-    build_launch_config_from(Cli::parse())
+pub fn launch_or_config() -> Result<Option<LaunchConfig>> {
+    let args = Cli::parse();
+    if let Some(action @ ("list" | "get" | "set")) = args.config_command.as_deref() {
+        if args.no_config
+            || args.once
+            || args.verbose
+            || args.auth.is_some()
+            || args.user.is_some()
+            || args.refresh.is_some()
+            || args.connect_timeout.is_some()
+            || args.command_timeout.is_some()
+            || args.concurrency.is_some()
+            || args.view.is_some()
+            || args.sort.is_some()
+            || args.output != CliOutputMode::Tui
+            || !args.unix_targets.is_empty()
+            || !args.tcp_targets.is_empty()
+            || !args.cluster_targets.is_empty()
+            || !args.autodiscover_hosts.is_empty()
+        {
+            bail!("--config commands cannot be combined with monitoring options");
+        }
+        config::command::run(
+            action,
+            &args.targets,
+            args.config_target.as_deref(),
+            args.config.as_deref(),
+        )?;
+        return Ok(None);
+    }
+    if args.config_target.is_some() {
+        bail!("--target requires a --config inspection or get/set command");
+    }
+    build_launch_config_from(args).map(Some)
 }
 
 #[allow(clippy::too_many_lines)]
-fn build_launch_config_from(args: Cli) -> Result<LaunchConfig> {
+fn build_launch_config_from(mut args: Cli) -> Result<LaunchConfig> {
+    if let Some(path) = args.config_command.take() {
+        if args.config.is_some() {
+            bail!("choose either --config PATH or --config-file PATH");
+        }
+        args.config = Some(PathBuf::from(path));
+    }
     let base_settings = config::default_settings();
     let loaded_config = config::load_config(args.config.as_deref(), args.no_config)?;
     let config_target_count = loaded_config.targets.len();

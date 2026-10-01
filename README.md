@@ -131,8 +131,13 @@ rtop --once
 rtop --output json
 rtop --output json --once
 rtop --autodiscover 10.0.0.12 --once
-rtop --config ~/.config/rtop.toml
+rtop --config-file ~/.config/rtop.toml
 rtop -c config.toml 127.0.0.1:6379
+rtop --config
+rtop --config get global.refresh_interval_ms
+rtop --config set global.refresh_interval_ms 2000
+rtop --config get addr --target local
+rtop --config set enabled false --target local
 ```
 
 For TCP targets, you can pass just a port (for example `6379`), and it is treated as
@@ -162,7 +167,9 @@ treated as `127.0.0.1:7000`.
 
 Important options:
 
-- `-c, --config <PATH>`
+- `-c, --config-file <PATH>` (legacy `--config <PATH>` still works)
+- `--config [get KEY | set KEY VALUE]`
+- `--target <ALIAS_OR_ADDRESS>` (select a target for config commands)
 - `--once`
 - `--output <tui|json>`
 - `--refresh <DURATION>`
@@ -278,11 +285,67 @@ early and the rest of the suite still runs.
 
 ## Config
 
-Search order when `--config` is not provided:
+Monitoring config search order when no explicit file is provided:
 
 1. `$XDG_CONFIG_HOME/rtop.toml`
 2. `~/.config/rtop.toml`
 3. `./rtop.toml`
+
+### Inspecting and editing settings
+
+`rtop --config` prints a grouped overview with the file path, global settings,
+saved targets (including disabled ones), and other saved sections. Global
+defaults are marked `[default]`; headings are colored when stdout is a terminal.
+It exits without starting monitoring or contacting Redis.
+
+Config commands use `$XDG_CONFIG_HOME/rtop.toml`, falling back to
+`~/.config/rtop.toml` when `XDG_CONFIG_HOME` is unset, empty, or relative. They
+do not fall back to the working directory's `rtop.toml`. Use `-c PATH` or
+`--config-file PATH` to inspect or edit another file. A missing user config
+shows global defaults and is created on the first successful `set`.
+
+```bash
+rtop --config                                      # grouped overview
+rtop --config get global.refresh_interval_ms        # single value
+rtop --config set global.refresh_interval_ms 2000
+rtop --config set remember_auth true                # global. is optional
+rtop --config set theme.foreground_color cyan
+rtop --config --target local                        # one saved target
+rtop --config get addr --target local
+rtop --config set enabled false --target local
+rtop --config set tags '["dev", "cache"]' --target local
+rtop --config set password_env REDIS_PASSWORD --target localhost:6379
+rtop --config -c ./rtop.toml
+```
+
+`--target` matches an existing target's alias or address. TCP address matching
+also accepts port-only forms and equivalent loopback addresses. Missing or
+ambiguous targets fail; these commands do not create target entries. Global
+`get` returns a saved value or its built-in default; target and theme `get`
+require a saved value. Target `user` and `username` are interchangeable.
+
+`set` accepts documented global, theme, and target keys. Booleans use `true` or
+`false`, intervals (in milliseconds) and concurrency require positive integers,
+and tags use a TOML array of strings. String values are passed literally, without
+TOML quoting. Invalid keys and values fail without changing the config. Use
+`--` before positional arguments if a value begins with a dash.
+
+Passwords, usernames, secret/token fields, and URL user information are redacted
+in both overview and `get` output. `password_env` names remain visible; their
+values are never read by config commands. Comments are not displayed, and parse
+errors omit source text to avoid exposing credentials. Setting a password does
+not echo it, but a literal command-line password may be recorded in shell history
+or visible in process arguments; prefer `password_env`.
+
+Updates preserve comments and unrelated sections, use a sibling `.toml.lock`
+file to coordinate writers, and replace the file atomically with owner-only
+permissions (`0600` on Unix). Setting `password` removes `password_env`, and
+vice versa; setting `user` or `username` removes the other spelling. Config
+commands never read or modify the generated `rtop-auth.toml` credential cache.
+Monitoring flags cannot be combined with config commands. The legacy
+`--config PATH` spelling still starts monitoring with that file; the words
+`list`, `get`, and `set` are reserved for config commands, so use `-c` for paths
+with those names.
 
 Example:
 
@@ -357,7 +420,8 @@ denied by ACLs.
 
 Saved credentials live in the generated `$XDG_CONFIG_HOME/rtop-auth.toml`, or
 `~/.config/rtop-auth.toml` when `XDG_CONFIG_HOME` is unset, empty, or relative.
-This location is independent of `--config`; `rtop` never rewrites `rtop.toml`.
+This location is independent of the selected monitoring config file; credential
+persistence never rewrites `rtop.toml`.
 The file contains **plaintext passwords** and is created with owner-only
 permissions (`0600` on Unix). Writes are atomic and use an adjacent
 `rtop-auth.lock` to coordinate concurrent processes.

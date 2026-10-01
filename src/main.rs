@@ -5,6 +5,8 @@ use rtop::{cli, tui};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let launch = cli::build_launch_config()?;
-    tui::run(launch).await
+    if let Some(launch) = cli::launch_or_config()? {
+        tui::run(launch).await?;
+    }
+    Ok(())
 }

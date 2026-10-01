@@ -2,6 +2,12 @@
 
 ### Added
 
+- Add `--config` for a grouped, credential-redacted settings overview and
+  `--config get/set` for global, theme, and existing target settings selected
+  with `--target`. Preserve TOML comments and unrelated sections, validate
+  updates, and write atomically with private permissions. Add `--config-file`
+  alongside `-c` while preserving legacy `--config PATH` monitoring usage.
+
 - Add opt-in `[global].remember_auth` to persist credentials only after successful
   Redis authentication in a private, generated `rtop-auth.toml` under the user
   config directory. Reuse credentials for matching endpoints while main-config
