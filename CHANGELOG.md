@@ -41,6 +41,12 @@
 
 ### Changed
 
+- Lead overview controls and help with mnemonic shortcuts: `a` for auth,
+  `f` or `/` for filtering, `t` for view mode, `s` for Sort By, `c` for columns,
+  and `k` for the kill picker. Accept uppercase variants and retain function
+  keys and `v` as compatibility shortcuts. `s` now opens the sort picker
+  instead of cycling columns; `f` and `/` both preserve existing filter text.
+
 - Authenticate connections explicitly and fall back from `AUTH default
   <password>` to the pre-Redis-6 `AUTH <password>` form when a server rejects
   ACL syntax.

@@ -19,10 +19,10 @@
   server-reported error details when polling fails
 - Tree, flat, and primary-only overview modes
 - Sorting by currently visible column keys and substring filtering
-- Kill picker on `F9` with Redis `SHUTDOWN` and local signal options
-- Credential form on `F8` for authenticating the selected server without
+- Kill picker on `k` with Redis `SHUTDOWN` and local signal options
+- Credential form on `a` for authenticating the selected server without
   restarting `reditop`
-- Bottom status/key bar with htop-style function key labels and live search/filter input echo
+- Bottom status/key bar with mnemonic shortcut labels and live search/filter input echo
 - Live discovery status in the footer, including queued/probing/verified counts
 - Config loading from TOML + CLI target merge
 - Handles per-instance failures without crashing UI
@@ -32,24 +32,19 @@
 
 - `q`: quit from the overview, or close the active overlay window
 - `Ctrl+C`: quit immediately
-- `F1`: open full help page
-- `F3`: start search input (overview)
-- `F4`: start filter input and clear existing filter (overview)
-- `F5`: cycle Tree / Flat / Primary (overview)
-- `F6`: open sort picker from currently visible overview columns
-- `F7`: open overview column picker for toggling and reordering visible columns
-- `F8`: enter a username and password for the selected server and retry it
-- `F9`: open kill picker for the selected overview row
 - `H`: open full help page
+- `f` or `/`: edit the overview filter, keeping existing text
+- `t`: cycle Tree / Flat / Primary (overview)
+- `s`: open Sort By to choose from currently visible overview columns
+- `c`: open the overview column picker for toggling and reordering columns
+- `a`: enter a username and password for the selected server and retry it
+- `k`: open the kill picker for the selected overview row; `Enter` executes the chosen action
 - `?`: toggle help
 - `Up/Down`: move selection in overview, or scroll the active detail pane when it has more rows than fit
 - `Enter`: open detail
 - `Esc`: quit from the overview, close the active overlay window, go back from detail/help, stop filter editing, or leave detail view and clear its active pane filters
 - `Tab` / `Left` / `Right`: cycle detail tabs
 - `S` / `L` / `I` / `C` / `B` / `K`: jump to `Summary` / `Latency` / `Info Raw` / `Commandstats` / `Bigkeys` / `Hotkeys` in detail view
-- `t`: cycle Tree / Flat / Primary
-- `s`: cycle sort column
-- `v`: open overview column picker
 - `Shift+Up/Down`: reorder columns inside the overview column picker
 - `h`: toggle host rendering (default auto-hides host when all targets share one host)
 - `/`: start filter input in overview, or filter the active detail pane in detail view (`Summary`, `Latency`, `Info Raw`, `Commandstats`, `Bigkeys`, or `Hotkeys`)
@@ -57,7 +52,15 @@
 - `X`: stop active `Hotkeys` sampling early, or reset the `Hotkeys` pane back to its idle prompt
 - `r` / `R`: refresh now, rerun the on-demand `Bigkeys` scan, or rerun `Hotkeys` sampling for the last selected metric while that tab is open
 
-When a discovered server shows `AUTH`, select it and press `F8`. The username
+Overview shortcuts `a`, `f`, `t`, `s`, `c`, and `k` also accept uppercase
+letters. While editing a filter or credentials, letters are entered as text.
+Detail tab shortcuts keep their existing meanings.
+
+Function keys remain available as aliases: `F1` help, `F5` view mode, `F6`
+Sort By, `F7` columns, `F8` auth, and `F9` kill. `v` also opens columns.
+`F3` starts overview search input; `F4` starts filtering with an empty filter.
+
+When a discovered server shows `AUTH`, select it and press `a`. The username
 defaults to Redis' `default` user and may be cleared for password-only
 authentication. The password is masked while it is entered, and the submitted
 credentials are kept only for the current process. For compatibility with
@@ -65,7 +68,7 @@ Redis versions before 6.0, `reditop` first tries `AUTH default <password>` and
 retries with `AUTH <password>` when the server reports that the ACL-style form
 is unsupported. A non-default username is sent only with the ACL-style form.
 
-The `F9` kill picker offers `SHUTDOWN SAVE`, `SHUTDOWN NOSAVE`, `SIGINT`,
+The `k` kill picker offers `SHUTDOWN SAVE`, `SHUTDOWN NOSAVE`, `SIGINT`,
 `SIGTERM`, `SIGQUIT`, and `SIGKILL`. The Redis shutdown commands work over the
 current connection, while the signal-based options require a local TCP or Unix
 socket target plus `process_id` from `INFO server`.

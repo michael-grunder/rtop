@@ -378,45 +378,13 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, launch: LaunchCon
                 continue;
             }
 
+            if handle_overview_shortcut(&mut app, key) {
+                continue;
+            }
+
             match key.code {
                 KeyCode::F(1) | KeyCode::Char('H') => app.open_help_view(),
                 KeyCode::Char('?') => app.show_help = !app.show_help,
-                KeyCode::F(5) | KeyCode::Char('t') if app.active_view == ActiveView::Overview => {
-                    app.cycle_view_mode();
-                    app.clamp_selection();
-                }
-                KeyCode::F(6) if app.active_view == ActiveView::Overview => {
-                    app.open_sort_picker();
-                }
-                KeyCode::Char('s') if app.active_view == ActiveView::Overview => {
-                    app.cycle_sort_mode();
-                }
-                KeyCode::F(7) | KeyCode::Char('v') if app.active_view == ActiveView::Overview => {
-                    app.open_column_picker();
-                }
-                KeyCode::F(8)
-                    if app.active_view == ActiveView::Overview && app.selected_key().is_some() =>
-                {
-                    app.open_auth_form();
-                }
-                KeyCode::F(9)
-                    if app.active_view == ActiveView::Overview && app.selected_key().is_some() =>
-                {
-                    app.open_kill_picker();
-                }
-                KeyCode::Char('h') if app.active_view == ActiveView::Overview => {
-                    app.toggle_host_rendering();
-                    app.clamp_selection();
-                }
-                KeyCode::F(3) if app.active_view == ActiveView::Overview => {
-                    app.start_filter_input(FilterPromptMode::Search, false);
-                }
-                KeyCode::F(4) if app.active_view == ActiveView::Overview => {
-                    app.start_filter_input(FilterPromptMode::Filter, true);
-                }
-                KeyCode::Char('/') if app.active_view == ActiveView::Overview => {
-                    app.start_filter_input(FilterPromptMode::Filter, false);
-                }
                 KeyCode::Char('/') if is_commandstats_detail(&app) => {
                     app.start_active_detail_filter_input(false);
                     sync_commandstats_view(&mut app, terminal.size()?.height);
@@ -551,6 +519,44 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, launch: LaunchCon
     }
 
     Ok(())
+}
+
+/// Handle overview commands after text inputs and modal dialogs have consumed their keys.
+fn handle_overview_shortcut(app: &mut AppState, key: KeyEvent) -> bool {
+    if app.active_view != ActiveView::Overview
+        || app.is_filtering
+        || app.overview_modal != OverviewModal::None
+        || app.show_help
+        || key.kind != KeyEventKind::Press
+        || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return false;
+    }
+
+    match key.code {
+        KeyCode::F(5) | KeyCode::Char('t' | 'T') => app.cycle_view_mode(),
+        KeyCode::F(6) | KeyCode::Char('s' | 'S') => app.open_sort_picker(),
+        KeyCode::F(7) | KeyCode::Char('c' | 'C' | 'v') => app.open_column_picker(),
+        KeyCode::F(8) | KeyCode::Char('a' | 'A') => app.open_auth_form(),
+        KeyCode::F(9) | KeyCode::Char('k' | 'K') => {
+            if app.selected_key().is_some() {
+                app.open_kill_picker();
+            }
+        }
+        KeyCode::Char('h') => {
+            app.toggle_host_rendering();
+            app.clamp_selection();
+        }
+        KeyCode::F(3) => app.start_filter_input(FilterPromptMode::Search, false),
+        KeyCode::F(4) => app.start_filter_input(FilterPromptMode::Filter, true),
+        KeyCode::Char('f' | 'F' | '/') => {
+            app.start_filter_input(FilterPromptMode::Filter, false);
+        }
+        _ => return false,
+    }
+    true
 }
 
 fn drain_updates(
@@ -1959,7 +1965,7 @@ fn status_bar_actions(app: &AppState) -> Line<'static> {
     }
 
     let footer_actions = format!(
-        "F1Help  F3Search  F4Filter  F5{}  F6SortBy  F7Columns  F8Auth  F9Kill",
+        "[H]elp  [F]ilter /  [T]ree:{}  [S]ortBy  [C]olumns  [A]uth  [K]ill",
         app.view_mode.footer_label()
     );
     let footer = app.discovery_status.footer_summary().map_or_else(
@@ -1999,8 +2005,19 @@ const fn help_bindings() -> &'static [(&'static str, &'static str)] {
     &[
         ("q", "Quit, or close the active overlay"),
         ("Ctrl+C", "Quit immediately"),
-        ("F1", "Open full help page"),
-        ("H", "Open this help page"),
+        ("H / F1", "Open full help page"),
+        ("t / F5", "Cycle Tree, Flat, and Primary view in overview"),
+        ("s / F6", "Choose sort column in overview"),
+        ("c / F7 / v", "Toggle and reorder visible overview columns"),
+        (
+            "a / F8",
+            "Enter credentials for the selected overview server",
+        ),
+        (
+            "k / F9",
+            "Open the kill picker for the selected overview row",
+        ),
+        ("f or /", "Edit the overview filter (keeps existing text)"),
         ("Esc", "Back from detail/help or stop filter editing"),
         ("Enter", "Open detail view from overview"),
         ("Tab/Right", "Next detail panel"),
@@ -2031,17 +2048,6 @@ const fn help_bindings() -> &'static [(&'static str, &'static str)] {
             "F4",
             "Start filter input in overview (clears existing filter)",
         ),
-        ("F5", "Cycle Tree, Flat, and Primary view in overview"),
-        ("F6", "Choose sort column in overview"),
-        (
-            "F7",
-            "Toggle visible overview columns and reorder visible ones",
-        ),
-        ("F8", "Enter credentials for the selected server"),
-        ("F9", "Open the kill picker for the selected overview row"),
-        ("t", "Cycle Tree, Flat, and Primary view in overview"),
-        ("s", "Cycle sort column in overview"),
-        ("v", "Open overview column picker"),
         (
             "Shift+Up/Down",
             "Reorder visible columns inside the column picker",
@@ -2069,7 +2075,11 @@ fn draw_help_overlay(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect)
     };
 
     frame.render_widget(Clear, popup);
-    let text = "q quits, or closes the active overlay\nCtrl+C quits immediately\nF1 or H open help page\nEsc back\nEnter open detail\nTab/Left/Right cycle detail panels\nS/L/I/C/B/K jump to detail panels\nUp/Down move selection or scroll detail panes with long content\n? toggle help overlay\nC/N start CPU or NET hotkeys sampling on Hotkeys\nX stops active Hotkeys sampling early or resets the pane\nr or R refresh now (Bigkeys reruns scan, Hotkeys reruns sampling)\nF3 search\nF4 filter\nF5 cycle Tree/Flat/Primary\nF6 open sort picker\nF7 or v toggle overview columns\nF8 enter credentials for selected server\nF9 open kill picker\nShift+Up/Down reorder visible overview columns in the picker\nh toggle host rendering\n/ filter in overview or the active detail pane";
+    let text = help_bindings()
+        .iter()
+        .map(|(keys, description)| format!("{keys}: {description}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     frame.render_widget(
         Paragraph::new(text)
             .style(base_style(app))
@@ -2339,38 +2349,35 @@ fn handle_column_picker_key(app: &mut AppState, key: KeyEvent) -> bool {
             if shift_modifier_key(key.code) {
                 app.set_column_picker_reorder_mode(false);
             }
-            true
         }
-        KeyEventKind::Press | KeyEventKind::Repeat => {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => app.close_overview_modal(),
-                KeyCode::Modifier(modifier) if is_shift_modifier(modifier) => {
-                    app.set_column_picker_reorder_mode(true);
-                }
-                KeyCode::Up => {
-                    if key.modifiers.contains(KeyModifiers::SHIFT) {
-                        app.set_column_picker_reorder_mode(true);
-                        app.move_selected_column(-1);
-                    } else {
-                        app.set_column_picker_reorder_mode(false);
-                        app.move_column_picker_selection(-1);
-                    }
-                }
-                KeyCode::Down => {
-                    if key.modifiers.contains(KeyModifiers::SHIFT) {
-                        app.set_column_picker_reorder_mode(true);
-                        app.move_selected_column(1);
-                    } else {
-                        app.set_column_picker_reorder_mode(false);
-                        app.move_column_picker_selection(1);
-                    }
-                }
-                KeyCode::Enter | KeyCode::Char(' ') => app.toggle_selected_column_visibility(),
-                _ => {}
+        KeyEventKind::Press | KeyEventKind::Repeat => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.close_overview_modal(),
+            KeyCode::Modifier(modifier) if is_shift_modifier(modifier) => {
+                app.set_column_picker_reorder_mode(true);
             }
-            true
-        }
+            KeyCode::Up => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    app.set_column_picker_reorder_mode(true);
+                    app.move_selected_column(-1);
+                } else {
+                    app.set_column_picker_reorder_mode(false);
+                    app.move_column_picker_selection(-1);
+                }
+            }
+            KeyCode::Down => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    app.set_column_picker_reorder_mode(true);
+                    app.move_selected_column(1);
+                } else {
+                    app.set_column_picker_reorder_mode(false);
+                    app.move_column_picker_selection(1);
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => app.toggle_selected_column_visibility(),
+            _ => {}
+        },
     }
+    true
 }
 
 const fn column_picker_title(app: &AppState) -> &'static str {
@@ -2471,8 +2478,8 @@ mod tests {
         background_color, bigkeys_age_title, carat_color, commandstats_page_len,
         compute_column_widths, detail_tab_index_for_shortcut, detail_tabs_widget, draw,
         draw_status_bar, format_aligned_rows, format_with_commas, handle_column_picker_key,
-        handle_overlay_quit_key, handle_primary_view_quit_key, help_bindings, is_force_quit_key,
-        ratatui_color_from_cluster, selected_signal_supported,
+        handle_overlay_quit_key, handle_overview_shortcut, handle_primary_view_quit_key,
+        help_bindings, is_force_quit_key, ratatui_color_from_cluster, selected_signal_supported,
     };
     use crate::app::{ActiveView, AppState, OverviewModal};
     use crate::column::{Align, CellText, Column, RenderCtx, SortCtx, SortKey, WidthHint};
@@ -2522,7 +2529,7 @@ mod tests {
 
     #[test]
     fn help_bindings_include_help_page_shortcut() {
-        assert!(help_bindings().iter().any(|(keys, _)| *keys == "H"));
+        assert!(help_bindings().iter().any(|(keys, _)| *keys == "H / F1"));
     }
 
     #[test]
@@ -2531,13 +2538,20 @@ mod tests {
     }
 
     #[test]
-    fn help_bindings_include_function_keys() {
-        assert!(help_bindings().iter().any(|(keys, _)| *keys == "F1"));
-        assert!(help_bindings().iter().any(|(keys, _)| *keys == "F3"));
-        assert!(help_bindings().iter().any(|(keys, _)| *keys == "F4"));
-        assert!(help_bindings().iter().any(|(keys, _)| *keys == "F5"));
-        assert!(help_bindings().iter().any(|(keys, _)| *keys == "F6"));
-        assert!(help_bindings().iter().any(|(keys, _)| *keys == "F9"));
+    fn help_bindings_include_mnemonics_and_legacy_aliases() {
+        for binding in [
+            "H / F1",
+            "F3",
+            "F4",
+            "t / F5",
+            "s / F6",
+            "c / F7 / v",
+            "a / F8",
+            "k / F9",
+            "f or /",
+        ] {
+            assert!(help_bindings().iter().any(|(keys, _)| *keys == binding));
+        }
     }
 
     #[test]
@@ -2545,9 +2559,180 @@ mod tests {
         assert!(
             help_bindings()
                 .iter()
-                .any(|(keys, description)| *keys == "F5"
+                .any(|(keys, description)| *keys == "t / F5"
                     && description.contains("Tree, Flat, and Primary"))
         );
+    }
+
+    #[test]
+    fn overview_picker_shortcuts_open_expected_modal() {
+        for (keys, modal) in [
+            (
+                vec![KeyCode::Char('s'), KeyCode::Char('S'), KeyCode::F(6)],
+                OverviewModal::SortPicker,
+            ),
+            (
+                vec![
+                    KeyCode::Char('c'),
+                    KeyCode::Char('C'),
+                    KeyCode::Char('v'),
+                    KeyCode::F(7),
+                ],
+                OverviewModal::ColumnPicker,
+            ),
+            (
+                vec![KeyCode::Char('a'), KeyCode::Char('A'), KeyCode::F(8)],
+                OverviewModal::AuthForm,
+            ),
+            (
+                vec![KeyCode::Char('k'), KeyCode::Char('K'), KeyCode::F(9)],
+                OverviewModal::KillPicker,
+            ),
+        ] {
+            for code in keys {
+                let mut app = AppState::new(default_settings(), test_registry());
+                app.apply_update(InstanceState::new("server".into(), "127.0.0.1:6379".into()));
+                let sort_before = app.sort_by.clone();
+                assert!(handle_overview_shortcut(
+                    &mut app,
+                    KeyEvent::new(code, KeyModifiers::NONE)
+                ));
+                assert_eq!(app.overview_modal, modal, "{code:?}");
+                assert_eq!(
+                    app.sort_by, sort_before,
+                    "opening Sort By must not change the sort"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overview_filter_shortcuts_preserve_text_and_legacy_clear_behavior() {
+        for code in [
+            KeyCode::Char('f'),
+            KeyCode::Char('F'),
+            KeyCode::Char('/'),
+            KeyCode::F(3),
+            KeyCode::F(4),
+        ] {
+            let mut app = AppState::new(default_settings(), test_registry());
+            app.filter = "redis".into();
+            assert!(handle_overview_shortcut(
+                &mut app,
+                KeyEvent::new(code, KeyModifiers::NONE)
+            ));
+            assert!(app.is_filtering);
+            assert_eq!(app.filter, if code == KeyCode::F(4) { "" } else { "redis" });
+            assert_eq!(
+                app.filter_prompt_mode,
+                if code == KeyCode::F(3) {
+                    crate::app::FilterPromptMode::Search
+                } else {
+                    crate::app::FilterPromptMode::Filter
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn overview_tree_shortcuts_cycle_all_modes() {
+        for code in [KeyCode::Char('t'), KeyCode::Char('T'), KeyCode::F(5)] {
+            let mut app = AppState::new(default_settings(), test_registry());
+            for expected in [ViewMode::Flat, ViewMode::Primary, ViewMode::Tree] {
+                assert!(handle_overview_shortcut(
+                    &mut app,
+                    KeyEvent::new(code, KeyModifiers::NONE)
+                ));
+                assert_eq!(app.view_mode, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn overview_shortcuts_do_not_interfere_with_other_input_contexts() {
+        let mut app = AppState::new(default_settings(), test_registry());
+        let shortcuts = [
+            'a', 'A', 'f', 'F', '/', 't', 'T', 's', 'S', 'c', 'C', 'k', 'K',
+        ];
+        for view in [ActiveView::Detail, ActiveView::Help] {
+            app.active_view = view;
+            for ch in shortcuts {
+                assert!(!handle_overview_shortcut(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+                ));
+            }
+        }
+        app.active_view = ActiveView::Overview;
+        for modal in [
+            OverviewModal::SortPicker,
+            OverviewModal::ColumnPicker,
+            OverviewModal::AuthForm,
+            OverviewModal::KillPicker,
+        ] {
+            app.overview_modal = modal;
+            for ch in shortcuts {
+                assert!(!handle_overview_shortcut(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+                ));
+                assert_eq!(app.overview_modal, modal);
+            }
+        }
+        app.overview_modal = OverviewModal::None;
+        app.is_filtering = true;
+        for ch in shortcuts {
+            assert!(!handle_overview_shortcut(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+            ));
+        }
+        assert_eq!(app.overview_modal, OverviewModal::None);
+        assert_eq!(app.view_mode, ViewMode::Tree);
+    }
+
+    #[test]
+    fn overview_commands_require_plain_key_press() {
+        let mut app = AppState::new(default_settings(), test_registry());
+        for kind in [KeyEventKind::Release, KeyEventKind::Repeat] {
+            assert!(!handle_overview_shortcut(
+                &mut app,
+                KeyEvent::new_with_kind(KeyCode::Char('k'), KeyModifiers::NONE, kind)
+            ));
+        }
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+        ] {
+            assert!(!handle_overview_shortcut(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), modifiers)
+            ));
+        }
+        assert!(handle_overview_shortcut(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT)
+        ));
+        assert_eq!(app.overview_modal, OverviewModal::ColumnPicker);
+    }
+
+    #[test]
+    fn auth_and_kill_shortcuts_require_a_selected_server() {
+        let mut app = AppState::new(default_settings(), test_registry());
+        for code in [
+            KeyCode::Char('a'),
+            KeyCode::Char('k'),
+            KeyCode::F(8),
+            KeyCode::F(9),
+        ] {
+            assert!(handle_overview_shortcut(
+                &mut app,
+                KeyEvent::new(code, KeyModifiers::NONE)
+            ));
+            assert_eq!(app.overview_modal, OverviewModal::None);
+            assert!(app.auth_form.is_none());
+        }
     }
 
     #[test]
@@ -2947,9 +3132,12 @@ mod tests {
             .expect("status bar draw succeeds");
 
         let lines = buffer_lines(terminal.backend().buffer());
-        assert!(lines.iter().any(|line| line.contains("F5Primary")));
-        assert!(lines.iter().any(|line| line.contains("F8Auth")));
-        assert!(lines.iter().any(|line| line.contains("F9Kill")));
+        assert!(lines.iter().any(|line| line.contains("[T]ree:Primary")));
+        assert!(lines.iter().any(|line| line.contains("[A]uth")));
+        assert!(lines.iter().any(|line| line.contains("[K]ill")));
+        for label in ["[H]elp", "[F]ilter /", "[S]ortBy", "[C]olumns"] {
+            assert!(lines.iter().any(|line| line.contains(label)));
+        }
     }
 
     #[test]
