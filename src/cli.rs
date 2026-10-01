@@ -13,9 +13,9 @@ use crate::target_addr::{normalize_tcp_addr, tcp_endpoint_identity, tcp_port};
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " [",
-    env!("REDITOP_BUILD_DATE"),
+    env!("RTOP_BUILD_DATE"),
     "] (",
-    env!("REDITOP_GIT_SHA"),
+    env!("RTOP_GIT_SHA"),
     ")"
 );
 
@@ -40,7 +40,7 @@ pub enum OutputMode {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "reditop",
+    name = "rtop",
     version = VERSION,
     about = "htop-like TUI for Redis/Valkey"
 )]
@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn positional_host_only_input_becomes_discovery_host() {
-        let cli = super::Cli::parse_from(["reditop", "--no-config", "192.168.0.174"]);
+        let cli = super::Cli::parse_from(["rtop", "--no-config", "192.168.0.174"]);
         let launch = super::build_launch_config_from(cli).expect("launch config should parse");
 
         assert!(launch.targets.is_empty());
@@ -600,7 +600,7 @@ mod tests {
 
     #[test]
     fn explicit_targets_disable_autodiscovery_by_default() {
-        let cli = super::Cli::parse_from(["reditop", "--no-config", "6379", "redis:9999"]);
+        let cli = super::Cli::parse_from(["rtop", "--no-config", "6379", "redis:9999"]);
         let launch = super::build_launch_config_from(cli).expect("launch config should parse");
 
         assert_eq!(launch.targets.len(), 2);
@@ -610,7 +610,7 @@ mod tests {
 
     #[test]
     fn autodiscover_without_value_reenables_localhost_discovery() {
-        let cli = super::Cli::parse_from(["reditop", "--no-config", "6379", "--autodiscover"]);
+        let cli = super::Cli::parse_from(["rtop", "--no-config", "6379", "--autodiscover"]);
         let launch = super::build_launch_config_from(cli).expect("launch config should parse");
 
         assert_eq!(launch.targets.len(), 1);
@@ -623,7 +623,7 @@ mod tests {
     #[test]
     fn autodiscover_with_value_uses_requested_host() {
         let cli = super::Cli::parse_from([
-            "reditop",
+            "rtop",
             "--no-config",
             "6379",
             "--autodiscover",
@@ -644,7 +644,7 @@ mod tests {
 
     #[test]
     fn cluster_seeds_still_feed_discovery() {
-        let cli = super::Cli::parse_from(["reditop", "--no-config", "--cluster", "7000"]);
+        let cli = super::Cli::parse_from(["rtop", "--no-config", "--cluster", "7000"]);
         let launch = super::build_launch_config_from(cli).expect("launch config should parse");
 
         assert_eq!(launch.targets.len(), 1);
@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn once_flag_enables_non_interactive_launch() {
-        let cli = super::Cli::parse_from(["reditop", "--no-config", "--once"]);
+        let cli = super::Cli::parse_from(["rtop", "--no-config", "--once"]);
         let launch = super::build_launch_config_from(cli).expect("launch config should parse");
 
         assert!(launch.once);
@@ -662,7 +662,7 @@ mod tests {
 
     #[test]
     fn output_json_selects_json_stream_mode() {
-        let cli = super::Cli::parse_from(["reditop", "--no-config", "--output", "json"]);
+        let cli = super::Cli::parse_from(["rtop", "--no-config", "--output", "json"]);
         let launch = super::build_launch_config_from(cli).expect("launch config should parse");
 
         assert_eq!(launch.output_mode, OutputMode::Json);
@@ -670,7 +670,7 @@ mod tests {
 
     #[test]
     fn cli_view_primary_sets_primary_default_view() {
-        let cli = super::Cli::parse_from(["reditop", "--no-config", "--view", "primary"]);
+        let cli = super::Cli::parse_from(["rtop", "--no-config", "--view", "primary"]);
         let launch = super::build_launch_config_from(cli).expect("launch config should parse");
 
         assert_eq!(launch.settings.default_view, ViewMode::Primary);
@@ -696,7 +696,7 @@ password = "secret"
         .expect("config should write");
 
         let cli = super::Cli::parse_from([
-            "reditop",
+            "rtop",
             "--config",
             config_path.to_str().expect("config path should be utf8"),
             "6379",
@@ -727,7 +727,7 @@ tags = ["known"]
         .expect("config should write");
 
         let cli = super::Cli::parse_from([
-            "reditop",
+            "rtop",
             "--config",
             config_path.to_str().expect("config path should be utf8"),
             "6380",

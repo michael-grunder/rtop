@@ -52,22 +52,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - artifact_name: reditop-aarch64-apple-darwin
+          - artifact_name: rtop-aarch64-apple-darwin
             os: macos-14
             target: aarch64-apple-darwin
-            binary_path: target/aarch64-apple-darwin/release/reditop
+            binary_path: target/aarch64-apple-darwin/release/rtop
             cargo_command: cargo build --locked --release --target aarch64-apple-darwin
             setup_zig: false
-          - artifact_name: reditop-x86_64-unknown-linux-musl
+          - artifact_name: rtop-x86_64-unknown-linux-musl
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            binary_path: target/x86_64-unknown-linux-musl/release/reditop
+            binary_path: target/x86_64-unknown-linux-musl/release/rtop
             cargo_command: cargo zigbuild --locked --release --target x86_64-unknown-linux-musl
             setup_zig: true
-          - artifact_name: reditop-aarch64-unknown-linux-musl
+          - artifact_name: rtop-aarch64-unknown-linux-musl
             os: ubuntu-latest
             target: aarch64-unknown-linux-musl
-            binary_path: target/aarch64-unknown-linux-musl/release/reditop
+            binary_path: target/aarch64-unknown-linux-musl/release/rtop
             cargo_command: cargo zigbuild --locked --release --target aarch64-unknown-linux-musl
             setup_zig: true
 

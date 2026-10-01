@@ -3,14 +3,14 @@ use std::env;
 use std::time::Duration;
 
 use redis::AsyncCommands;
-use reditop::cluster::discover_cluster_targets;
-use reditop::discovery::{self, DiscoveryEvent};
-use reditop::hotkeys::{HotkeysMetric, HotkeysStatus};
-use reditop::model::{
+use rtop::cluster::discover_cluster_targets;
+use rtop::discovery::{self, DiscoveryEvent};
+use rtop::hotkeys::{HotkeysMetric, HotkeysStatus};
+use rtop::model::{
     BigkeysScanStatus, RuntimeSettings, SortMode, Target, TargetProtocol, UiTheme, ViewMode,
 };
-use reditop::poller::{PollerRequest, PollerUpdate, start};
-use reditop::target_addr::tcp_endpoint_identity;
+use rtop::poller::{PollerRequest, PollerUpdate, start};
+use rtop::target_addr::tcp_endpoint_identity;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -30,7 +30,7 @@ fn runtime_settings() -> RuntimeSettings {
 fn standalone_target() -> Target {
     Target {
         alias: Some("standalone".to_string()),
-        addr: env::var("REDITOP_TEST_REDIS_ADDR").unwrap_or_else(|_| "localhost:6379".to_string()),
+        addr: env::var("RTOP_TEST_REDIS_ADDR").unwrap_or_else(|_| "localhost:6379".to_string()),
         protocol: TargetProtocol::Tcp,
         username: None,
         password: None,
@@ -42,7 +42,7 @@ fn standalone_target() -> Target {
 fn cluster_target() -> Target {
     Target {
         alias: Some("cluster".to_string()),
-        addr: env::var("REDITOP_TEST_REDIS_CLUSTER_ADDR")
+        addr: env::var("RTOP_TEST_REDIS_CLUSTER_ADDR")
             .unwrap_or_else(|_| "localhost:7000".to_string()),
         protocol: TargetProtocol::Tcp,
         username: None,
@@ -55,7 +55,7 @@ fn cluster_target() -> Target {
 async fn recv_state(
     update_rx: &mut mpsc::Receiver<PollerUpdate>,
     key: &str,
-) -> reditop::model::InstanceState {
+) -> rtop::model::InstanceState {
     loop {
         let update = timeout(Duration::from_secs(5), update_rx.recv())
             .await
@@ -92,7 +92,7 @@ async fn generate_hotkeys_traffic(target: &Target) -> redis::RedisResult<()> {
     let client = redis::Client::open(redis_url_for_target(target))?;
     let mut conn = client.get_multiplexed_async_connection().await?;
     for idx in 0..250 {
-        let key = format!("reditop:hotkeys:{idx}");
+        let key = format!("rtop:hotkeys:{idx}");
         let value = format!("value-{idx}");
         let _: () = conn.set(&key, &value).await?;
         let _: String = conn.get(&key).await?;
@@ -107,7 +107,7 @@ async fn standalone_poll_and_bigkeys_scan_work_against_live_redis() {
     let (mut update_rx, request_tx) = start(vec![target.clone()], settings);
 
     let state = recv_state(&mut update_rx, &target.addr).await;
-    if state.status != reditop::model::Status::Ok {
+    if state.status != rtop::model::Status::Ok {
         skip_unreachable(
             "standalone redis",
             state.last_error.as_deref().unwrap_or("poll failed"),
@@ -147,7 +147,7 @@ async fn cluster_discovery_and_bigkeys_scan_work_against_live_cluster() {
 
     let (mut update_rx, request_tx) = start(vec![seed.clone()], settings);
     let state = recv_state(&mut update_rx, &seed.addr).await;
-    if state.status != reditop::model::Status::Ok {
+    if state.status != rtop::model::Status::Ok {
         skip_unreachable(
             "redis cluster poll",
             state.last_error.as_deref().unwrap_or("poll failed"),
@@ -183,7 +183,7 @@ async fn standalone_hotkeys_sampling_works_against_live_redis() {
     let (mut update_rx, request_tx) = start(vec![target.clone()], settings);
 
     let state = recv_state(&mut update_rx, &target.addr).await;
-    if state.status != reditop::model::Status::Ok {
+    if state.status != rtop::model::Status::Ok {
         skip_unreachable(
             "standalone redis",
             state.last_error.as_deref().unwrap_or("poll failed"),
@@ -241,7 +241,7 @@ async fn standalone_hotkeys_sampling_can_stop_early() {
     let (mut update_rx, request_tx) = start(vec![target.clone()], settings);
 
     let state = recv_state(&mut update_rx, &target.addr).await;
-    if state.status != reditop::model::Status::Ok {
+    if state.status != rtop::model::Status::Ok {
         skip_unreachable(
             "standalone redis",
             state.last_error.as_deref().unwrap_or("poll failed"),

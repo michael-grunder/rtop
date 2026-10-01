@@ -14,8 +14,8 @@ fn main() {
         _ => git_sha,
     };
 
-    println!("cargo:rustc-env=REDITOP_BUILD_DATE={build_date}");
-    println!("cargo:rustc-env=REDITOP_GIT_SHA={git_sha}");
+    println!("cargo:rustc-env=RTOP_BUILD_DATE={build_date}");
+    println!("cargo:rustc-env=RTOP_GIT_SHA={git_sha}");
 
     configure_git_rerun_hints();
 }

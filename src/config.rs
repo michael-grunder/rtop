@@ -417,7 +417,7 @@ foreground_color = "cyan"
         let path = dir.path().join("config.toml");
         // SAFETY: tests control this process environment for the duration of the assertion.
         unsafe {
-            std::env::set_var("REDITOP_TEST_PASSWORD", "secret");
+            std::env::set_var("RTOP_TEST_PASSWORD", "secret");
         }
         std::fs::write(
             &path,
@@ -425,7 +425,7 @@ foreground_color = "cyan"
 [[targets]]
 addr = ":6380"
 user = "alice"
-password_env = "REDITOP_TEST_PASSWORD"
+password_env = "RTOP_TEST_PASSWORD"
 "#,
         )
         .expect("write config");
@@ -441,7 +441,7 @@ password_env = "REDITOP_TEST_PASSWORD"
 
         // SAFETY: restore the process environment before releasing the lock.
         unsafe {
-            std::env::remove_var("REDITOP_TEST_PASSWORD");
+            std::env::remove_var("RTOP_TEST_PASSWORD");
         }
     }
 
@@ -455,7 +455,7 @@ password_env = "REDITOP_TEST_PASSWORD"
 [[targets]]
 addr = "127.0.0.1:6379"
 password = "secret"
-password_env = "REDITOP_TEST_PASSWORD"
+password_env = "RTOP_TEST_PASSWORD"
 "#,
         )
         .expect("write config");
@@ -528,7 +528,7 @@ still_autodiscover = false
                 Some(value) => std::env::set_var("HOME", value),
                 None => std::env::remove_var("HOME"),
             }
-            std::env::remove_var("REDITOP_TEST_PASSWORD");
+            std::env::remove_var("RTOP_TEST_PASSWORD");
         }
     }
 }

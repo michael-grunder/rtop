@@ -1,6 +1,6 @@
-# reditop
+# rtop
 
-`reditop` is a terminal UI for monitoring Redis/Valkey instances.
+`rtop` is a terminal UI for monitoring Redis/Valkey instances.
 
 ## Implemented MVP
 
@@ -21,7 +21,7 @@
 - Sorting by currently visible column keys and substring filtering
 - Kill picker on `k` with Redis `SHUTDOWN` and local signal options
 - Credential form on `a` for authenticating the selected server without
-  restarting `reditop`
+  restarting `rtop`
 - Bottom status/key bar with mnemonic shortcut labels and live search/filter input echo
 - Live discovery status in the footer, including queued/probing/verified counts
 - Config loading from TOML + CLI target merge
@@ -79,7 +79,7 @@ credentials on each selected server. The username
 defaults to Redis' `default` user and may be cleared for password-only
 authentication. The password is masked while it is entered, and the submitted
 credentials are kept only for the current process. For compatibility with
-Redis versions before 6.0, `reditop` first tries `AUTH default <password>` and
+Redis versions before 6.0, `rtop` first tries `AUTH default <password>` and
 retries with `AUTH <password>` when the server reports that the ACL-style form
 is unsupported. A non-default username is sent only with the ACL-style form.
 
@@ -115,22 +115,22 @@ its idle prompt.
 Examples:
 
 ```bash
-reditop 127.0.0.1:6379 127.0.0.1:6380
-reditop 6379 6380
-reditop
-reditop 192.168.0.148
-reditop --autodiscover 192.168.0.148 --autodiscover 192.168.0.149
-reditop 6379 --autodiscover
-reditop 6379 --autodiscover 192.168.0.148
-reditop --unix /tmp/redis.sock --tcp 10.0.0.12:6379
-reditop --cluster 7000
-reditop --cluster 10.0.0.11:7000 --cluster 10.0.0.12:7000
-reditop --once
-reditop --output json
-reditop --output json --once
-reditop --autodiscover 10.0.0.12 --once
-reditop --config ~/.config/redis-top.toml
-reditop -c config.toml 127.0.0.1:6379
+rtop 127.0.0.1:6379 127.0.0.1:6380
+rtop 6379 6380
+rtop
+rtop 192.168.0.148
+rtop --autodiscover 192.168.0.148 --autodiscover 192.168.0.149
+rtop 6379 --autodiscover
+rtop 6379 --autodiscover 192.168.0.148
+rtop --unix /tmp/redis.sock --tcp 10.0.0.12:6379
+rtop --cluster 7000
+rtop --cluster 10.0.0.11:7000 --cluster 10.0.0.12:7000
+rtop --once
+rtop --output json
+rtop --output json --once
+rtop --autodiscover 10.0.0.12 --once
+rtop --config ~/.config/redis-top.toml
+rtop -c config.toml 127.0.0.1:6379
 ```
 
 For TCP targets, you can pass just a port (for example `6379`), and it is treated as
@@ -141,12 +141,12 @@ hosts, not fixed monitored instances. Exact TCP targets such as `6379` or
 `192.168.0.148:6380` disable autodiscovery by default and only connect to the
 requested server(s).
 
-When you provide explicit targets, `reditop` does not also add unrelated
+When you provide explicit targets, `rtop` does not also add unrelated
 `[[targets]]` entries from `redis-top.toml`. If an explicit target matches a
-configured TCP or Unix target, `reditop` still reuses that target's context
+configured TCP or Unix target, `rtop` still reuses that target's context
 such as alias, username, password, and tags.
 
-If you do not provide explicit targets, `reditop` autodiscovers on `127.0.0.1`
+If you do not provide explicit targets, `rtop` autodiscovers on `127.0.0.1`
 by default. `--autodiscover[=<HOST>]` opt back into autodiscovery when you also
 provide exact targets. With no value it autodiscovers on localhost; with a
 value it probes the provided host. `--host <HOST>` remains available as an
@@ -185,14 +185,14 @@ frames instead of drawing the interactive TUI. Each frame includes a top-level
 microtime-style timestamp string (`seconds.microseconds`) and is generated from
 the same centralized overview data model used by the TUI overview, which makes
 the JSON stream suitable for
-integration testing. When combined with `--once`, `reditop` emits a single
+integration testing. When combined with `--once`, `rtop` emits a single
 JSON frame and exits.
 
 Version output includes build metadata:
 
 ```bash
-reditop --version
-# reditop x.y.z [YYYY-MM-DD] (<gitsha>[-dirty])
+rtop --version
+# rtop x.y.z [YYYY-MM-DD] (<gitsha>[-dirty])
 ```
 
 ## Building release binaries
@@ -220,7 +220,7 @@ cargo build-musl
 Output binary:
 
 ```bash
-target/x86_64-unknown-linux-musl/release/reditop
+target/x86_64-unknown-linux-musl/release/rtop
 ```
 
 ### macOS Apple Silicon binary
@@ -234,7 +234,7 @@ cargo build --release --target aarch64-apple-darwin
 Output binary:
 
 ```bash
-target/aarch64-apple-darwin/release/reditop
+target/aarch64-apple-darwin/release/rtop
 ```
 
 ## Testing
@@ -266,8 +266,8 @@ standalone instance and a Redis Cluster. By default it probes:
 Override those endpoints with:
 
 ```bash
-REDITOP_TEST_REDIS_ADDR=redis.example:6379 \
-REDITOP_TEST_REDIS_CLUSTER_ADDR=redis-cluster.example:7000 \
+RTOP_TEST_REDIS_ADDR=redis.example:6379 \
+RTOP_TEST_REDIS_CLUSTER_ADDR=redis-cluster.example:7000 \
 cargo test
 ```
 
@@ -354,7 +354,7 @@ background autodiscovery. Set it to `false` if config-defined `[[targets]]`
 should behave like an explicit fixed target list.
 
 `[[targets]]` accepts `user` or `username`, plus either `password` or
-`password_env`. If you omit the host from a TCP `addr`, `reditop` assumes
+`password_env`. If you omit the host from a TCP `addr`, `rtop` assumes
 `localhost`, so `:6380` and `6380` both resolve to loopback addresses. Configured
 TCP target credentials are also reused by autodiscovery when it verifies the
 same `host:port`.

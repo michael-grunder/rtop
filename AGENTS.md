@@ -1,4 +1,4 @@
-# reditop Agent Guide
+# rtop Agent Guide
 
 ## Goals
 

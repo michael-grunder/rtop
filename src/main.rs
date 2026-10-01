@@ -1,7 +1,7 @@
 #![warn(clippy::all, clippy::nursery, clippy::pedantic)]
 
 use anyhow::Result;
-use reditop::{cli, tui};
+use rtop::{cli, tui};
 
 #[tokio::main]
 async fn main() -> Result<()> {

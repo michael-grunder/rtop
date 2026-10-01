@@ -44,6 +44,10 @@
 
 ### Changed
 
+- Rename the project, Cargo crate, executable, and CI artifacts from `reditop`
+  to `rtop`, including build and test environment variable prefixes from
+  `REDITOP_` to `RTOP_`.
+
 - Make `Esc` in the overview clear all server selections before a second press
   exits, including selections hidden by the current view or filter.
 
