@@ -2,6 +2,10 @@
 
 ### Added
 
+- Add Vim `h`/`j`/`k`/`l` navigation and numeric motion counts across overview,
+  detail panes, and pickers. Add `NSpace` range selection and counted vertical
+  motion followed by Space within 500 ms to select from the original row.
+
 - Add `--config` for a grouped, credential-redacted settings overview and
   `--config get/set` for global, theme, and existing target settings selected
   with `--target`. Preserve TOML comments and unrelated sections, validate
@@ -54,6 +58,10 @@
   progress.
 
 ### Changed
+
+- Reserve lowercase motion keys for navigation: kill/Hotkeys require `K` and
+  Latency requires `L`. Move host display to `o`/`O`, retaining `H` for help
+  and case-insensitive shortcuts for actions without motion-key conflicts.
 
 - Rename the project, Cargo crate, executable, and CI artifacts from `reditop`
   to `rtop`, including build and test environment variable prefixes from

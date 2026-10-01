@@ -1,3 +1,5 @@
+mod navigation;
+
 use std::fmt::Write as _;
 use std::io::{self, Stdout, Write};
 use std::time::Duration;
@@ -178,6 +180,8 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, launch: LaunchCon
         launch.settings,
     );
 
+    let mut navigation = navigation::Navigation::default();
+
     loop {
         drain_updates(&mut app, &mut updates_rx, &mut discovery_rx, &request_tx);
 
@@ -195,6 +199,15 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, launch: LaunchCon
             };
             if is_force_quit_key(key) {
                 app.should_quit = true;
+                continue;
+            }
+
+            if navigation.handle_key(
+                &mut app,
+                key,
+                terminal.size()?.height,
+                std::time::Instant::now(),
+            ) {
                 continue;
             }
 
@@ -348,8 +361,6 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, launch: LaunchCon
             if app.is_sort_picker_open() {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => app.close_overview_modal(),
-                    KeyCode::Up => app.move_sort_picker_selection(-1),
-                    KeyCode::Down => app.move_sort_picker_selection(1),
                     KeyCode::Enter => app.apply_sort_picker_selection(),
                     _ => {}
                 }
@@ -419,64 +430,6 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, launch: LaunchCon
                         let _ = request_tx.try_send(request);
                     }
                 }
-                KeyCode::Up if app.active_view == ActiveView::Overview => app.move_selection(-1),
-                KeyCode::Down if app.active_view == ActiveView::Overview => app.move_selection(1),
-                KeyCode::Up if is_commandstats_detail(&app) => {
-                    if let Some(stats) = current_commandstats(&app).map(ToOwned::to_owned) {
-                        let page_len = commandstats_page_len(terminal.size()?.height);
-                        app.move_commandstats_scroll(-1, &stats, page_len);
-                    }
-                }
-                KeyCode::Down if is_commandstats_detail(&app) => {
-                    if let Some(stats) = current_commandstats(&app).map(ToOwned::to_owned) {
-                        let page_len = commandstats_page_len(terminal.size()?.height);
-                        app.move_commandstats_scroll(1, &stats, page_len);
-                    }
-                }
-                KeyCode::Up if is_bigkeys_detail(&app) => {
-                    if let Some(bigkeys) = current_bigkeys(&app) {
-                        let page_len = bigkeys_page_len(terminal.size()?.height);
-                        let visible_len = app.visible_bigkeys(&bigkeys.largest_keys).len();
-                        app.move_bigkeys_scroll(-1, visible_len, page_len);
-                    }
-                }
-                KeyCode::Down if is_bigkeys_detail(&app) => {
-                    if let Some(bigkeys) = current_bigkeys(&app) {
-                        let page_len = bigkeys_page_len(terminal.size()?.height);
-                        let visible_len = app.visible_bigkeys(&bigkeys.largest_keys).len();
-                        app.move_bigkeys_scroll(1, visible_len, page_len);
-                    }
-                }
-                KeyCode::Up if is_hotkeys_detail(&app) => {
-                    if let Some(hotkeys) = current_hotkeys(&app) {
-                        let page_len = hotkeys_page_len(terminal.size()?.height);
-                        let visible_len = app.visible_hotkeys(&hotkeys.entries).len();
-                        app.move_hotkeys_scroll(-1, visible_len, page_len);
-                    }
-                }
-                KeyCode::Down if is_hotkeys_detail(&app) => {
-                    if let Some(hotkeys) = current_hotkeys(&app) {
-                        let page_len = hotkeys_page_len(terminal.size()?.height);
-                        let visible_len = app.visible_hotkeys(&hotkeys.entries).len();
-                        app.move_hotkeys_scroll(1, visible_len, page_len);
-                    }
-                }
-                KeyCode::Up if is_detail_text_tab(&app) => {
-                    let page_len = detail_text_page_len(terminal.size()?.height);
-                    let row_count = current_detail_text_body(&app).map_or(0, |body| {
-                        let lines = detail_text_lines(&body);
-                        app.visible_detail_text_lines(app.detail_tab, &lines).len()
-                    });
-                    app.move_detail_text_scroll(app.detail_tab, -1, row_count, page_len);
-                }
-                KeyCode::Down if is_detail_text_tab(&app) => {
-                    let page_len = detail_text_page_len(terminal.size()?.height);
-                    let row_count = current_detail_text_body(&app).map_or(0, |body| {
-                        let lines = detail_text_lines(&body);
-                        app.visible_detail_text_lines(app.detail_tab, &lines).len()
-                    });
-                    app.move_detail_text_scroll(app.detail_tab, 1, row_count, page_len);
-                }
                 KeyCode::Enter
                     if app.active_view == ActiveView::Overview && app.selected_key().is_some() =>
                 {
@@ -489,12 +442,8 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, launch: LaunchCon
                     app.close_detail_view();
                 }
                 KeyCode::Esc if app.active_view == ActiveView::Help => app.close_help_view(),
-                KeyCode::Tab | KeyCode::Right if app.active_view == ActiveView::Detail => {
+                KeyCode::Tab if app.active_view == ActiveView::Detail => {
                     app.detail_tab = (app.detail_tab + 1) % DETAIL_TABS.len();
-                    sync_detail_views(&mut app, terminal.size()?.height);
-                }
-                KeyCode::Left if app.active_view == ActiveView::Detail => {
-                    app.detail_tab = (app.detail_tab + DETAIL_TABS.len() - 1) % DETAIL_TABS.len();
                     sync_detail_views(&mut app, terminal.size()?.height);
                 }
                 KeyCode::Char(ch) if app.active_view == ActiveView::Detail => {
@@ -529,10 +478,10 @@ fn handle_overview_shortcut(app: &mut AppState, key: KeyEvent) -> bool {
         KeyCode::Char(' ') => app.toggle_server_selection(),
         KeyCode::F(5) | KeyCode::Char('t' | 'T') => app.cycle_view_mode(),
         KeyCode::F(6) | KeyCode::Char('s' | 'S') => app.open_sort_picker(),
-        KeyCode::F(7) | KeyCode::Char('c' | 'C' | 'v') => app.open_column_picker(),
+        KeyCode::F(7) | KeyCode::Char('c' | 'C' | 'v' | 'V') => app.open_column_picker(),
         KeyCode::F(8) | KeyCode::Char('a' | 'A') => app.open_auth_form(),
-        KeyCode::F(9) | KeyCode::Char('k' | 'K') => app.open_kill_picker(),
-        KeyCode::Char('h') => {
+        KeyCode::F(9) | KeyCode::Char('K') => app.open_kill_picker(),
+        KeyCode::Char('o' | 'O') => {
             app.toggle_host_rendering();
             app.clamp_selection();
         }
@@ -1241,6 +1190,9 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
 }
 
 fn detail_tab_index_for_shortcut(ch: char) -> Option<usize> {
+    if matches!(ch, 'h' | 'j' | 'k' | 'l') {
+        return None;
+    }
     let shortcut = ch.to_ascii_lowercase();
     DETAIL_TABS.iter().position(|tab| tab.shortcut == shortcut)
 }
@@ -2037,24 +1989,34 @@ const fn help_bindings() -> &'static [(&'static str, &'static str)] {
             "Enter credentials for selected servers (or the focused server)",
         ),
         (
-            "k / F9",
+            "K / F9",
             "Stop selected servers (or the focused server); confirm batch stops",
         ),
         ("Space", "Toggle selection of the focused overview server"),
+        ("N + motion", "Move N steps with h/j/k/l or arrow keys"),
+        (
+            "NSpace",
+            "Select N servers downward, including the focused row",
+        ),
+        (
+            "Nj/k Space",
+            "Space within 500 ms selects N rows from the original focus",
+        ),
+        ("Case", "K (kill/Hotkeys), L (Latency) require uppercase"),
         ("f or /", "Edit the overview filter (keeps existing text)"),
         (
             "Esc",
             "Close overlay/filter/detail/help; clear selection, then quit",
         ),
         ("Enter", "Open detail view for the focused server"),
-        ("Tab/Right", "Next detail panel"),
-        ("Left", "Previous detail panel"),
+        ("Tab/Right/l", "Next detail panel"),
+        ("Left/h", "Previous detail panel"),
         (
             "S / L / I / C / B / K",
             "Jump to Summary, Latency, Info Raw, Commandstats, Bigkeys, or Hotkeys in detail",
         ),
         (
-            "Up/Down",
+            "Up/Down/j/k",
             "Move focus in overview or scroll detail panes with long content",
         ),
         ("?", "Toggle help overlay"),
@@ -2080,7 +2042,7 @@ const fn help_bindings() -> &'static [(&'static str, &'static str)] {
             "Reorder visible columns inside the column picker",
         ),
         (
-            "h",
+            "o / O",
             "Toggle host rendering (auto hide when all hosts are the same)",
         ),
         (
@@ -2416,8 +2378,6 @@ fn handle_kill_key(
     }
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => app.close_overview_modal(),
-        KeyCode::Up if app.is_kill_picker_open() => app.move_kill_picker_selection(-1),
-        KeyCode::Down if app.is_kill_picker_open() => app.move_kill_picker_selection(1),
         KeyCode::Enter => {
             if let Some((keys, action)) = app.submit_kill() {
                 request_tx
@@ -2441,24 +2401,6 @@ fn handle_column_picker_key(app: &mut AppState, key: KeyEvent) -> bool {
             KeyCode::Esc | KeyCode::Char('q') => app.close_overview_modal(),
             KeyCode::Modifier(modifier) if is_shift_modifier(modifier) => {
                 app.set_column_picker_reorder_mode(true);
-            }
-            KeyCode::Up => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    app.set_column_picker_reorder_mode(true);
-                    app.move_selected_column(-1);
-                } else {
-                    app.set_column_picker_reorder_mode(false);
-                    app.move_column_picker_selection(-1);
-                }
-            }
-            KeyCode::Down => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    app.set_column_picker_reorder_mode(true);
-                    app.move_selected_column(1);
-                } else {
-                    app.set_column_picker_reorder_mode(false);
-                    app.move_column_picker_selection(1);
-                }
             }
             KeyCode::Enter | KeyCode::Char(' ') => app.toggle_selected_column_visibility(),
             _ => {}
@@ -2679,12 +2621,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         app.open_kill_picker();
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        super::handle_kill_key(
+        assert!(super::navigation::Navigation::default().handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-            &tx,
-        )
-        .unwrap();
+            20,
+            std::time::Instant::now(),
+        ));
         super::handle_kill_key(&mut app, enter, &tx).unwrap();
         assert_eq!(app.overview_modal, OverviewModal::KillConfirmation);
         assert!(rx.try_recv().is_err());
@@ -2801,7 +2743,7 @@ mod tests {
             "s / F6",
             "c / F7 / v",
             "a / F8",
-            "k / F9",
+            "K / F9",
             "f or /",
         ] {
             assert!(help_bindings().iter().any(|(keys, _)| *keys == binding));
@@ -2830,6 +2772,7 @@ mod tests {
                     KeyCode::Char('c'),
                     KeyCode::Char('C'),
                     KeyCode::Char('v'),
+                    KeyCode::Char('V'),
                     KeyCode::F(7),
                 ],
                 OverviewModal::ColumnPicker,
@@ -2839,7 +2782,7 @@ mod tests {
                 OverviewModal::AuthForm,
             ),
             (
-                vec![KeyCode::Char('k'), KeyCode::Char('K'), KeyCode::F(9)],
+                vec![KeyCode::Char('K'), KeyCode::F(9)],
                 OverviewModal::KillPicker,
             ),
         ] {
@@ -2976,7 +2919,7 @@ mod tests {
         let mut app = AppState::new(default_settings(), test_registry());
         for code in [
             KeyCode::Char('a'),
-            KeyCode::Char('k'),
+            KeyCode::Char('K'),
             KeyCode::F(8),
             KeyCode::F(9),
         ] {
@@ -2990,13 +2933,15 @@ mod tests {
     }
 
     #[test]
-    fn detail_tab_shortcuts_match_expected_tabs_case_insensitively() {
+    fn detail_tab_shortcuts_reserve_lowercase_motion_keys() {
         assert_eq!(detail_tab_index_for_shortcut('s'), Some(0));
         assert_eq!(detail_tab_index_for_shortcut('L'), Some(1));
         assert_eq!(detail_tab_index_for_shortcut('i'), Some(2));
         assert_eq!(detail_tab_index_for_shortcut('C'), Some(3));
         assert_eq!(detail_tab_index_for_shortcut('b'), Some(4));
-        assert_eq!(detail_tab_index_for_shortcut('k'), Some(5));
+        assert_eq!(detail_tab_index_for_shortcut('K'), Some(5));
+        assert_eq!(detail_tab_index_for_shortcut('k'), None);
+        assert_eq!(detail_tab_index_for_shortcut('l'), None);
         assert_eq!(detail_tab_index_for_shortcut('x'), None);
     }
 

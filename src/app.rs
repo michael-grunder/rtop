@@ -222,6 +222,23 @@ impl AppState {
         self.marked_keys.contains(key)
     }
 
+    /// Add a captured visible range, preserving existing selections and skipping removed servers.
+    pub fn select_server_range(&mut self, keys: &[String]) {
+        self.marked_keys.extend(
+            keys.iter()
+                .filter(|key| self.instances.contains_key(*key))
+                .cloned(),
+        );
+        let rows = self.visible_rows();
+        if let Some(index) = keys
+            .iter()
+            .rev()
+            .find_map(|key| rows.iter().position(|row| &row.key == key))
+        {
+            self.selected_index = index;
+        }
+    }
+
     pub fn selected_server_count(&self) -> usize {
         self.marked_keys.len()
     }
@@ -248,7 +265,7 @@ impl AppState {
 
         let current = isize::try_from(self.selected_index).unwrap_or(isize::MAX);
         let max_index = isize::try_from(len - 1).unwrap_or(isize::MAX);
-        let next = (current + delta).clamp(0, max_index);
+        let next = current.saturating_add(delta).clamp(0, max_index);
         let next = usize::try_from(next).unwrap_or(0);
         self.selected_index = next;
     }
@@ -326,7 +343,7 @@ impl AppState {
         let max_offset = visible_len.saturating_sub(page_len.max(1));
         let current = isize::try_from(self.commandstats_view.scroll_offset).unwrap_or(isize::MAX);
         let max_index = isize::try_from(max_offset).unwrap_or(isize::MAX);
-        let next = (current + delta).clamp(0, max_index);
+        let next = current.saturating_add(delta).clamp(0, max_index);
         self.commandstats_view.scroll_offset = usize::try_from(next).unwrap_or(0);
     }
 
@@ -341,7 +358,7 @@ impl AppState {
         let max_offset = rows_len.saturating_sub(page_len.max(1));
         let current = isize::try_from(self.bigkeys_view.scroll_offset).unwrap_or(isize::MAX);
         let max_index = isize::try_from(max_offset).unwrap_or(isize::MAX);
-        let next = (current + delta).clamp(0, max_index);
+        let next = current.saturating_add(delta).clamp(0, max_index);
         self.bigkeys_view.scroll_offset = usize::try_from(next).unwrap_or(0);
     }
 
@@ -416,7 +433,7 @@ impl AppState {
         if let Some(view) = self.detail_text_view_mut(detail_tab) {
             let current = isize::try_from(view.scroll_offset).unwrap_or(isize::MAX);
             let max_index = isize::try_from(max_offset).unwrap_or(isize::MAX);
-            let next = (current + delta).clamp(0, max_index);
+            let next = current.saturating_add(delta).clamp(0, max_index);
             view.scroll_offset = usize::try_from(next).unwrap_or(0);
         }
     }
@@ -515,7 +532,7 @@ impl AppState {
         let max_offset = rows_len.saturating_sub(page_len.max(1));
         let current = isize::try_from(self.hotkeys_view.scroll_offset).unwrap_or(isize::MAX);
         let max_index = isize::try_from(max_offset).unwrap_or(isize::MAX);
-        let next = (current + delta).clamp(0, max_index);
+        let next = current.saturating_add(delta).clamp(0, max_index);
         self.hotkeys_view.scroll_offset = usize::try_from(next).unwrap_or(0);
     }
 
@@ -736,7 +753,7 @@ impl AppState {
         }
         let current = isize::try_from(self.sort_picker_index).unwrap_or(isize::MAX);
         let max_index = isize::try_from(columns.len() - 1).unwrap_or(isize::MAX);
-        let next = (current + delta).clamp(0, max_index);
+        let next = current.saturating_add(delta).clamp(0, max_index);
         let next = usize::try_from(next).unwrap_or(0);
         self.sort_picker_index = next;
     }
@@ -765,14 +782,14 @@ impl AppState {
         }
         let current = isize::try_from(self.column_picker_index).unwrap_or(isize::MAX);
         let max_index = isize::try_from(columns.len() - 1).unwrap_or(isize::MAX);
-        let next = (current + delta).clamp(0, max_index);
+        let next = current.saturating_add(delta).clamp(0, max_index);
         self.column_picker_index = usize::try_from(next).unwrap_or(0);
     }
 
     pub fn move_kill_picker_selection(&mut self, delta: isize) {
         let current = isize::try_from(self.kill_picker_index).unwrap_or(isize::MAX);
         let max_index = isize::try_from(KillAction::ALL.len().saturating_sub(1)).unwrap_or(0);
-        let next = (current + delta).clamp(0, max_index);
+        let next = current.saturating_add(delta).clamp(0, max_index);
         self.kill_picker_index = usize::try_from(next).unwrap_or(0);
     }
 
@@ -796,14 +813,15 @@ impl AppState {
         let current = isize::try_from(chosen_order_idx).unwrap_or(isize::MAX);
         let max_index = isize::try_from(self.runtime_overview_column_order.len().saturating_sub(1))
             .unwrap_or(0);
-        let next = (current + delta).clamp(0, max_index);
+        let next = current.saturating_add(delta).clamp(0, max_index);
         let next_order_idx = usize::try_from(next).unwrap_or(chosen_order_idx);
         if next_order_idx == chosen_order_idx {
             return;
         }
 
+        let key = self.runtime_overview_column_order.remove(chosen_order_idx);
         self.runtime_overview_column_order
-            .swap(chosen_order_idx, next_order_idx);
+            .insert(next_order_idx, key);
         self.column_picker_index = next_order_idx;
     }
 

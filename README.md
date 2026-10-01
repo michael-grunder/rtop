@@ -19,7 +19,7 @@
   server-reported error details when polling fails
 - Tree, flat, and primary-only overview modes
 - Sorting by currently visible column keys and substring filtering
-- Kill picker on `k` with Redis `SHUTDOWN` and local signal options
+- Kill picker on `K` with Redis `SHUTDOWN` and local signal options
 - Credential form on `a` for authenticating the selected server without
   restarting `rtop`
 - Bottom status/key bar with mnemonic shortcut labels and live search/filter input echo
@@ -39,31 +39,47 @@
 - `c`: open the overview column picker for toggling and reordering columns
 - `Space`: toggle selection of the focused overview server
 - `a`: enter one username and password and retry all selected servers
-- `k`: open the kill picker for selected servers; `Enter` chooses the action,
+- `K`: open the kill picker for selected servers; `Enter` chooses the action,
   with an additional confirmation when stopping more than one server
 - `?`: toggle help
-- `Up/Down`: move focus in overview, or scroll the active detail pane when it has more rows than fit
+- `j` / `k` or `Up/Down`: move focus in overview, or scroll the active detail pane when it has more rows than fit
 - `Enter`: open detail for the focused server
 - `Esc`: clear server selections in the overview, or quit if none are selected;
   close the active overlay window, go back from detail/help, or stop filter editing
-- `Tab` / `Left` / `Right`: cycle detail tabs
+- `h` / `l` or `Left` / `Right`: cycle detail tabs (`Tab` also advances)
 - `S` / `L` / `I` / `C` / `B` / `K`: jump to `Summary` / `Latency` / `Info Raw` / `Commandstats` / `Bigkeys` / `Hotkeys` in detail view
 - `Shift+Up/Down`: reorder columns inside the overview column picker
-- `h`: toggle host rendering (default auto-hides host when all targets share one host)
+- `o` / `O`: toggle host rendering (default auto-hides host when all targets share one host)
 - `/`: start filter input in overview, or filter the active detail pane in detail view (`Summary`, `Latency`, `Info Raw`, `Commandstats`, `Bigkeys`, or `Hotkeys`)
 - `C` / `N`: start CPU or NET sampling while the `Hotkeys` tab is open
 - `X`: stop active `Hotkeys` sampling early, or reset the `Hotkeys` pane back to its idle prompt
 - `r` / `R`: refresh now, rerun the on-demand `Bigkeys` scan, or rerun `Hotkeys` sampling for the last selected metric while that tab is open
 
-Overview shortcuts `a`, `f`, `t`, `s`, `c`, and `k` also accept uppercase
-letters. While editing a filter or credentials, letters are entered as text.
-Detail tab shortcuts keep their existing meanings.
+Shortcuts without a motion-key conflict remain case insensitive. Kill and the
+Hotkeys detail tab require `K`; the Latency tab requires `L`. Lowercase
+`h`/`j`/`k`/`l` are reserved for movement. While editing filters or credentials,
+letters and digits are entered as text. `j`/`k` also navigate the sort, column,
+and kill pickers. Help remains on `H`, `F1`, and `?`.
 
 Function keys remain available as aliases: `F1` help, `F5` view mode, `F6`
 Sort By, `F7` columns, `F8` auth, and `F9` kill. `v` also opens columns.
 `F3` starts overview search input; `F4` starts filtering with an empty filter.
 
-Use `Space` to select or deselect servers. The caret gutter shows `●` for a
+Prefix a motion with a positive count: `10j` moves down ten rows, `3k` moves
+up three, and `2l` advances two detail tabs. Counts also work with arrow keys;
+vertical movement stops at the list boundary. `Esc` cancels a pending count,
+and another command discards it.
+
+Use `4Space` to select the current server and the next three visible servers.
+Press Space within 500 ms after `3k` to select the original server and the two
+above it; `3j` followed quickly by Space selects downward. The motion happens
+immediately; quick Space converts it to a range selection and puts focus on
+the last selected row. After 500 ms, Space just toggles the new focused row.
+Ranges include the starting row, stop at the boundary, and add to existing
+selections without deselecting already selected servers. They follow the
+visible sorted/filtered order captured when the motion was entered.
+
+Use plain `Space` to select or deselect servers. The caret gutter shows `●` for a
 selected server, `>` for the focused server, or a bold `▶` when the focused
 server is also selected. Other rows leave the gutter blank, and the overview
 title shows the selected count. Selections persist across refreshes,
@@ -85,7 +101,7 @@ Redis versions before 6.0, `rtop` first tries `AUTH default <password>` and
 retries with `AUTH <password>` when the server reports that the ACL-style form
 is unsupported. A non-default username is sent only with the ACL-style form.
 
-The `k` kill picker offers `SHUTDOWN SAVE`, `SHUTDOWN NOSAVE`, `SIGINT`,
+The `K` kill picker offers `SHUTDOWN SAVE`, `SHUTDOWN NOSAVE`, `SIGINT`,
 `SIGTERM`, `SIGQUIT`, and `SIGKILL`. The Redis shutdown commands work over the
 current connection, while the signal-based options require a local TCP or Unix
 socket target plus `process_id` from `INFO server`.
