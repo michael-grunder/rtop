@@ -6,6 +6,11 @@
   `500ms` or `2s`, retaining `--refresh` as an alias. Default to 1 second and
   override TOML `[global].refresh_interval_ms` when supplied. Reject zero
   polling intervals before starting the timer.
+- Add a top activity panel with a scrolling server selector and aggregate CPU,
+  operations, and network history graphs plus memory/client totals. Use the
+  existing Space selections to monitor a group, or all servers when none are
+  selected. Exclude stale/failed samples, flag partial data, and adapt the
+  panel to smaller terminals.
 
 - Color overview `Status` cells with the theme's `warning_color` and
   `critical_color`, which were previously accepted but unused. JSON frames

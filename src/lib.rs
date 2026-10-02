@@ -6,6 +6,7 @@
     clippy::return_self_not_must_use
 )]
 
+mod activity;
 pub mod app;
 pub mod cli;
 pub mod cluster;

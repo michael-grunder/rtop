@@ -1,3 +1,4 @@
+mod activity;
 mod navigation;
 
 use std::fmt::Write as _;
@@ -617,12 +618,25 @@ const fn is_shift_modifier(modifier: ModifierKeyCode) -> bool {
 // ---------------------------------------------------------------------------
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut AppState) {
+    app.sample_activity(std::time::Instant::now());
     let area = frame.area();
     frame.render_widget(Block::default().style(base_style(app)), area);
     let [main, status] = Layout::vertical([Constraint::Min(5), Constraint::Length(2)]).areas(area);
 
     match app.active_view {
-        ActiveView::Overview => draw_overview(frame, app, main),
+        ActiveView::Overview => {
+            let height = match main.height {
+                13.. => 7,
+                10.. => 5,
+                _ => 0,
+            };
+            let [activity_area, table] =
+                Layout::vertical([Constraint::Length(height), Constraint::Min(0)]).areas(main);
+            if height > 0 {
+                activity::draw(frame, app, activity_area);
+            }
+            draw_overview(frame, app, table);
+        }
         ActiveView::Detail => draw_detail(frame, app, main),
         ActiveView::Help => draw_help_page(frame, app, main),
     }
@@ -1488,7 +1502,10 @@ const fn help_bindings() -> &'static [(&'static str, &'static str)] {
             "K / F9",
             "Stop selected servers (or the focused server); confirm batch stops",
         ),
-        ("Space", "Toggle selection of the focused overview server"),
+        (
+            "Space",
+            "Select server for activity totals and batch actions (none = all activity)",
+        ),
         ("N + motion", "Move N steps with h/j/k/l or arrow keys"),
         (
             "NSpace",
@@ -1927,6 +1944,86 @@ mod tests {
     }
 
     #[test]
+    fn activity_panel_renders_graphs_and_tracks_keyboard_selection() {
+        let mut app = AppState::new(default_settings(), test_registry());
+        let now = std::time::Instant::now();
+        for port in [6379, 6380] {
+            let addr = format!("127.0.0.1:{port}");
+            let mut state = InstanceState::new(addr.clone(), addr);
+            state.status = Status::Ok;
+            state.last_updated = Some(now);
+            state.ops_per_sec = Some(100);
+            state.used_memory_bytes = Some(1024);
+            state.detail.connected_clients = Some(2);
+            for (key, value) in [
+                ("used_cpu_sys", "0"),
+                ("used_cpu_user", "1"),
+                ("instantaneous_input_kbps", "1"),
+                ("instantaneous_output_kbps", "2"),
+            ] {
+                state.info.insert(key.into(), value.into());
+            }
+            app.apply_update(state.clone());
+            state.last_updated = Some(now + std::time::Duration::from_secs(1));
+            state.info.insert("used_cpu_user".into(), "1.25".into());
+            app.apply_update(state);
+        }
+        let at = now + std::time::Duration::from_secs(1);
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let lines = buffer_lines(terminal.backend().buffer());
+        assert!(lines[0].contains("Activity | all 2 | 2/2 live"));
+        assert!(lines[1].contains("6379") && lines[1].contains("6380"));
+        assert!(lines[2].contains("Memory 2 KiB  Clients 4"));
+        assert!(lines[3].contains("CPU 50.0%"));
+        assert!(lines[4].contains("Ops 200/s") && lines[4].contains('█'));
+        assert!(lines[5].contains("Net ↓2 KiB/s ↑4 KiB/s"));
+        assert_eq!(app.overview_page_len, 12);
+
+        let mut navigation = super::navigation::Navigation::default();
+        assert!(navigation.handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            at
+        ));
+        assert!(handle_overview_shortcut(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)
+        ));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let lines = buffer_lines(terminal.backend().buffer());
+        assert!(lines[0].contains("Activity | selected 1 | 1/1 live"));
+        assert!(lines[1].contains("▶ 127.0.0.1:6380"));
+        assert!(lines[4].contains("Ops 100/s"));
+        assert_eq!(app.activity.history.len(), 1);
+    }
+
+    #[test]
+    fn activity_panel_handles_small_empty_and_scrolled_views() {
+        let mut app = AppState::new(default_settings(), test_registry());
+        for (width, height) in [(120, 24), (80, 12), (20, 10), (1, 1), (0, 0)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            if height >= 12 {
+                let lines = buffer_lines(terminal.backend().buffer());
+                assert!(lines[1].contains("No visible servers"));
+                assert!(lines[2].contains("Memory -"));
+            }
+        }
+        for port in 6379..6399 {
+            let addr = format!("127.0.0.1:{port}");
+            app.apply_update(InstanceState::new(addr.clone(), addr));
+        }
+        app.selected_index = 19;
+        app.sample_activity(std::time::Instant::now());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let lines = buffer_lines(terminal.backend().buffer());
+        assert!(lines[1].contains("> 127.0.0.1:6398"));
+        assert!(lines[0].contains("0/20 live | partial data"));
+    }
+
+    #[test]
     fn overview_shows_marked_servers_separately_from_focus() {
         let mut app = app_with_selected_servers();
         let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
@@ -1957,7 +2054,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let lines = buffer_lines(buffer);
         for (port, marker) in [("6379", '▶'), ("6380", '●'), ("6381", ' ')] {
-            let row = lines.iter().position(|line| line.contains(port)).unwrap();
+            let row = lines.iter().rposition(|line| line.contains(port)).unwrap();
             assert_eq!(lines[row].chars().nth(1), Some(marker));
             if marker == '▶' {
                 let cell = &buffer[(1, u16::try_from(row).unwrap())];
@@ -2088,11 +2185,15 @@ mod tests {
             app.apply_update(state);
         }
 
-        let mut terminal = Terminal::new(TestBackend::new(140, 12)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let lines = buffer_lines(buffer);
-        assert!(lines[0].contains("refresh=") && lines[0].contains("view=Tree"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("refresh=") && line.contains("view=Tree"))
+        );
 
         let theme = app.settings.ui_theme;
         for (status, expected) in [
@@ -2781,7 +2882,7 @@ mod tests {
         let lines = buffer_lines(&buffer);
         let row = lines
             .iter()
-            .position(|line| line.contains("6379"))
+            .rposition(|line| line.contains("6379"))
             .expect("cluster row rendered");
         let width = usize::from(buffer.area.width);
         let row_start = row * width;
@@ -3726,7 +3827,7 @@ mod tests {
         app.apply_update(b);
         app.apply_update(c);
 
-        let backend = TestBackend::new(100, 12);
+        let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| draw(frame, &mut app))
@@ -3814,7 +3915,7 @@ underlined = true
         app.apply_update(b);
         app.apply_update(c);
 
-        let backend = TestBackend::new(100, 12);
+        let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| draw(frame, &mut app))

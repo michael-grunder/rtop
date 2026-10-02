@@ -7,6 +7,8 @@
 - Polls one or more Redis targets every second (default, configurable)
 - Starts immediately and runs Redis/Valkey autodiscovery in the background
 - Overview screen with:
+  - a top activity panel with a server selector, CPU/operations/network history
+    graphs, and aggregate memory and client counts
   - generic, configurable columns (INFO-backed + calculated)
   - defaults for alias/address/type/memory/ops/latency/status plus a cluster/replication color gutter, with `Type` auto-hidden in `Tree` view and host auto-hidden when all targets share one host
   - available optional columns including `connected_clients` and `master_repl_offset` (`INFO replication` / `master_repl_offset`)
@@ -31,6 +33,36 @@
 - Config loading from TOML + CLI target merge
 - Handles per-instance failures without crashing UI
 - Surfaces richer instance states such as `PROTECTED`, `AUTH`, `LOADING`, and `DOWN`
+
+## Activity panel
+
+The top of the main overview shows activity for all monitored servers. Use
+`j`/`k` or `Up`/`Down` to move focus in the server strip and table together,
+then `Space` to select servers. With any servers selected, the panel sums only
+that group. `Esc` clears the selection and returns to all servers (another
+`Esc` exits). These are the same selections used by authentication and kill
+actions. The strip follows the sorted/filtered table and scrolls to keep the
+focused server visible. Filtering and Tree/Flat/Primary mode do not change
+the aggregate group; selected servers hidden by the view still contribute.
+
+CPU is the sum of Redis process system and user CPU usage, measured between
+successful INFO samples: 100% equals one fully occupied CPU core, so totals
+can exceed 100%. It needs two samples after startup, a restart, or a polling
+failure. Operations and network rates come from Redis' instantaneous INFO
+metrics. Network text shows incoming and outgoing bytes per second; its graph
+shows their sum. Memory is summed `used_memory`, and clients are summed
+`connected_clients`. These are per-process totals, including replicas, rather
+than deduplicated logical data or host-wide utilization.
+
+Graphs retain up to 120 samples at the configured refresh interval, with the
+newest on the right and each graph scaled to its visible peak. Their height
+shows relative activity, not a percentage of server capacity. Changing the
+aggregate membership resets history. Failed servers and samples older than
+two refresh intervals are excluded; the header reports live/total servers
+and flags partial data, and unavailable metrics show `-`. Short terminals
+use a compact operations graph or hide the panel to leave room for the table.
+This panel is interactive only; plain-text and JSON output keep their existing
+table format.
 
 ## Key Bindings
 

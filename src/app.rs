@@ -318,6 +318,7 @@ impl RowCtx {
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct AppState {
+    pub(crate) activity: crate::activity::Activity,
     pub settings: RuntimeSettings,
     pub view_mode: ViewMode,
     pub sort_by: String,
@@ -363,6 +364,7 @@ struct TreeRenderCtx<'a> {
 impl AppState {
     pub fn new(settings: RuntimeSettings, column_registry: ColumnRegistry) -> Self {
         Self {
+            activity: crate::activity::Activity::default(),
             view_mode: settings.default_view,
             sort_by: column_registry.default_sort_by.clone(),
             sort_direction: column_registry.default_sort_direction,
@@ -406,6 +408,7 @@ impl AppState {
     }
 
     pub fn apply_update(&mut self, mut update: InstanceState) {
+        self.activity.observe(&update);
         // Append discoveries so polling never moves the picker focus or changes user ordering.
         let metrics: BTreeSet<_> = update
             .detail
@@ -429,6 +432,7 @@ impl AppState {
     }
 
     pub fn remove_instance(&mut self, key: &str) {
+        self.activity.remove(key);
         self.instances.remove(key);
         self.marked_keys.remove(key);
         self.hotkeys_locally_reset.remove(key);
@@ -498,6 +502,14 @@ impl AppState {
 
     pub fn selected_server_count(&self) -> usize {
         self.marked_keys.len()
+    }
+
+    pub(crate) fn sample_activity(&mut self, now: std::time::Instant) {
+        let instances = self.instances.values().filter(|instance| {
+            self.marked_keys.is_empty() || self.marked_keys.contains(&instance.key)
+        });
+        self.activity
+            .sample(instances, self.settings.refresh_interval, now);
     }
 
     pub fn clear_server_selection(&mut self) {
@@ -1324,6 +1336,31 @@ mod tests {
             app.apply_update(InstanceState::new(addr.clone(), addr));
         }
         app
+    }
+
+    #[test]
+    fn activity_scope_uses_all_or_marked_servers_including_hidden_ones() {
+        let mut app = app_with_servers();
+        let now = std::time::Instant::now();
+        app.sample_activity(now);
+        let total = app.instances.len();
+        assert_eq!(app.activity.current.servers, total);
+        app.toggle_server_selection();
+        let selected = app.selected_key().unwrap();
+        app.filter = "no visible servers".into();
+        app.sample_activity(now);
+        assert!(app.visible_rows().is_empty());
+        assert_eq!(app.activity.current.servers, 1);
+        assert_eq!(app.activity.history.len(), 1);
+        app.clear_server_selection();
+        app.sample_activity(now);
+        assert_eq!(app.activity.current.servers, total);
+        app.filter.clear();
+        app.toggle_server_selection();
+        app.remove_instance(&selected);
+        app.sample_activity(now);
+        assert_eq!(app.selected_server_count(), 0);
+        assert_eq!(app.activity.current.servers, total - 1);
     }
 
     #[test]
