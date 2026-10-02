@@ -53,10 +53,18 @@ shows their sum. Memory is summed `used_memory`, and clients are summed
 `connected_clients`. These are per-process totals, including replicas, rather
 than deduplicated logical data or host-wide utilization.
 
-Graphs retain up to 120 samples at the configured refresh interval, with the
-newest on the right and each graph scaled to its visible peak. Their height
-shows relative activity, not a percentage of server capacity. Changing the
-aggregate membership resets history. Failed servers and samples older than
+Graphs retain up to 120 samples at the configured refresh interval, newest on
+the right. The rows show process CPU, operations/second, and combined incoming
+plus outgoing network bytes/second. Each row's right-hand `max` label is the
+value represented by a full-height bar. Scales start at 100% CPU, 1,000 ops/s,
+and 1 MiB/s of network traffic **per monitored server**. They grow to retain
+higher observed peaks for the current server group, even after those samples
+scroll out of history or the terminal is resized. This keeps idle polling
+traffic near the bottom instead of stretching it to full height.
+
+These scales are display references, not estimates of server capacity; CPU
+100% still means one busy core. Changing the aggregate membership resets both
+history and retained peaks. Failed servers and samples older than
 two refresh intervals are excluded; the header reports live/total servers
 and flags partial data, and unavailable metrics show `-`. Short terminals
 use a compact operations graph or hide the panel to leave room for the table.

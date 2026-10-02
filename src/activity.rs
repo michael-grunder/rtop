@@ -6,6 +6,45 @@ use crate::model::{InstanceState, Status};
 
 const HISTORY_LEN: usize = 120;
 
+#[derive(Debug, Clone, Copy)]
+pub enum ActivityMetric {
+    Cpu,
+    Ops,
+    Network,
+}
+
+impl ActivityMetric {
+    pub const ALL: [Self; 3] = [Self::Cpu, Self::Ops, Self::Network];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Cpu => 0,
+            Self::Ops => 1,
+            Self::Network => 2,
+        }
+    }
+
+    /// Display references per monitored process, not estimates of server capacity.
+    const fn baseline(self) -> u64 {
+        match self {
+            Self::Cpu => 10_000, // Hundredths of a percent; 100% is one CPU core.
+            Self::Ops => 1_000,
+            Self::Network => 1024 * 1024,
+        }
+    }
+
+    pub fn value(self, totals: &ActivityTotals) -> Option<u64> {
+        match self {
+            Self::Cpu => totals.cpu.map(|cpu| graph_value(cpu * 100.0)),
+            Self::Ops => totals.ops,
+            Self::Network => totals
+                .input
+                .zip(totals.output)
+                .map(|(input, output)| input.saturating_add(output)),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CpuSample {
     at: Instant,
@@ -34,11 +73,23 @@ pub struct Activity {
     cpu: HashMap<String, CpuSample>,
     scope: BTreeSet<String>,
     sampled_at: Option<Instant>,
+    /// Peaks belong to the server group, independent of history length and terminal width.
+    peaks: [u64; 3],
     pub current: ActivityTotals,
     pub history: VecDeque<ActivityTotals>,
 }
 
 impl Activity {
+    pub fn scale(&self, metric: ActivityMetric) -> u64 {
+        let servers = u64::try_from(self.current.servers)
+            .unwrap_or(u64::MAX)
+            .max(1);
+        metric
+            .baseline()
+            .saturating_mul(servers)
+            .max(self.peaks[metric.index()])
+    }
+
     pub fn observe(&mut self, state: &InstanceState) {
         let seconds = number(state, "used_cpu_sys")
             .zip(number(state, "used_cpu_user"))
@@ -132,8 +183,14 @@ impl Activity {
         // A different membership is a different time series, even when its size is unchanged.
         if scope != self.scope {
             self.history.clear();
+            self.peaks = [0; 3];
             self.sampled_at = None;
             self.scope = scope;
+        }
+        for metric in ActivityMetric::ALL {
+            if let Some(value) = metric.value(&totals) {
+                self.peaks[metric.index()] = self.peaks[metric.index()].max(value);
+            }
         }
         self.current = totals.clone();
         if self
@@ -262,6 +319,75 @@ mod tests {
         activity.sample([&a, &b].into_iter(), interval, now + Duration::from_secs(3));
         assert_eq!(activity.current.available, 0);
         assert_eq!(activity.current.ops, None);
+    }
+
+    #[test]
+    fn idle_stays_low_before_and_after_benchmark_history_expires() {
+        let now = Instant::now();
+        let interval = Duration::from_secs(1);
+        let mut activity = Activity::default();
+        let mut state = server("a", now, "1");
+        activity.observe(&state);
+        state.last_updated = Some(now + interval);
+        state.info.insert("used_cpu_user".into(), "1.01".into());
+        activity.observe(&state);
+        activity.sample(std::iter::once(&state), interval, now + interval);
+        for metric in ActivityMetric::ALL {
+            assert!(metric.value(&activity.current).unwrap() < activity.scale(metric) / 4);
+            assert_eq!(activity.scale(metric), metric.baseline());
+        }
+
+        state.last_updated = Some(now + interval * 2);
+        state.info.insert("used_cpu_user".into(), "3.01".into());
+        state.ops_per_sec = Some(50_000);
+        state
+            .info
+            .insert("instantaneous_input_kbps".into(), "8192".into());
+        activity.observe(&state);
+        activity.sample(std::iter::once(&state), interval, now + interval * 2);
+        let scales = ActivityMetric::ALL.map(|metric| activity.scale(metric));
+        assert_eq!(scales, [20_000, 50_000, 8 * 1024 * 1024 + 2048]);
+
+        state.ops_per_sec = Some(120);
+        state
+            .info
+            .insert("instantaneous_input_kbps".into(), "1.5".into());
+        let mut cpu_seconds = 3.01;
+        for offset in 3..130 {
+            let at = now + interval * offset;
+            cpu_seconds += 0.01;
+            state.last_updated = Some(at);
+            state
+                .info
+                .insert("used_cpu_user".into(), cpu_seconds.to_string());
+            activity.observe(&state);
+            activity.sample(std::iter::once(&state), interval, at);
+        }
+        assert_eq!(activity.history.len(), HISTORY_LEN);
+        assert_eq!(
+            ActivityMetric::ALL.map(|metric| activity.scale(metric)),
+            scales
+        );
+        for totals in &activity.history {
+            for metric in ActivityMetric::ALL {
+                assert!(metric.value(totals).unwrap() < activity.scale(metric) / 4);
+            }
+        }
+
+        // An unavailable sample must not lower the retained scales either.
+        state.status = Status::Down;
+        activity.sample(std::iter::once(&state), interval, now + interval * 130);
+        assert_eq!(
+            ActivityMetric::ALL.map(|metric| activity.scale(metric)),
+            scales
+        );
+
+        // Switching to another server resets the reference, even for equal-sized groups.
+        let other = server("b", now + interval * 131, "0");
+        activity.sample(std::iter::once(&other), interval, now + interval * 131);
+        for metric in ActivityMetric::ALL {
+            assert_eq!(activity.scale(metric), metric.baseline());
+        }
     }
 
     #[test]

@@ -1976,9 +1976,21 @@ mod tests {
         assert!(lines[..6].iter().all(|line| !line.contains("127.0.0.1:")));
         assert!(lines[1].contains("Memory 2 KiB  Clients 4"));
         assert!(lines[2].contains("CPU 50.0%"));
-        assert!(lines[3].contains("Ops 200/s") && lines[3].contains('█'));
+        assert!(lines[3].contains("Ops 200/s"));
         assert!(lines[4].contains("Net ↓2 KiB/s ↑4 KiB/s"));
+        assert!(lines[2..5].iter().all(|line| !line.contains('█')));
+        assert!(lines[2].contains("200% max"));
+        assert!(lines[3].contains("2,000/s max"));
+        assert!(lines[4].contains("2 MiB/s max"));
         assert_eq!(app.overview_page_len, 13);
+
+        // Resizing changes the visible history, not its vertical scale.
+        let mut narrow = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        narrow.draw(|frame| draw(frame, &mut app)).unwrap();
+        let lines = buffer_lines(narrow.backend().buffer());
+        assert!(lines[2].contains("200% max"));
+        assert!(lines[3].contains("2,000/s max"));
+        assert!(lines[4].contains("2 MiB/s max"));
 
         let mut navigation = super::navigation::Navigation::default();
         assert!(navigation.handle_key(
@@ -1999,6 +2011,9 @@ mod tests {
                 .any(|line| line.contains("6380") && line.chars().nth(1) == Some('▶'))
         );
         assert!(lines[3].contains("Ops 100/s"));
+        assert!(lines[2].contains("100% max"));
+        assert!(lines[3].contains("1,000/s max"));
+        assert!(lines[4].contains("1 MiB/s max"));
         assert_eq!(app.activity.history.len(), 1);
     }
 

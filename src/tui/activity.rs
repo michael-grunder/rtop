@@ -3,7 +3,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Sparkline};
 
-use crate::activity::{ActivityTotals, graph_value};
+use crate::activity::{ActivityMetric, graph_value};
 use crate::app::AppState;
 use crate::column::{format_bytes, u64_to_f64};
 
@@ -24,7 +24,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
         totals.servers, totals.available, totals.servers
     );
     let block = super::bordered(app, title).title_bottom(Line::from(
-        " j/k: focus  Space: select  Esc: clear | history auto-scale ",
+        " Net graph = in+out | right = full scale (retained peaks) ",
     ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -63,7 +63,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
             app,
             rows[1],
             format!("CPU {cpu} (100% = 1 core)"),
-            |total| total.cpu.map(|cpu| graph_value(cpu * 100.0)),
+            ActivityMetric::Cpu,
             Color::Green,
         );
         graph(
@@ -71,7 +71,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
             app,
             rows[2],
             format!("Ops {}/s", super::format_optional_u64(totals.ops)),
-            |total| total.ops,
+            ActivityMetric::Ops,
             Color::Cyan,
         );
         graph(
@@ -79,12 +79,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
             app,
             rows[3],
             format!("Net ↓{}/s ↑{}/s", bytes(totals.input), bytes(totals.output)),
-            |total| {
-                total
-                    .input
-                    .zip(total.output)
-                    .map(|(input, output)| input.saturating_add(output))
-            },
+            ActivityMetric::Network,
             Color::Magenta,
         );
     } else if let Some(row) = rows.get(1) {
@@ -93,7 +88,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
             app,
             *row,
             format!("Ops {}/s", super::format_optional_u64(totals.ops)),
-            |total| total.ops,
+            ActivityMetric::Ops,
             Color::Cyan,
         );
     }
@@ -103,28 +98,58 @@ fn bytes(value: Option<u64>) -> String {
     value.map_or_else(|| "-".into(), format_bytes)
 }
 
+fn scale_label(app: &AppState, metric: ActivityMetric) -> String {
+    let scale = app.activity.scale(metric);
+    format!(
+        " {} max",
+        match metric {
+            ActivityMetric::Cpu => format!("{:.0}%", u64_to_f64(scale) / 100.0),
+            ActivityMetric::Ops => format!("{}/s", super::format_with_commas(scale)),
+            ActivityMetric::Network => format!("{}/s", format_bytes(scale)),
+        }
+    )
+}
+
 fn graph(
     frame: &mut ratatui::Frame<'_>,
     app: &AppState,
     area: Rect,
     label: String,
-    metric: fn(&ActivityTotals) -> Option<u64>,
+    metric: ActivityMetric,
     color: Color,
 ) {
-    let [label_area, chart] = Layout::horizontal([
+    let scale = app.activity.scale(metric);
+    // Equal label widths keep samples from the same tick aligned across all rows.
+    let scale_width = ActivityMetric::ALL
+        .into_iter()
+        .map(|metric| Line::from(scale_label(app, metric)).width())
+        .max()
+        .unwrap_or(0);
+    let scale_width = u16::try_from(scale_width).unwrap_or(u16::MAX);
+    let [label_area, chart, scale_area] = Layout::horizontal([
         Constraint::Length(38.min(area.width / 2)),
         Constraint::Min(0),
+        Constraint::Length(scale_width.min(area.width / 3)),
     ])
     .areas(area);
     frame.render_widget(Paragraph::new(label), label_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(scale_label(app, metric)).right_aligned()),
+        scale_area,
+    );
     let width = usize::from(chart.width);
     let skip = app.activity.history.len().saturating_sub(width);
-    let values: Vec<_> = app.activity.history.iter().skip(skip).map(metric).collect();
-    let peak = values.iter().flatten().copied().max().unwrap_or(1).max(1);
+    let values: Vec<_> = app
+        .activity
+        .history
+        .iter()
+        .skip(skip)
+        .map(|totals| metric.value(totals))
+        .collect();
     // Normalize before Sparkline multiplies values by bar height, avoiding overflow.
     let values = std::iter::repeat_n(None, width.saturating_sub(values.len())).chain(
         values.into_iter().map(|value| {
-            value.map(|value| graph_value(u64_to_f64(value) / u64_to_f64(peak) * 1000.0))
+            value.map(|value| graph_value(u64_to_f64(value) / u64_to_f64(scale) * 1000.0))
         }),
     );
     frame.render_widget(
