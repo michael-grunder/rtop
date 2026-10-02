@@ -7,6 +7,7 @@
   override TOML `[global].refresh_interval_ms` when supplied. Reject zero
   polling intervals before starting the timer.
 - Add a top activity panel with a scrolling server selector and aggregate CPU,
+- Add a top activity panel with aggregate CPU,
   operations, and network history graphs plus memory/client totals. Use the
   existing Space selections to monitor a group, or all servers when none are
   selected. Exclude stale/failed samples, flag partial data, and adapt the
@@ -85,6 +86,9 @@
   progress.
 
 ### Changed
+
+- Remove the duplicate server strip from the activity panel, returning one row
+  to the main table. Activity totals still follow the table's server selections.
 
 - Merge the server Latency detail pane into Summary, including last, maximum,
   and average latency plus sample count. Remove the separate Latency tab and

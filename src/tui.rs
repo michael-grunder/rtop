@@ -626,8 +626,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut AppState) {
     match app.active_view {
         ActiveView::Overview => {
             let height = match main.height {
-                13.. => 7,
-                10.. => 5,
+                13.. => 6,
+                10.. => 4,
                 _ => 0,
             };
             let [activity_area, table] =
@@ -1973,12 +1973,12 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let lines = buffer_lines(terminal.backend().buffer());
         assert!(lines[0].contains("Activity | all 2 | 2/2 live"));
-        assert!(lines[1].contains("6379") && lines[1].contains("6380"));
-        assert!(lines[2].contains("Memory 2 KiB  Clients 4"));
-        assert!(lines[3].contains("CPU 50.0%"));
-        assert!(lines[4].contains("Ops 200/s") && lines[4].contains('█'));
-        assert!(lines[5].contains("Net ↓2 KiB/s ↑4 KiB/s"));
-        assert_eq!(app.overview_page_len, 12);
+        assert!(lines[..6].iter().all(|line| !line.contains("127.0.0.1:")));
+        assert!(lines[1].contains("Memory 2 KiB  Clients 4"));
+        assert!(lines[2].contains("CPU 50.0%"));
+        assert!(lines[3].contains("Ops 200/s") && lines[3].contains('█'));
+        assert!(lines[4].contains("Net ↓2 KiB/s ↑4 KiB/s"));
+        assert_eq!(app.overview_page_len, 13);
 
         let mut navigation = super::navigation::Navigation::default();
         assert!(navigation.handle_key(
@@ -1993,8 +1993,12 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let lines = buffer_lines(terminal.backend().buffer());
         assert!(lines[0].contains("Activity | selected 1 | 1/1 live"));
-        assert!(lines[1].contains("▶ 127.0.0.1:6380"));
-        assert!(lines[4].contains("Ops 100/s"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("6380") && line.chars().nth(1) == Some('▶'))
+        );
+        assert!(lines[3].contains("Ops 100/s"));
         assert_eq!(app.activity.history.len(), 1);
     }
 
@@ -2006,8 +2010,10 @@ mod tests {
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
             if height >= 12 {
                 let lines = buffer_lines(terminal.backend().buffer());
-                assert!(lines[1].contains("No visible servers"));
-                assert!(lines[2].contains("Memory -"));
+                assert!(lines[1].contains("Memory -"));
+                if height == 12 {
+                    assert!(lines[2].contains("Ops -/s"));
+                }
             }
         }
         for port in 6379..6399 {
@@ -2019,7 +2025,11 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let lines = buffer_lines(terminal.backend().buffer());
-        assert!(lines[1].contains("> 127.0.0.1:6398"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("6398") && line.chars().nth(1) == Some('>'))
+        );
         assert!(lines[0].contains("0/20 live | partial data"));
     }
 

@@ -1,12 +1,11 @@
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::style::{Color, Style};
+use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Sparkline};
 
 use crate::activity::{ActivityTotals, graph_value};
 use crate::app::AppState;
-use crate::column::{Align, format_bytes, u64_to_f64};
-use crate::overview::fit_cell_text;
+use crate::column::{format_bytes, u64_to_f64};
 
 pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
     let totals = &app.activity.current;
@@ -31,17 +30,13 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
     frame.render_widget(block, area);
     let rows =
         Layout::vertical(vec![Constraint::Length(1); usize::from(inner.height)]).split(inner);
-    let Some(selector) = rows.first() else {
-        return;
-    };
-    draw_servers(frame, app, *selector);
-    let Some(summary) = rows.get(1) else {
+    let Some(summary) = rows.first() else {
         return;
     };
     let cpu = totals
         .cpu
         .map_or_else(|| "-".into(), |cpu| format!("{cpu:.1}%"));
-    let summary_text = if rows.len() >= 5 {
+    let summary_text = if rows.len() >= 4 {
         format!(
             "Memory {}  Clients {}  Ops {}/s",
             bytes(totals.memory),
@@ -62,11 +57,11 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
         )
     };
     frame.render_widget(Paragraph::new(summary_text), *summary);
-    if rows.len() >= 5 {
+    if rows.len() >= 4 {
         graph(
             frame,
             app,
-            rows[2],
+            rows[1],
             format!("CPU {cpu} (100% = 1 core)"),
             |total| total.cpu.map(|cpu| graph_value(cpu * 100.0)),
             Color::Green,
@@ -74,7 +69,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
         graph(
             frame,
             app,
-            rows[3],
+            rows[2],
             format!("Ops {}/s", super::format_optional_u64(totals.ops)),
             |total| total.ops,
             Color::Cyan,
@@ -82,7 +77,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
         graph(
             frame,
             app,
-            rows[4],
+            rows[3],
             format!("Net ↓{}/s ↑{}/s", bytes(totals.input), bytes(totals.output)),
             |total| {
                 total
@@ -92,7 +87,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
             },
             Color::Magenta,
         );
-    } else if let Some(row) = rows.get(2) {
+    } else if let Some(row) = rows.get(1) {
         graph(
             frame,
             app,
@@ -106,46 +101,6 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
 
 fn bytes(value: Option<u64>) -> String {
     value.map_or_else(|| "-".into(), format_bytes)
-}
-
-fn draw_servers(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
-    let rows = app.visible_rows();
-    if rows.is_empty() {
-        frame.render_widget(Paragraph::new("No visible servers"), area);
-        return;
-    }
-    let count = usize::from((area.width / 24).max(1));
-    let width = usize::from(area.width) / count;
-    let start = app.selected_index / count * count;
-    let mut spans = Vec::new();
-    for (index, row) in rows.iter().enumerate().skip(start).take(count) {
-        let Some(instance) = app.instances.get(&row.key) else {
-            continue;
-        };
-        let focused = index == app.selected_index;
-        let marker = match (focused, app.is_server_selected(&row.key)) {
-            (true, true) => "▶",
-            (true, false) => ">",
-            (false, true) => "●",
-            (false, false) => " ",
-        };
-        let style = if focused {
-            Style::default()
-                .fg(super::carat_color(app))
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
-        spans.push(Span::styled(
-            fit_cell_text(
-                &format!("{marker} {}", instance.display_name()),
-                width,
-                Align::Left,
-            ),
-            style,
-        ));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn graph(

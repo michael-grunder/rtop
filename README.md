@@ -7,7 +7,7 @@
 - Polls one or more Redis targets every second (default, configurable)
 - Starts immediately and runs Redis/Valkey autodiscovery in the background
 - Overview screen with:
-  - a top activity panel with a server selector, CPU/operations/network history
+  - a top activity panel with CPU/operations/network history
     graphs, and aggregate memory and client counts
   - generic, configurable columns (INFO-backed + calculated)
   - defaults for alias/address/type/memory/ops/latency/status plus a cluster/replication color gutter, with `Type` auto-hidden in `Tree` view and host auto-hidden when all targets share one host
@@ -37,12 +37,11 @@
 ## Activity panel
 
 The top of the main overview shows activity for all monitored servers. Use
-`j`/`k` or `Up`/`Down` to move focus in the server strip and table together,
+`j`/`k` or `Up`/`Down` to move focus in the main server table,
 then `Space` to select servers. With any servers selected, the panel sums only
 that group. `Esc` clears the selection and returns to all servers (another
 `Esc` exits). These are the same selections used by authentication and kill
-actions. The strip follows the sorted/filtered table and scrolls to keep the
-focused server visible. Filtering and Tree/Flat/Primary mode do not change
+actions. Filtering and Tree/Flat/Primary mode do not change
 the aggregate group; selected servers hidden by the view still contribute.
 
 CPU is the sum of Redis process system and user CPU usage, measured between
