@@ -1,9 +1,12 @@
 use std::cmp::Ordering;
 
-use crate::model::{InstanceState, Status, UiColor};
+use serde::Serialize;
+
+use crate::model::{InstanceState, UiColor};
 use crate::target_addr::strip_host;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Align {
     Left,
     Right,
@@ -18,6 +21,8 @@ pub struct WidthHint {
     pub fixed: Option<u16>,
 }
 
+/// A typed cell value. Columns compute one of these per row; it drives sorting
+/// and emphasis directly and rendering through the column's [`FormatSpec`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum SortKey {
     Null,
@@ -34,6 +39,16 @@ pub enum Emphasis {
     Min,
 }
 
+impl Emphasis {
+    /// Whether `candidate` beats the current `best` under this rule.
+    pub fn prefers(self, candidate: &SortKey, best: &SortKey) -> bool {
+        match self {
+            Self::Max => candidate > best,
+            Self::Min => candidate < best,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EmphasisLifetime {
     #[default]
@@ -42,13 +57,14 @@ pub enum EmphasisLifetime {
 }
 
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct EmphasisStyle {
     pub bold: bool,
     pub italic: bool,
     pub underlined: bool,
     pub dim: bool,
     pub reversed: bool,
+    #[serde(rename = "foreground_color")]
     pub foreground: Option<UiColor>,
 }
 
@@ -65,8 +81,51 @@ impl EmphasisStyle {
     }
 }
 
+/// Severity hint a column can attach to a cell so renderers can color it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tone {
+    Warning,
+    Critical,
+}
+
 impl SortKey {
-    pub fn compare(&self, other: &Self) -> Ordering {
+    pub const fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    const fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::I64(value) => Some(i64_to_f64(*value)),
+            Self::U64(value) => Some(u64_to_f64(*value)),
+            Self::F64(value) => Some(*value),
+            Self::Null | Self::Bool(_) | Self::Str(_) => None,
+        }
+    }
+
+    const fn variant_rank(&self) -> u8 {
+        match self {
+            Self::Null => 0,
+            Self::Bool(_) => 1,
+            Self::I64(_) => 2,
+            Self::U64(_) => 3,
+            Self::F64(_) => 4,
+            Self::Str(_) => 5,
+        }
+    }
+}
+
+impl Eq for SortKey {}
+
+impl PartialOrd for SortKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Total order where missing values sort after every present value.
+impl Ord for SortKey {
+    fn cmp(&self, other: &Self) -> Ordering {
         use SortKey::{Bool, F64, I64, Null, Str, U64};
 
         match (self, other) {
@@ -76,54 +135,60 @@ impl SortKey {
             (Bool(a), Bool(b)) => a.cmp(b),
             (I64(a), I64(b)) => a.cmp(b),
             (U64(a), U64(b)) => a.cmp(b),
-            (F64(a), F64(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+            (F64(a), F64(b)) => a.total_cmp(b),
             (Str(a), Str(b)) => a.cmp(b),
-            (a, b) => variant_rank(a).cmp(&variant_rank(b)),
+            (a, b) => a.variant_rank().cmp(&b.variant_rank()),
         }
     }
 }
 
-const fn variant_rank(key: &SortKey) -> u8 {
-    match key {
-        SortKey::Null => 0,
-        SortKey::Bool(_) => 1,
-        SortKey::I64(_) => 2,
-        SortKey::U64(_) => 3,
-        SortKey::F64(_) => 4,
-        SortKey::Str(_) => 5,
+impl From<Option<u64>> for SortKey {
+    fn from(value: Option<u64>) -> Self {
+        value.map_or(Self::Null, Self::U64)
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct CellText {
-    pub text: String,
-}
-
-impl CellText {
-    pub const fn plain(text: String) -> Self {
-        Self { text }
+impl From<Option<f64>> for SortKey {
+    fn from(value: Option<f64>) -> Self {
+        value.map_or(Self::Null, Self::F64)
     }
 }
 
-pub struct RenderCtx<'a> {
+impl From<Option<String>> for SortKey {
+    fn from(value: Option<String>) -> Self {
+        value.map_or(Self::Null, Self::Str)
+    }
+}
+
+/// Everything a column may need to compute a cell for one instance.
+pub struct CellCtx<'a> {
     pub snap: &'a InstanceState,
     pub omit_host: bool,
+    /// Tree branch drawing; empty when sorting or outside tree view.
     pub tree_prefix: &'a str,
     pub cluster_label: Option<&'a str>,
 }
 
-pub struct SortCtx<'a> {
-    pub snap: &'a InstanceState,
-    pub omit_host: bool,
-    pub cluster_label: Option<&'a str>,
+impl<'a> CellCtx<'a> {
+    pub const fn new(snap: &'a InstanceState) -> Self {
+        Self {
+            snap,
+            omit_host: false,
+            tree_prefix: "",
+            cluster_label: None,
+        }
+    }
 }
 
 pub trait Column: Send + Sync {
     fn header(&self) -> &str;
     fn align(&self) -> Align;
     fn width_hint(&self) -> WidthHint;
-    fn render_cell(&self, ctx: &RenderCtx<'_>) -> CellText;
-    fn sort_key(&self, ctx: &SortCtx<'_>) -> SortKey;
+    fn render_cell(&self, ctx: &CellCtx<'_>) -> String;
+    fn sort_key(&self, ctx: &CellCtx<'_>) -> SortKey;
+    fn tone(&self, _ctx: &CellCtx<'_>) -> Option<Tone> {
+        None
+    }
     fn emphasis(&self) -> Option<Emphasis> {
         None
     }
@@ -155,15 +220,35 @@ pub enum FormatSpec {
     Millis(u8),
 }
 
-pub fn parse_u64(snap: &InstanceState, key: &str) -> Option<u64> {
-    snap.info.get(key)?.parse().ok()
+impl FormatSpec {
+    /// Formats a typed value, returning `None` for missing values so callers
+    /// can substitute the column's placeholder.
+    pub fn apply(&self, value: &SortKey) -> Option<String> {
+        let text = match (self, value) {
+            (_, SortKey::Null) => return None,
+            (_, SortKey::Str(text)) => text.clone(),
+            (_, SortKey::Bool(flag)) => flag.to_string(),
+            (Self::Raw, SortKey::I64(number)) => number.to_string(),
+            (Self::Raw, SortKey::U64(number)) => number.to_string(),
+            (Self::Raw, SortKey::F64(number)) => number.to_string(),
+            (Self::BytesHuman, SortKey::U64(bytes)) => format_bytes(*bytes),
+            (format, number) => {
+                let number = number.as_f64()?;
+                match format {
+                    Self::BytesHuman => format_bytes(nonnegative_f64_to_u64(number)),
+                    Self::Fixed(decimals) | Self::Millis(decimals) => {
+                        format!("{number:.*}", usize::from(*decimals))
+                    }
+                    Self::Percent(decimals) => format_percent(number, *decimals),
+                    Self::Raw => number.to_string(),
+                }
+            }
+        };
+        Some(text)
+    }
 }
 
-pub fn parse_i64(snap: &InstanceState, key: &str) -> Option<i64> {
-    snap.info.get(key)?.parse().ok()
-}
-
-pub fn parse_f64(snap: &InstanceState, key: &str) -> Option<f64> {
+pub fn parse_info_field<T: std::str::FromStr>(snap: &InstanceState, key: &str) -> Option<T> {
     snap.info.get(key)?.parse().ok()
 }
 
@@ -174,10 +259,6 @@ pub fn parse_bool(snap: &InstanceState, key: &str) -> Option<bool> {
         "0" | "false" | "no" => Some(false),
         _ => None,
     }
-}
-
-pub fn parse_string(snap: &InstanceState, key: &str) -> Option<String> {
-    snap.info.get(key).cloned()
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -198,11 +279,7 @@ pub fn format_bytes(bytes: u64) -> String {
 }
 
 pub fn format_percent(value: f64, decimals: u8) -> String {
-    format!("{:.*}%", decimals as usize, value)
-}
-
-pub fn format_millis(value: f64, decimals: u8) -> String {
-    format!("{:.*}", decimals as usize, value)
+    format!("{value:.*}%", usize::from(decimals))
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -225,22 +302,9 @@ pub const fn nonnegative_f64_to_u64(value: f64) -> u64 {
     value.max(0.0) as u64
 }
 
-pub const fn compact_role(snap: &InstanceState) -> &'static str {
-    match snap.kind {
-        crate::model::InstanceType::Standalone => "STD",
-        crate::model::InstanceType::Cluster => "CLU",
-        crate::model::InstanceType::Primary => "PRI",
-        crate::model::InstanceType::Replica => "REP",
-    }
-}
-
 pub fn default_label(addr: &str, omit_host: bool) -> String {
     if omit_host && let Some(without_host) = strip_host(addr) {
         return without_host;
     }
     addr.rsplit('/').next().unwrap_or(addr).to_string()
-}
-
-pub const fn status_text(status: Status) -> &'static str {
-    status.as_str()
 }

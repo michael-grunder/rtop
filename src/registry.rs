@@ -211,52 +211,41 @@ struct ColumnDef {
     calc: Option<String>,
 }
 
+/// Layered config merging: every `Some` field in `incoming` replaces ours.
+macro_rules! overwrite_present_fields {
+    ($target:expr, $incoming:expr, $($field:ident),+ $(,)?) => {
+        $(
+            if $incoming.$field.is_some() {
+                $target.$field = $incoming.$field;
+            }
+        )+
+    };
+}
+
 impl ColumnDef {
     fn merge(&mut self, incoming: Self) {
-        if incoming.type_name.is_some() {
-            self.type_name = incoming.type_name;
-        }
-        if incoming.header.is_some() {
-            self.header = incoming.header;
-        }
-        if incoming.align.is_some() {
-            self.align = incoming.align;
-        }
-        if incoming.emphasis.is_some() {
-            self.emphasis = incoming.emphasis;
-        }
         merge_option(
             &mut self.emphasis_style,
             incoming.emphasis_style,
             EmphasisStyleDef::merge,
         );
-        if incoming.min_width.is_some() {
-            self.min_width = incoming.min_width;
-        }
-        if incoming.ideal_width.is_some() {
-            self.ideal_width = incoming.ideal_width;
-        }
-        if incoming.max_width.is_some() {
-            self.max_width = incoming.max_width;
-        }
-        if incoming.fixed_width.is_some() {
-            self.fixed_width = incoming.fixed_width;
-        }
-        if incoming.info_key.is_some() {
-            self.info_key = incoming.info_key;
-        }
-        if incoming.value_type.is_some() {
-            self.value_type = incoming.value_type;
-        }
-        if incoming.format.is_some() {
-            self.format = incoming.format;
-        }
-        if incoming.missing.is_some() {
-            self.missing = incoming.missing;
-        }
-        if incoming.calc.is_some() {
-            self.calc = incoming.calc;
-        }
+        overwrite_present_fields!(
+            self,
+            incoming,
+            type_name,
+            header,
+            align,
+            emphasis,
+            min_width,
+            ideal_width,
+            max_width,
+            fixed_width,
+            info_key,
+            value_type,
+            format,
+            missing,
+            calc,
+        );
     }
 }
 
@@ -272,24 +261,16 @@ struct EmphasisStyleDef {
 
 impl EmphasisStyleDef {
     fn merge(&mut self, incoming: Self) {
-        if incoming.bold.is_some() {
-            self.bold = incoming.bold;
-        }
-        if incoming.italic.is_some() {
-            self.italic = incoming.italic;
-        }
-        if incoming.underlined.is_some() {
-            self.underlined = incoming.underlined;
-        }
-        if incoming.dim.is_some() {
-            self.dim = incoming.dim;
-        }
-        if incoming.reversed.is_some() {
-            self.reversed = incoming.reversed;
-        }
-        if incoming.foreground_color.is_some() {
-            self.foreground_color = incoming.foreground_color;
-        }
+        overwrite_present_fields!(
+            self,
+            incoming,
+            bold,
+            italic,
+            underlined,
+            dim,
+            reversed,
+            foreground_color,
+        );
     }
 }
 
@@ -312,6 +293,8 @@ fn build_column(
         .as_ref()
         .map(|style| resolve_emphasis_style(base_emphasis_style, style))
         .transpose()?;
+    let format = parse_format(def.format.as_deref().unwrap_or("raw"))?;
+    let align = def.align.as_deref().map(parse_align).transpose()?;
 
     match def
         .type_name
@@ -324,13 +307,7 @@ fn build_column(
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("info column {key} missing info_key"))?;
             let value_type = parse_value_type(def.value_type.as_deref().unwrap_or("string"))?;
-            let format = parse_format(def.format.as_deref().unwrap_or("raw"))?;
-            let align = def
-                .align
-                .as_deref()
-                .map(parse_align)
-                .transpose()?
-                .unwrap_or_else(|| default_align_for_value_type(value_type));
+            let align = align.unwrap_or_else(|| default_align_for_value_type(value_type));
 
             Ok(Box::new(RedisInfoFieldColumn {
                 header,
@@ -347,16 +324,10 @@ fn build_column(
         "calc" => {
             let calc_raw = def
                 .calc
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("calc column {key} missing calc"))?;
-            let calc_kind = parse_calc_kind(&calc_raw)?;
-            let format = parse_format(def.format.as_deref().unwrap_or("raw"))?;
-            let align = def
-                .align
                 .as_deref()
-                .map(parse_align)
-                .transpose()?
-                .unwrap_or_else(|| default_align_for_calc(&calc_kind));
+                .ok_or_else(|| anyhow::anyhow!("calc column {key} missing calc"))?;
+            let calc_kind = parse_calc_kind(calc_raw)?;
+            let align = align.unwrap_or_else(|| default_align_for_calc(&calc_kind));
 
             Ok(Box::new(CalcColumn {
                 header,
@@ -409,21 +380,8 @@ fn parse_emphasis(raw: &str) -> Result<Emphasis> {
 }
 
 fn parse_color(raw: &str) -> Result<UiColor> {
-    let normalized = raw.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "black" => Ok(UiColor::Black),
-        "red" => Ok(UiColor::Red),
-        "green" => Ok(UiColor::Green),
-        "yellow" => Ok(UiColor::Yellow),
-        "blue" => Ok(UiColor::Blue),
-        "magenta" => Ok(UiColor::Magenta),
-        "cyan" => Ok(UiColor::Cyan),
-        "gray" | "grey" => Ok(UiColor::Gray),
-        "white" => Ok(UiColor::White),
-        _ => bail!(
-            "invalid emphasis color: {raw} (supported: black, red, green, yellow, blue, magenta, cyan, gray, white)"
-        ),
-    }
+    raw.parse()
+        .map_err(|err| anyhow::anyhow!("invalid emphasis color: {err}"))
 }
 
 fn merge_option<T>(slot: &mut Option<T>, incoming: Option<T>, merge: impl FnOnce(&mut T, T)) {
@@ -518,16 +476,11 @@ const fn default_align_for_calc(kind: &CalcKind) -> Align {
 }
 
 fn default_visible_columns() -> Vec<String> {
-    vec![
-        "alias".to_string(),
-        "addr".to_string(),
-        "role".to_string(),
-        "used_mem".to_string(),
-        "ops".to_string(),
-        "lat_last".to_string(),
-        "lat_max".to_string(),
-        "status".to_string(),
+    [
+        "alias", "addr", "role", "used_mem", "ops", "lat_last", "lat_max", "status",
     ]
+    .map(str::to_string)
+    .to_vec()
 }
 
 pub const fn legacy_sort_key(mode: SortMode) -> &'static str {
@@ -562,7 +515,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::ColumnRegistry;
-    use crate::column::{Column, Emphasis, RenderCtx, SortCtx, SortKey};
+    use crate::column::{CellCtx, Column, Emphasis, SortKey};
     use crate::model::{InstanceState, InstanceType, SlotRange, SortMode, UiColor};
 
     #[test]
@@ -621,22 +574,10 @@ mod tests {
         let replica = InstanceState::new("replica".into(), "10.0.0.2:7001".into());
 
         let render = |snap: &InstanceState, column: &Arc<dyn Column>| {
-            column
-                .render_cell(&RenderCtx {
-                    snap,
-                    omit_host: false,
-                    tree_prefix: "",
-                    cluster_label: None,
-                })
-                .text
+            column.render_cell(&CellCtx::new(snap))
         };
-        let sort = |snap: &InstanceState, column: &Arc<dyn Column>| {
-            column.sort_key(&SortCtx {
-                snap,
-                omit_host: false,
-                cluster_label: None,
-            })
-        };
+        let sort =
+            |snap: &InstanceState, column: &Arc<dyn Column>| column.sort_key(&CellCtx::new(snap));
 
         assert_eq!(render(&primary, total), "12");
         assert_eq!(render(&primary, ranges), "0-10,100");

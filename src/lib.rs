@@ -23,5 +23,6 @@ pub mod poller;
 mod redis_connection;
 pub mod registry;
 pub mod target_addr;
+mod text;
 pub mod topology;
 pub mod tui;

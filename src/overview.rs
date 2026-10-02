@@ -2,9 +2,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::app::{AppState, DisplayRow};
-use crate::column::{Align, EmphasisStyle};
-use crate::model::{SortDirection, UiColor};
+use crate::app::{AppState, RowCtx};
+use crate::column::{Align, EmphasisStyle, Tone};
+use crate::model::{InstanceState, InstanceType, SortDirection, UiColor};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OverviewFrame {
@@ -19,64 +19,45 @@ pub struct OverviewHeader {
     pub refresh_interval_ms: u128,
     pub view_mode: &'static str,
     pub sort: OverviewSort,
-    pub host_rendering: &'static str,
+    pub host_rendering: HostRendering,
     pub filter: String,
     pub is_filtering: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostRendering {
+    /// Forced on by the user.
+    Shown,
+    /// Hidden because every instance shares one host.
+    OmittedAuto,
+    /// Shown because instances span several hosts.
+    ShownAuto,
+}
+
+impl HostRendering {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Shown => "shown",
+            Self::OmittedAuto => "omitted(auto)",
+            Self::ShownAuto => "shown(auto)",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OverviewSort {
     pub key: String,
     pub label: String,
-    pub direction: SortDirectionLabel,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SortDirectionLabel {
-    Asc,
-    Desc,
+    pub direction: SortDirection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OverviewColumn {
     pub key: String,
     pub label: String,
-    pub align: AlignmentLabel,
-    pub emphasis_style: Option<OverviewEmphasisStyle>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AlignmentLabel {
-    Left,
-    Right,
-    Center,
-}
-
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct OverviewEmphasisStyle {
-    pub bold: bool,
-    pub italic: bool,
-    pub underlined: bool,
-    pub dim: bool,
-    pub reversed: bool,
-    pub foreground_color: Option<ColorLabel>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ColorLabel {
-    Black,
-    Red,
-    Green,
-    Yellow,
-    Blue,
-    Magenta,
-    Cyan,
-    Gray,
-    White,
+    pub align: Align,
+    pub emphasis_style: Option<EmphasisStyle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -92,19 +73,7 @@ pub struct OverviewRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OverviewClusterGutter {
     pub token: String,
-    pub color: ClusterGutterColor,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClusterGutterColor {
-    Cyan,
-    Yellow,
-    Green,
-    Magenta,
-    Blue,
-    Red,
-    Gray,
+    pub color: UiColor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -112,63 +81,64 @@ pub struct OverviewCell {
     pub column_key: String,
     pub value: String,
     pub emphasized: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tone: Option<Tone>,
 }
 
 impl AppState {
     pub fn build_overview_frame(&mut self) -> OverviewFrame {
         let rows = self.visible_rows();
-        let column_keys = self.visible_column_keys();
-        let cluster_labels = self.cluster_labels();
-        let emphasized = self.take_emphasized_rows_by_column(&rows);
+        let row_ctx = self.row_ctx();
+        let emphasized = self.take_emphasized_rows_by_column(&rows, &row_ctx);
+        let columns: Vec<_> = self
+            .visible_column_keys()
+            .into_iter()
+            .filter_map(|key| Some((self.column_registry.column(&key)?.clone(), key)))
+            .collect();
         let host_rendering = if self.force_show_host {
-            "shown"
+            HostRendering::Shown
         } else if self.should_omit_host_in_rendering() {
-            "omitted_auto"
+            HostRendering::OmittedAuto
         } else {
-            "shown_auto"
+            HostRendering::ShownAuto
         };
 
-        let columns = column_keys
+        let overview_columns = columns
             .iter()
-            .filter_map(|key| {
-                let column = self.column_registry.column(key)?;
-                Some(OverviewColumn {
-                    key: key.clone(),
-                    label: sortable_header(
-                        column.header(),
-                        &self.sort_by,
-                        self.sort_direction,
-                        key,
-                    ),
-                    align: AlignmentLabel::from(column.align()),
-                    emphasis_style: column.emphasis().map(|_| {
-                        OverviewEmphasisStyle::from(
-                            column
-                                .emphasis_style()
-                                .unwrap_or_else(|| self.column_registry.overview_emphasis_style()),
-                        )
-                    }),
-                })
+            .map(|(column, key)| OverviewColumn {
+                key: key.clone(),
+                label: sortable_header(column.header(), &self.sort_by, self.sort_direction, key),
+                align: column.align(),
+                emphasis_style: column.emphasis().map(|_| {
+                    column
+                        .emphasis_style()
+                        .unwrap_or_else(|| self.column_registry.overview_emphasis_style())
+                }),
             })
-            .collect::<Vec<_>>();
+            .collect();
 
         let rows = rows
             .iter()
             .enumerate()
-            .map(|(idx, row)| OverviewRow {
-                key: row.key.clone(),
-                tree_prefix: row.tree_prefix.clone(),
-                stale: row.stale,
-                selected: idx == self.selected_index,
-                cluster_gutter: overview_cluster_gutter(self, row, &cluster_labels),
-                cells: column_keys
-                    .iter()
-                    .map(|key| OverviewCell {
-                        column_key: key.clone(),
-                        value: self.render_cell(row, key).unwrap_or_default(),
-                        emphasized: emphasized.get(key).is_some_and(|winner| winner == &row.key),
-                    })
-                    .collect(),
+            .filter_map(|(idx, row)| {
+                let node = self.instances.get(&row.key)?;
+                let ctx = row_ctx.cell(node, &row.tree_prefix);
+                Some(OverviewRow {
+                    key: row.key.clone(),
+                    tree_prefix: row.tree_prefix.clone(),
+                    stale: row.stale,
+                    selected: idx == self.selected_index,
+                    cluster_gutter: overview_cluster_gutter(self, node, &row_ctx),
+                    cells: columns
+                        .iter()
+                        .map(|(column, key)| OverviewCell {
+                            column_key: key.clone(),
+                            value: column.render_cell(&ctx),
+                            emphasized: emphasized.get(key) == Some(&row.key),
+                            tone: column.tone(&ctx),
+                        })
+                        .collect(),
+                })
             })
             .collect();
 
@@ -180,13 +150,13 @@ impl AppState {
                 sort: OverviewSort {
                     key: self.sort_by.clone(),
                     label: self.sort_label(),
-                    direction: SortDirectionLabel::from(self.sort_direction),
+                    direction: self.sort_direction,
                 },
                 host_rendering,
                 filter: self.filter.clone(),
                 is_filtering: self.is_filtering,
             },
-            columns,
+            columns: overview_columns,
             rows,
         }
     }
@@ -208,52 +178,36 @@ pub fn render_plain_text(frame: &OverviewFrame) -> String {
         return "No overview columns are enabled.".to_string();
     }
 
-    let rendered_rows = frame
-        .rows
-        .iter()
-        .map(|row| {
-            row.cells
-                .iter()
-                .map(|cell| cell.value.clone())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-
-    let mut widths = frame
+    let mut widths: Vec<usize> = frame
         .columns
         .iter()
         .map(|column| plain_text_width(&column.label))
-        .collect::<Vec<_>>();
-
-    for row in &rendered_rows {
-        for (idx, cell) in row.iter().enumerate() {
-            widths[idx] = widths[idx].max(plain_text_width(cell));
+        .collect();
+    for row in &frame.rows {
+        for (width, cell) in widths.iter_mut().zip(&row.cells) {
+            *width = (*width).max(plain_text_width(&cell.value));
         }
     }
 
-    let header = frame
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(idx, column)| fit_cell_text(&column.label, widths[idx], column.align.into()))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let render_line = |cells: &mut dyn Iterator<Item = &str>| {
+        cells
+            .zip(&frame.columns)
+            .zip(&widths)
+            .map(|((text, column), width)| fit_cell_text(text, *width, column.align))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    let header = render_line(&mut frame.columns.iter().map(|column| column.label.as_str()));
     let separator = widths
         .iter()
         .map(|width| "-".repeat(*width))
         .collect::<Vec<_>>()
         .join(" ");
-    let body = rendered_rows
+    let body = frame
+        .rows
         .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(idx, cell)| {
-                    fit_cell_text(cell, widths[idx], frame.columns[idx].align.into())
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
+        .map(|row| render_line(&mut row.cells.iter().map(|cell| cell.value.as_str())))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -281,34 +235,14 @@ pub const fn sort_direction_symbol(direction: SortDirection) -> &'static str {
 }
 
 pub fn fit_cell_text(text: &str, width: usize, align: Align) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let mut chars = text.chars().collect::<Vec<char>>();
-    if chars.len() > width {
-        chars.truncate(width);
-    }
-    let truncated: String = chars.into_iter().collect();
-    let len = truncated.chars().count();
-    if len >= width {
-        return truncated;
-    }
-    let pad = width - len;
-    match align {
-        Align::Left => format!("{truncated}{:pad$}", "", pad = pad),
-        Align::Right => format!("{:pad$}{truncated}", "", pad = pad),
-        Align::Center => {
-            let left = pad / 2;
-            let right = pad - left;
-            format!(
-                "{:left$}{truncated}{:right$}",
-                "",
-                "",
-                left = left,
-                right = right
-            )
-        }
-    }
+    let truncated: String = text.chars().take(width).collect();
+    let pad = width - truncated.chars().count();
+    let (left, right) = match align {
+        Align::Left => (0, pad),
+        Align::Right => (pad, 0),
+        Align::Center => (pad / 2, pad - pad / 2),
+    };
+    format!("{:left$}{truncated}{:right$}", "", "")
 }
 
 pub fn plain_text_width(text: &str) -> usize {
@@ -317,13 +251,12 @@ pub fn plain_text_width(text: &str) -> usize {
 
 fn overview_cluster_gutter(
     app: &AppState,
-    row: &DisplayRow,
-    cluster_labels: &std::collections::HashMap<String, String>,
+    instance: &InstanceState,
+    row_ctx: &RowCtx,
 ) -> Option<OverviewClusterGutter> {
-    let instance = app.instances.get(&row.key)?;
     let token = instance.cluster_id.as_deref().map_or_else(
         || replication_group_token(app, instance),
-        |raw_cluster| cluster_labels.get(raw_cluster).cloned(),
+        |raw_cluster| row_ctx.cluster_labels.get(raw_cluster).cloned(),
     )?;
 
     Some(OverviewClusterGutter {
@@ -332,40 +265,41 @@ fn overview_cluster_gutter(
     })
 }
 
-fn replication_group_token(
-    app: &AppState,
-    instance: &crate::model::InstanceState,
-) -> Option<String> {
+fn replication_group_token(app: &AppState, instance: &InstanceState) -> Option<String> {
     match instance.kind {
-        crate::model::InstanceType::Primary => app
+        InstanceType::Primary => app
             .instances
             .values()
             .any(|candidate| candidate.parent_addr.as_deref() == Some(instance.addr.as_str()))
             .then(|| instance.addr.clone()),
-        crate::model::InstanceType::Replica => instance
+        InstanceType::Replica => instance
             .parent_addr
             .as_deref()
             .map(|parent| resolve_replication_group_addr(app, parent)),
-        crate::model::InstanceType::Standalone | crate::model::InstanceType::Cluster => None,
+        InstanceType::Standalone | InstanceType::Cluster => None,
     }
 }
 
 fn resolve_replication_group_addr(app: &AppState, parent: &str) -> String {
     app.instances
-        .values()
-        .find(|candidate| candidate.key == parent || candidate.addr == parent)
+        .get(parent)
+        .or_else(|| {
+            app.instances
+                .values()
+                .find(|candidate| candidate.addr == parent)
+        })
         .map_or_else(|| parent.to_string(), |candidate| candidate.addr.clone())
 }
 
-pub fn cluster_color_for_token(token: &str) -> ClusterGutterColor {
-    const PALETTE: [ClusterGutterColor; 7] = [
-        ClusterGutterColor::Cyan,
-        ClusterGutterColor::Yellow,
-        ClusterGutterColor::Green,
-        ClusterGutterColor::Magenta,
-        ClusterGutterColor::Blue,
-        ClusterGutterColor::Red,
-        ClusterGutterColor::Gray,
+pub fn cluster_color_for_token(token: &str) -> UiColor {
+    const PALETTE: [UiColor; 7] = [
+        UiColor::Cyan,
+        UiColor::Yellow,
+        UiColor::Green,
+        UiColor::Magenta,
+        UiColor::Blue,
+        UiColor::Red,
+        UiColor::Gray,
     ];
 
     let index = token.bytes().fold(0usize, |acc, byte| {
@@ -374,67 +308,9 @@ pub fn cluster_color_for_token(token: &str) -> ClusterGutterColor {
     PALETTE[index % PALETTE.len()]
 }
 
-impl From<Align> for AlignmentLabel {
-    fn from(value: Align) -> Self {
-        match value {
-            Align::Left => Self::Left,
-            Align::Right => Self::Right,
-            Align::Center => Self::Center,
-        }
-    }
-}
-
-impl From<AlignmentLabel> for Align {
-    fn from(value: AlignmentLabel) -> Self {
-        match value {
-            AlignmentLabel::Left => Self::Left,
-            AlignmentLabel::Right => Self::Right,
-            AlignmentLabel::Center => Self::Center,
-        }
-    }
-}
-
-impl From<SortDirection> for SortDirectionLabel {
-    fn from(value: SortDirection) -> Self {
-        match value {
-            SortDirection::Asc => Self::Asc,
-            SortDirection::Desc => Self::Desc,
-        }
-    }
-}
-
-impl From<EmphasisStyle> for OverviewEmphasisStyle {
-    fn from(value: EmphasisStyle) -> Self {
-        Self {
-            bold: value.bold,
-            italic: value.italic,
-            underlined: value.underlined,
-            dim: value.dim,
-            reversed: value.reversed,
-            foreground_color: value.foreground.map(ColorLabel::from),
-        }
-    }
-}
-
-impl From<UiColor> for ColorLabel {
-    fn from(value: UiColor) -> Self {
-        match value {
-            UiColor::Black => Self::Black,
-            UiColor::Red => Self::Red,
-            UiColor::Green => Self::Green,
-            UiColor::Yellow => Self::Yellow,
-            UiColor::Blue => Self::Blue,
-            UiColor::Magenta => Self::Magenta,
-            UiColor::Cyan => Self::Cyan,
-            UiColor::Gray => Self::Gray,
-            UiColor::White => Self::White,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ClusterGutterColor, render_plain_text};
+    use super::render_plain_text;
     use crate::app::AppState;
     use crate::config::default_settings;
     use crate::model::{InstanceState, Status, ViewMode};
@@ -475,7 +351,7 @@ mod tests {
                 .cluster_gutter
                 .as_ref()
                 .map(|gutter| gutter.color),
-            Some(ClusterGutterColor::Yellow)
+            Some(crate::model::UiColor::Yellow)
         );
     }
 

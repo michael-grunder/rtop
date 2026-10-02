@@ -1,6 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::net::IpAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -13,9 +12,8 @@ use crate::poller::{
     apply_cluster_shards_to_state, apply_info_to_state, classify_error, error_details,
 };
 use crate::redis_connection;
-use crate::target_addr::{canonical_host, strip_host, tcp_host, tcp_port};
+use crate::target_addr::{canonical_host, is_loopback_host, strip_host, tcp_host, tcp_port};
 
-const LOCALHOST_NAMES: &[&str] = &["localhost", "127.0.0.1", "::1"];
 const DISCOVERY_TAG: &str = "autodiscovered";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +66,7 @@ impl DiscoveryTarget {
     }
 
     pub fn is_localhost(&self) -> bool {
-        is_localhost_host(&self.host)
+        is_loopback_host(&self.host)
     }
 }
 
@@ -824,7 +822,7 @@ fn tcp_target_key(target: &Target) -> Option<String> {
 }
 
 fn candidate_key(host: &str, port: u16) -> String {
-    let normalized_host = if is_localhost_host(host) {
+    let normalized_host = if is_loopback_host(host) {
         "127.0.0.1".to_string()
     } else {
         let addr = if host.contains(':') && !host.starts_with('[') {
@@ -1006,13 +1004,6 @@ pub(crate) fn local_process_id_for_unix_socket(path: &str) -> Option<u32> {
         .copied()
 }
 
-fn is_localhost_host(host: &str) -> bool {
-    LOCALHOST_NAMES
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(host))
-        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
-}
-
 fn is_auth_required(error: &redis::RedisError) -> bool {
     error
         .code()
@@ -1030,17 +1021,19 @@ mod tests {
     use super::{
         CandidateEndpoint, CandidateSource, DiscoveryEvent, DiscoveryPhase, DiscoveryStatus,
         DiscoveryTarget, credential_map, dedupe_candidates, extract_ports_from_cmdline,
-        is_localhost_host, parse_proc_net_listening_ports, replication_candidates,
+        parse_proc_net_listening_ports, replication_candidates,
     };
     use crate::model::{Target, TargetProtocol};
     use crate::parse::parse_info;
 
     #[test]
     fn localhost_detection_handles_names_and_ips() {
-        assert!(is_localhost_host("localhost"));
-        assert!(is_localhost_host("127.0.0.1"));
-        assert!(is_localhost_host("::1"));
-        assert!(!is_localhost_host("192.168.1.10"));
+        use crate::target_addr::is_loopback_host;
+
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("192.168.1.10"));
     }
 
     #[test]

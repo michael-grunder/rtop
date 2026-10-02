@@ -155,7 +155,8 @@ pub struct RuntimeSettings {
     pub ui_theme: UiTheme,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UiColor {
     Black,
     Red,
@@ -166,6 +167,27 @@ pub enum UiColor {
     Cyan,
     Gray,
     White,
+}
+
+impl std::str::FromStr for UiColor {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "black" => Ok(Self::Black),
+            "red" => Ok(Self::Red),
+            "green" => Ok(Self::Green),
+            "yellow" => Ok(Self::Yellow),
+            "blue" => Ok(Self::Blue),
+            "magenta" => Ok(Self::Magenta),
+            "cyan" => Ok(Self::Cyan),
+            "gray" | "grey" => Ok(Self::Gray),
+            "white" => Ok(Self::White),
+            _ => Err(format!(
+                "{raw} (supported: black, red, green, yellow, blue, magenta, cyan, gray, white)"
+            )),
+        }
+    }
 }
 
 impl UiColor {
@@ -220,6 +242,15 @@ impl InstanceType {
             Self::Cluster => "cluster",
             Self::Primary => "primary",
             Self::Replica => "replica",
+        }
+    }
+
+    pub const fn compact_label(self) -> &'static str {
+        match self {
+            Self::Standalone => "STD",
+            Self::Cluster => "CLU",
+            Self::Primary => "PRI",
+            Self::Replica => "REP",
         }
     }
 }
@@ -362,6 +393,9 @@ pub struct BigkeysMetrics {
     pub last_completed: Option<Instant>,
 }
 
+/// Grouping key used for instances that do not belong to a Redis Cluster.
+pub const STANDALONE_CLUSTER: &str = "Standalone";
+
 #[derive(Debug, Clone)]
 pub struct InstanceState {
     pub key: String,
@@ -413,6 +447,14 @@ impl InstanceState {
             latency_window: VecDeque::with_capacity(120),
             detail: DetailMetrics::default(),
         }
+    }
+
+    pub fn cluster_key(&self) -> &str {
+        self.cluster_id.as_deref().unwrap_or(STANDALONE_CLUSTER)
+    }
+
+    pub fn display_name(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.addr)
     }
 
     pub fn is_stale(&self, refresh_interval: Duration) -> bool {

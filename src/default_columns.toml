@@ -43,6 +43,7 @@ align = "left"
 min_width = 6
 ideal_width = 8
 max_width = 12
+missing = "?"
 
 [columns.slots_total]
 type = "calc"

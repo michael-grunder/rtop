@@ -22,6 +22,9 @@
 - Kill picker on `K` with Redis `SHUTDOWN` and local signal options
 - Credential form on `a` for authenticating the selected server without
   restarting `rtop`
+- Overview border summarizing refresh interval, view, sort, host rendering, and filter
+- `Status` cells colored with the theme's `warning_color` (`LOADING`, `TIMEOUT`,
+  `AUTH`, `PROTECTED`) and `critical_color` (`DOWN`, `ERROR`)
 - Bottom status/key bar with mnemonic shortcut labels and live search/filter input echo
 - Live discovery status in the footer, including queued/probing/verified counts
 - Config loading from TOML + CLI target merge
@@ -43,10 +46,12 @@
   with an additional confirmation when stopping more than one server
 - `?`: toggle help
 - `j` / `k` or `Up/Down`: move focus in overview, or scroll the active detail pane when it has more rows than fit
+- `PgUp` / `PgDn`: move or scroll a full page in the overview, detail panes, and pickers
+- `g` / `Home` and `G` / `End`: jump to the first or last row; `NG` jumps to row `N` in the overview
 - `Enter`: open detail for the focused server
 - `Esc`: clear server selections in the overview, or quit if none are selected;
   close the active overlay window, go back from detail/help, or stop filter editing
-- `h` / `l` or `Left` / `Right`: cycle detail tabs (`Tab` also advances)
+- `h` / `l` or `Left` / `Right`: cycle detail tabs (`Tab` advances, `Shift+Tab` goes back)
 - `S` / `L` / `I` / `C` / `B` / `K`: jump to `Summary` / `Latency` / `Info Raw` / `Commandstats` / `Bigkeys` / `Hotkeys` in detail view
 - `Shift+Up/Down`: reorder columns inside the column picker
 - `o` / `O`: toggle host rendering (default auto-hides host when all targets share one host)
@@ -128,9 +133,10 @@ The `Bigkeys` detail tab mirrors `redis-cli --bigkeys`: it scans the keyspace wi
 found. The `Length` column shows that type-specific cardinality/length value,
 while `Memory` shows a humanized `MEMORY USAGE` estimate when supported. Unlike
 normal polling, this scan is
-performed on demand when the `Bigkeys` tab is opened or refreshed. The header
-shows when a scan is in progress, and after completion it shows the result age
-in seconds.
+performed on demand when the `Bigkeys` tab is opened or refreshed. Scans run in
+the background, so regular polling of every server continues while a large
+keyspace is scanned. The header shows when a scan is in progress, and after
+completion it shows the result age in seconds.
 
 The `Hotkeys` detail tab uses Redis `HOTKEYS START ... DURATION 60` so sampling
 always stops automatically even if the TUI exits mid-run. The pane starts in an
@@ -224,7 +230,8 @@ microtime-style timestamp string (`seconds.microseconds`) and is generated from
 the same centralized overview data model used by the TUI overview, which makes
 the JSON stream suitable for
 integration testing. When combined with `--once`, `rtop` emits a single
-JSON frame and exits.
+JSON frame and exits. Cells that carry a severity (currently `Status`) include
+a `tone` of `warning` or `critical`; the field is omitted otherwise.
 
 Version output includes build metadata:
 
@@ -469,7 +476,9 @@ saved credentials. `--no-config` also disables persistence unless an explicit
 printing its contents, and write failures warn without failing authentication.
 
 `[theme]` colors support: `black`, `red`, `green`, `yellow`, `blue`,
-`magenta`, `cyan`, `gray`/`grey`, `white`.
+`magenta`, `cyan`, `gray`/`grey`, `white`. `warning_color` and
+`critical_color` color the overview `Status` cell; a column's explicit
+emphasis `foreground_color` takes precedence when both apply.
 
 `[global].still_autodiscover` defaults to `true`. Leave it enabled if you want
 saved targets to provide credentials or fixed instances without suppressing

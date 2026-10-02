@@ -37,9 +37,7 @@ pub fn tcp_port(addr: &str) -> Option<u16> {
 pub fn tcp_endpoint_identity(addr: &str) -> Option<String> {
     let host = tcp_host(addr)?;
     let port = tcp_port(addr)?;
-    let normalized_host = if host.eq_ignore_ascii_case("localhost")
-        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
-    {
+    let normalized_host = if is_loopback_host(&host) {
         "127.0.0.1".to_string()
     } else {
         canonical_host(addr).unwrap_or_else(|| host.to_ascii_lowercase())
@@ -47,15 +45,15 @@ pub fn tcp_endpoint_identity(addr: &str) -> Option<String> {
     Some(format!("{normalized_host}:{port}"))
 }
 
-pub fn is_local_addr(addr: &str) -> bool {
-    if addr.contains('/') {
-        return true;
-    }
+/// `localhost` or any loopback IP literal.
+pub fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
 
-    tcp_host(addr).is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost")
-            || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
-    })
+/// Unix sockets and loopback TCP endpoints live on this machine.
+pub fn is_local_addr(addr: &str) -> bool {
+    addr.contains('/') || tcp_host(addr).is_some_and(|host| is_loopback_host(&host))
 }
 
 pub fn strip_host(addr: &str) -> Option<String> {

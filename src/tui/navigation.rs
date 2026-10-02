@@ -1,12 +1,6 @@
 use std::time::{Duration, Instant};
 
-use super::{
-    ActiveView, AppState, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, OverviewModal,
-    bigkeys_page_len, commandstats_page_len, current_bigkeys, current_commandstats,
-    current_detail_text_body, current_hotkeys, detail_text_lines, detail_text_page_len,
-    hotkeys_page_len, is_bigkeys_detail, is_commandstats_detail, is_detail_text_tab,
-    is_hotkeys_detail, sync_detail_views,
-};
+use super::{ActiveView, AppState, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, OverviewModal};
 
 const RANGE_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -16,15 +10,58 @@ pub(super) struct Navigation {
     recent_range: Option<(Instant, Vec<String>)>,
 }
 
+/// Where a navigation key moves the focus or scroll position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Motion {
+    /// Relative rows (negative is up).
+    Rows(isize),
+    /// Relative pages of the last rendered size.
+    Pages(isize),
+    /// Absolute zero-based row.
+    Row(usize),
+    Last,
+    /// Relative detail tabs.
+    Tabs(isize),
+}
+
+impl Motion {
+    fn from_key(code: KeyCode, count: Option<usize>) -> Option<Self> {
+        let steps = count
+            .unwrap_or(1)
+            .min(isize::MAX.cast_unsigned())
+            .cast_signed();
+        Some(match code {
+            KeyCode::Char('j') | KeyCode::Down => Self::Rows(steps),
+            KeyCode::Char('k') | KeyCode::Up => Self::Rows(-steps),
+            KeyCode::Char('l') | KeyCode::Right => Self::Tabs(steps),
+            KeyCode::Char('h') | KeyCode::Left => Self::Tabs(-steps),
+            KeyCode::PageDown => Self::Pages(steps),
+            KeyCode::PageUp => Self::Pages(-steps),
+            KeyCode::Char('g') | KeyCode::Home => Self::Row(0),
+            // Like vim, a counted G jumps to that (one-based) row.
+            KeyCode::Char('G') | KeyCode::End => {
+                count.map_or(Self::Last, |row| Self::Row(row.saturating_sub(1)))
+            }
+            _ => return None,
+        })
+    }
+
+    /// The equivalent relative row movement within a list of `len` items.
+    fn row_delta(self, current: usize, len: usize, page_len: usize) -> isize {
+        let page = page_len.max(1).cast_signed();
+        match self {
+            Self::Rows(delta) => delta,
+            Self::Pages(pages) => pages.saturating_mul(page),
+            Self::Row(row) => row.cast_signed().saturating_sub(current.cast_signed()),
+            Self::Last => len.cast_signed().saturating_sub(current.cast_signed()),
+            Self::Tabs(_) => 0,
+        }
+    }
+}
+
 impl Navigation {
     /// Runs before command dispatch, but leaves text fields and non-navigation overlays alone.
-    pub(super) fn handle_key(
-        &mut self,
-        app: &mut AppState,
-        key: KeyEvent,
-        height: u16,
-        now: Instant,
-    ) -> bool {
+    pub(super) fn handle_key(&mut self, app: &mut AppState, key: KeyEvent, now: Instant) -> bool {
         if !accepts_navigation(app) {
             *self = Self::default();
             return false;
@@ -33,10 +70,7 @@ impl Navigation {
         if key.kind == KeyEventKind::Release || matches!(key.code, KeyCode::Modifier(_)) {
             return false;
         }
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-        {
+        if super::has_command_modifier(key) {
             *self = Self::default();
             return false;
         }
@@ -74,52 +108,47 @@ impl Navigation {
             }
             return false;
         }
-        let direction = match key.code {
-            KeyCode::Char('j') | KeyCode::Down => KeyCode::Down,
-            KeyCode::Char('k') | KeyCode::Up => KeyCode::Up,
-            KeyCode::Char('h') | KeyCode::Left => KeyCode::Left,
-            KeyCode::Char('l') | KeyCode::Right => KeyCode::Right,
-            _ => return false,
+        let Some(motion) = Motion::from_key(key.code, count) else {
+            return false;
         };
-        let steps = count.unwrap_or(1);
-        let magnitude = isize::try_from(steps).unwrap_or(isize::MAX);
-        let delta = if matches!(direction, KeyCode::Up | KeyCode::Left) {
-            -magnitude
-        } else {
-            magnitude
-        };
-        if matches!(direction, KeyCode::Left | KeyCode::Right) {
+        if let Motion::Tabs(steps) = motion {
             if app.active_view == ActiveView::Detail && app.overview_modal == OverviewModal::None {
-                let tabs = super::DETAIL_TABS.len();
-                let offset = steps % tabs;
-                app.detail_tab = if direction == KeyCode::Left {
-                    (app.detail_tab + tabs - offset) % tabs
-                } else {
-                    (app.detail_tab + offset) % tabs
-                };
-                sync_detail_views(app, height);
+                app.set_detail_tab(app.detail_tab.rotate(steps));
             }
             return true;
         }
         match app.overview_modal {
-            OverviewModal::SortPicker => app.move_sort_picker_selection(delta),
+            OverviewModal::SortPicker => {
+                let len = app.sortable_columns().len();
+                app.move_sort_picker_selection(motion.row_delta(app.sort_picker_index, len, len));
+            }
             OverviewModal::ColumnPicker => {
                 let reorder = key.modifiers.contains(KeyModifiers::SHIFT);
                 app.set_column_picker_reorder_mode(reorder);
+                let len = app.column_picker_entries().len();
+                let delta = motion.row_delta(app.column_picker_index, len, len);
                 if reorder {
                     app.move_selected_column(delta);
                 } else {
                     app.move_column_picker_selection(delta);
                 }
             }
-            OverviewModal::KillPicker => app.move_kill_picker_selection(delta),
+            OverviewModal::KillPicker => {
+                let len = crate::model::KillAction::ALL.len();
+                app.move_kill_picker_selection(motion.row_delta(app.kill_picker_index, len, len));
+            }
             OverviewModal::None if overview => {
-                if count.is_some() && key.kind == KeyEventKind::Press {
-                    self.recent_range = Some((now, range_keys(app, steps, delta < 0)));
+                let len = app.visible_rows().len();
+                let delta = motion.row_delta(app.selected_index, len, app.overview_page_len);
+                if count.is_some()
+                    && key.kind == KeyEventKind::Press
+                    && let Motion::Rows(rows) = motion
+                {
+                    self.recent_range = Some((now, range_keys(app, count.unwrap_or(1), rows < 0)));
                 }
                 app.move_selection(delta);
             }
-            OverviewModal::None => scroll_detail(app, delta, height),
+            OverviewModal::None => scroll_detail(app, motion),
             _ => {}
         }
         true
@@ -129,12 +158,7 @@ impl Navigation {
 fn accepts_navigation(app: &AppState) -> bool {
     !(app.is_auth_form_open()
         || app.is_filtering
-        || app.commandstats_view.is_filtering
-        || app.bigkeys_view.is_filtering
-        || app.hotkeys_view.is_filtering
-        || app
-            .detail_pane_view(app.detail_tab)
-            .is_some_and(|view| view.is_filtering)
+        || app.editing_pane().is_some()
         || app.show_help
         || app.active_view == ActiveView::Help
         || app.overview_modal == OverviewModal::KillConfirmation)
@@ -142,49 +166,34 @@ fn accepts_navigation(app: &AppState) -> bool {
 
 fn range_keys(app: &AppState, count: usize, upward: bool) -> Vec<String> {
     let rows = app.visible_rows();
+    let keys = |iter: &mut dyn Iterator<Item = &crate::app::DisplayRow>| {
+        iter.take(count).map(|row| row.key.clone()).collect()
+    };
     if upward {
-        rows.iter()
-            .take(app.selected_index.saturating_add(1))
-            .rev()
-            .take(count)
-            .map(|row| row.key.clone())
-            .collect()
+        keys(&mut rows.iter().take(app.selected_index.saturating_add(1)).rev())
     } else {
-        rows.iter()
-            .skip(app.selected_index)
-            .take(count)
-            .map(|row| row.key.clone())
-            .collect()
+        keys(&mut rows.iter().skip(app.selected_index))
     }
 }
 
-fn scroll_detail(app: &mut AppState, delta: isize, height: u16) {
-    if is_commandstats_detail(app) {
-        if let Some(stats) = current_commandstats(app).map(ToOwned::to_owned) {
-            app.move_commandstats_scroll(delta, &stats, commandstats_page_len(height));
+fn scroll_detail(app: &mut AppState, motion: Motion) {
+    let scroll = &mut app.active_pane_mut().scroll;
+    match motion {
+        Motion::Rows(delta) => scroll.scroll_by(delta),
+        Motion::Pages(pages) => scroll.page_by(pages),
+        Motion::Row(row) => {
+            scroll.to_start();
+            scroll.scroll_by(row.min(isize::MAX.cast_unsigned()).cast_signed());
         }
-    } else if is_bigkeys_detail(app) {
-        if let Some(bigkeys) = current_bigkeys(app) {
-            let rows = app.visible_bigkeys(&bigkeys.largest_keys).len();
-            app.move_bigkeys_scroll(delta, rows, bigkeys_page_len(height));
-        }
-    } else if is_hotkeys_detail(app) {
-        if let Some(hotkeys) = current_hotkeys(app) {
-            let rows = app.visible_hotkeys(&hotkeys.entries).len();
-            app.move_hotkeys_scroll(delta, rows, hotkeys_page_len(height));
-        }
-    } else if is_detail_text_tab(app) {
-        let rows = current_detail_text_body(app).map_or(0, |body| {
-            app.visible_detail_text_lines(app.detail_tab, &detail_text_lines(&body))
-                .len()
-        });
-        app.move_detail_text_scroll(app.detail_tab, delta, rows, detail_text_page_len(height));
+        Motion::Last => scroll.to_end(),
+        Motion::Tabs(_) => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::DetailTab;
     use crate::config::default_settings;
     use crate::model::{InstanceState, SortDirection, SortMode};
     use crate::registry::ColumnRegistry;
@@ -204,7 +213,7 @@ mod tests {
     fn type_keys(nav: &mut Navigation, app: &mut AppState, keys: &str, at: Instant) {
         for ch in keys.chars() {
             let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
-            if !nav.handle_key(app, key, 10, at) {
+            if !nav.handle_key(app, key, at) {
                 super::super::handle_overview_shortcut(app, key);
             }
         }
@@ -224,7 +233,6 @@ mod tests {
         assert!(nav.handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-            10,
             now
         ));
         assert_eq!(app.selected_index, 11);
@@ -338,7 +346,6 @@ mod tests {
         assert!(nav.handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            10,
             now
         ));
         assert!(!app.should_quit);
@@ -362,7 +369,7 @@ mod tests {
                 3 => app.active_view = ActiveView::Help,
                 tab => {
                     app.active_view = ActiveView::Detail;
-                    app.detail_tab = tab - 4;
+                    app.detail_tab = DetailTab::ALL[tab - 4];
                     app.start_active_detail_filter_input(false);
                 }
             }
@@ -371,7 +378,6 @@ mod tests {
                 assert!(!nav.handle_key(
                     &mut app,
                     KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
-                    10,
                     Instant::now()
                 ));
             }
@@ -393,7 +399,6 @@ mod tests {
                 KeyModifiers::NONE,
                 KeyEventKind::Release
             ),
-            10,
             now
         ));
         type_keys(&mut nav, &mut app, "j", now);
@@ -405,7 +410,6 @@ mod tests {
                 KeyModifiers::NONE,
                 KeyEventKind::Release
             ),
-            10,
             now
         ));
         type_keys(&mut nav, &mut app, " ", now);
@@ -416,12 +420,7 @@ mod tests {
             KeyModifiers::SUPER,
         ] {
             type_keys(&mut nav, &mut app, "3", now);
-            assert!(!nav.handle_key(
-                &mut app,
-                KeyEvent::new(KeyCode::Char('j'), modifier),
-                10,
-                now
-            ));
+            assert!(!nav.handle_key(&mut app, KeyEvent::new(KeyCode::Char('j'), modifier), now));
             let before = app.selected_index;
             type_keys(&mut nav, &mut app, "j", now);
             assert_eq!(app.selected_index, before + 1);
@@ -432,18 +431,54 @@ mod tests {
     fn detail_tabs_and_scrolling_accept_counts() {
         let mut app = app();
         app.active_view = ActiveView::Detail;
+        // Scrolling clamps against the viewport the renderer last reported.
+        app.pane_mut(DetailTab::Summary).scroll.viewport(10, 3);
         let mut nav = Navigation::default();
         let now = Instant::now();
         type_keys(&mut nav, &mut app, "2j", now);
-        assert_eq!(app.summary_view.scroll_offset, 2);
+        assert_eq!(app.pane(DetailTab::Summary).scroll.offset(), 2);
         type_keys(&mut nav, &mut app, "k", now);
-        assert_eq!(app.summary_view.scroll_offset, 1);
+        assert_eq!(app.pane(DetailTab::Summary).scroll.offset(), 1);
         type_keys(&mut nav, &mut app, "2l", now);
-        assert_eq!(app.detail_tab, 2);
+        assert_eq!(app.detail_tab, DetailTab::InfoRaw);
         type_keys(&mut nav, &mut app, "3h", now);
-        assert_eq!(app.detail_tab, 5);
+        assert_eq!(app.detail_tab, DetailTab::Hotkeys);
         type_keys(&mut nav, &mut app, "l", now);
-        assert_eq!(app.detail_tab, 0);
+        assert_eq!(app.detail_tab, DetailTab::Summary);
+    }
+
+    #[test]
+    fn paging_and_jumps_move_overview_focus_and_detail_scroll() {
+        let mut app = app();
+        app.overview_page_len = 5;
+        let mut nav = Navigation::default();
+        let now = Instant::now();
+        let press = |nav: &mut Navigation, app: &mut AppState, code| {
+            assert!(nav.handle_key(app, KeyEvent::new(code, KeyModifiers::NONE), now));
+        };
+        press(&mut nav, &mut app, KeyCode::PageDown);
+        assert_eq!(app.selected_index, 5);
+        type_keys(&mut nav, &mut app, "G", now);
+        assert_eq!(app.selected_index, 19);
+        press(&mut nav, &mut app, KeyCode::PageUp);
+        assert_eq!(app.selected_index, 14);
+        type_keys(&mut nav, &mut app, "g", now);
+        assert_eq!(app.selected_index, 0);
+        type_keys(&mut nav, &mut app, "7G", now);
+        assert_eq!(app.selected_index, 6);
+        press(&mut nav, &mut app, KeyCode::End);
+        assert_eq!(app.selected_index, 19);
+        press(&mut nav, &mut app, KeyCode::Home);
+        assert_eq!(app.selected_index, 0);
+
+        app.active_view = ActiveView::Detail;
+        app.pane_mut(DetailTab::Summary).scroll.viewport(30, 10);
+        press(&mut nav, &mut app, KeyCode::PageDown);
+        assert_eq!(app.pane(DetailTab::Summary).scroll.offset(), 10);
+        press(&mut nav, &mut app, KeyCode::End);
+        assert_eq!(app.pane(DetailTab::Summary).scroll.offset(), 20);
+        type_keys(&mut nav, &mut app, "g", now);
+        assert_eq!(app.pane(DetailTab::Summary).scroll.offset(), 0);
     }
 
     #[test]
@@ -452,18 +487,17 @@ mod tests {
 
         let mut app = app();
         app.active_view = ActiveView::Detail;
-        app.detail_tab = 3;
+        app.detail_tab = DetailTab::Commandstats;
         app.open_column_picker();
         let mut nav = Navigation::default();
         let now = Instant::now();
         type_keys(&mut nav, &mut app, "2jkh", now);
         assert_eq!(app.column_picker_index, 1);
-        assert_eq!(app.detail_tab, 3);
-        assert_eq!(app.commandstats_view.scroll_offset, 0);
+        assert_eq!(app.detail_tab, DetailTab::Commandstats);
+        assert_eq!(app.pane(DetailTab::Commandstats).scroll.offset(), 0);
         assert!(nav.handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
-            20,
             now
         ));
         assert_eq!(app.column_picker_index, 2);
@@ -471,7 +505,7 @@ mod tests {
             app.visible_commandstats_columns(),
             [Command, Usec, Calls, UsecPerCall]
         );
-        assert_eq!(app.commandstats_view.scroll_offset, 0);
+        assert_eq!(app.pane(DetailTab::Commandstats).scroll.offset(), 0);
         assert!(app.column_picker_reorder_mode);
     }
 
@@ -520,7 +554,6 @@ mod tests {
         assert!(nav.handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
-            10,
             now,
         ));
         let after = app.available_overview_columns();
@@ -540,7 +573,6 @@ mod tests {
             assert!(nav.handle_key(
                 &mut app,
                 KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, kind),
-                10,
                 now,
             ));
         }
@@ -548,7 +580,6 @@ mod tests {
         assert!(!nav.handle_key(
             &mut app,
             KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Release),
-            10,
             now,
         ));
         assert_eq!(app.sort_picker_index, 2);

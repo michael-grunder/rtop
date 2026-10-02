@@ -1,29 +1,35 @@
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use redis::{ErrorKind, Value};
 use tokio::sync::{Semaphore, mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::MissedTickBehavior;
 
 use crate::discovery::{local_process_id_for_tcp_port, local_process_id_for_unix_socket};
-use crate::hotkeys::{HotkeysMetric, HotkeysStatus, parse_hotkeys_get};
+use crate::hotkeys::{HotkeysMetric, HotkeysMetrics, HotkeysStatus, parse_hotkeys_get};
 use crate::model::{
     BigkeyEntry, BigkeysMetrics, BigkeysScanStatus, ErrorDetails, InstanceState, InstanceType,
     KillAction, RuntimeSettings, Status, Target, TargetProtocol,
 };
 use crate::parse::{ClusterShard, parse_cluster_shards, parse_commandstats, parse_info};
 use crate::redis_connection;
-use crate::target_addr::{canonical_host, is_local_addr, strip_host, tcp_host, tcp_port};
+use crate::target_addr::{
+    canonical_host, is_local_addr, is_loopback_host, strip_host, tcp_host, tcp_port,
+};
+use crate::text::{first_line, truncate_chars};
 
 const BIGKEYS_SCAN_COUNT: usize = 256;
 const BIGKEYS_TOP_N: usize = 20;
 const HOTKEYS_TOP_N: usize = 20;
-const HOTKEYS_DURATION: Duration = Duration::from_mins(1);
+pub const HOTKEYS_DURATION: Duration = Duration::from_mins(1);
 const HOTKEYS_GET_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const HOTKEYS_GET_MAX_ATTEMPTS: usize = 256;
+const TASK_ERROR_MAX_CHARS: usize = 120;
 
 #[derive(Debug, Clone)]
 pub enum PollerRequest {
@@ -58,256 +64,377 @@ pub enum PollerUpdate {
     Remove { key: String },
 }
 
-struct HotkeysTask {
-    stop_tx: oneshot::Sender<()>,
+/// Long-running per-instance jobs that must not block regular polling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TaskKind {
+    Bigkeys,
+    Hotkeys,
+}
+
+enum TaskOutcome {
+    Bigkeys(BigkeysMetrics),
+    Hotkeys(HotkeysMetrics),
+}
+
+struct TaskResult {
+    key: String,
+    generation: u64,
+    outcome: TaskOutcome,
+}
+
+struct BackgroundTask {
+    generation: u64,
+    /// Asks the task to finish early but still report its results.
+    stop_tx: Option<oneshot::Sender<()>>,
     handle: JoinHandle<()>,
 }
 
-#[allow(clippy::too_many_lines)]
+/// The UI side hung up; the poller should shut down.
+struct Disconnected;
+
+type Step = Result<(), Disconnected>;
+
+struct Poller {
+    settings: RuntimeSettings,
+    semaphore: Arc<Semaphore>,
+    targets: HashMap<String, Target>,
+    known_states: HashMap<String, InstanceState>,
+    tasks: HashMap<(String, TaskKind), BackgroundTask>,
+    next_generation: u64,
+    update_tx: mpsc::Sender<PollerUpdate>,
+    task_tx: mpsc::Sender<TaskResult>,
+}
+
 pub fn start(
     targets: Vec<Target>,
     settings: RuntimeSettings,
 ) -> (mpsc::Receiver<PollerUpdate>, mpsc::Sender<PollerRequest>) {
     let (update_tx, update_rx) = mpsc::channel(1024);
     let (request_tx, mut request_rx) = mpsc::channel::<PollerRequest>(32);
-    let (task_update_tx, mut task_update_rx) = mpsc::channel::<InstanceState>(128);
+    let (task_tx, mut task_rx) = mpsc::channel::<TaskResult>(128);
 
     tokio::spawn(async move {
-        let semaphore = Arc::new(Semaphore::new(settings.concurrency_limit.max(1)));
-        let mut known_states: HashMap<String, InstanceState> = HashMap::new();
-        let mut hotkeys_tasks: HashMap<String, HotkeysTask> = HashMap::new();
-        let mut target_map: HashMap<String, Target> = targets
-            .into_iter()
-            .map(|target| (target.addr.clone(), target))
-            .collect();
         let mut ticker = tokio::time::interval(settings.refresh_interval);
+        // A slow refresh must not trigger a burst of catch-up refreshes.
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut poller = Poller {
+            semaphore: Arc::new(Semaphore::new(settings.concurrency_limit.max(1))),
+            settings,
+            targets: targets
+                .into_iter()
+                .map(|target| (target.addr.clone(), target))
+                .collect(),
+            known_states: HashMap::new(),
+            tasks: HashMap::new(),
+            next_generation: 0,
+            update_tx,
+            task_tx,
+        };
 
         loop {
-            let request = tokio::select! {
-                Some(update) = task_update_rx.recv() => {
-                    if let Some(task) = hotkeys_tasks.remove(&update.key) {
-                        task.handle.abort();
-                    }
-                    known_states.insert(update.key.clone(), update.clone());
-                    if update_tx
-                        .send(PollerUpdate::State(Box::new(update)))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    continue;
-                }
-                _ = ticker.tick() => Some(PollerRequest::RefreshAll),
-                maybe = request_rx.recv() => maybe,
+            let step = tokio::select! {
+                Some(result) = task_rx.recv() => poller.finish_task(result).await,
+                _ = ticker.tick() => poller.handle(PollerRequest::RefreshAll).await,
+                request = request_rx.recv() => match request {
+                    Some(request) => poller.handle(request).await,
+                    None => break,
+                },
             };
-
-            let Some(request) = request else {
+            if step.is_err() {
                 break;
-            };
-
-            match request {
-                PollerRequest::RefreshAll => {
-                    let refreshed = refresh_target_states(
-                        target_map.values().cloned().collect(),
-                        &settings,
-                        &known_states,
-                        semaphore.clone(),
-                    )
-                    .await;
-
-                    for state in refreshed {
-                        known_states.insert(state.key.clone(), state.clone());
-                        if update_tx
-                            .send(PollerUpdate::State(Box::new(state)))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-                PollerRequest::UpsertTarget(target) => {
-                    let key = target.addr.clone();
-                    let existing = target_map.insert(key.clone(), target.clone());
-                    if existing.is_some() {
-                        continue;
-                    }
-
-                    let updated = {
-                        let _permit = semaphore.clone().acquire_owned().await.ok();
-                        let prior = known_states.get(&key).cloned();
-                        poll_one(&target, &settings, prior).await
-                    };
-                    known_states.insert(updated.key.clone(), updated.clone());
-                    if update_tx
-                        .send(PollerUpdate::State(Box::new(updated)))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                PollerRequest::RefreshBigkeys { key, force } => {
-                    let Some(target) = target_map.get(&key) else {
-                        continue;
-                    };
-                    let Some(prior) = known_states.get(&key).cloned() else {
-                        continue;
-                    };
-                    if !force
-                        && matches!(
-                            prior.detail.bigkeys.status,
-                            BigkeysScanStatus::Running | BigkeysScanStatus::Ready
-                        )
-                    {
-                        continue;
-                    }
-
-                    let mut running = prior.clone();
-                    running.detail.bigkeys.status = BigkeysScanStatus::Running;
-                    running.detail.bigkeys.last_error = None;
-                    if update_tx
-                        .send(PollerUpdate::State(Box::new(running.clone())))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    known_states.insert(key.clone(), running);
-
-                    let updated = {
-                        let _permit = semaphore.clone().acquire_owned().await.ok();
-                        poll_bigkeys(target, &settings, prior).await
-                    };
-                    known_states.insert(updated.key.clone(), updated.clone());
-                    if update_tx
-                        .send(PollerUpdate::State(Box::new(updated)))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                PollerRequest::StartHotkeys { key, metric, force } => {
-                    let Some(target) = target_map.get(&key) else {
-                        continue;
-                    };
-                    let Some(prior) = known_states.get(&key).cloned() else {
-                        continue;
-                    };
-                    if !force && prior.detail.hotkeys.status == HotkeysStatus::Running {
-                        continue;
-                    }
-
-                    let mut running = prior.clone();
-                    running.detail.hotkeys.start(metric, HOTKEYS_DURATION);
-                    if update_tx
-                        .send(PollerUpdate::State(Box::new(running.clone())))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    known_states.insert(key.clone(), running.clone());
-
-                    if let Some(task) = hotkeys_tasks.remove(&key) {
-                        let _ = task.stop_tx.send(());
-                        task.handle.abort();
-                    }
-
-                    let (stop_tx, stop_rx) = oneshot::channel();
-                    let target = target.clone();
-                    let settings = settings.clone();
-                    let semaphore = semaphore.clone();
-                    let task_update_tx = task_update_tx.clone();
-                    let handle = tokio::spawn(async move {
-                        let _permit = semaphore.acquire_owned().await.ok();
-                        let updated =
-                            poll_hotkeys(&target, &settings, prior, metric, stop_rx).await;
-                        let _ = task_update_tx.send(updated).await;
-                    });
-                    hotkeys_tasks.insert(key, HotkeysTask { stop_tx, handle });
-                }
-                PollerRequest::StopHotkeys { key } => {
-                    let Some(task) = hotkeys_tasks.remove(&key) else {
-                        continue;
-                    };
-                    let _ = task.stop_tx.send(());
-                }
-                PollerRequest::KillTargets { keys, action } => {
-                    for key in keys {
-                        let Some(target) = target_map.get(&key) else {
-                            continue;
-                        };
-                        let Some(prior) = known_states.get(&key).cloned() else {
-                            continue;
-                        };
-
-                        if let Some(task) = hotkeys_tasks.remove(&key) {
-                            let _ = task.stop_tx.send(());
-                            task.handle.abort();
-                        }
-
-                        let updated = {
-                            let _permit = semaphore.clone().acquire_owned().await.ok();
-                            kill_target(target, &settings, prior, action).await
-                        };
-                        match updated {
-                            PollerUpdate::State(state) => {
-                                known_states.insert(state.key.clone(), (*state).clone());
-                                if update_tx.send(PollerUpdate::State(state)).await.is_err() {
-                                    return;
-                                }
-                            }
-                            PollerUpdate::Remove { key } => {
-                                known_states.remove(&key);
-                                target_map.remove(&key);
-                                if update_tx.send(PollerUpdate::Remove { key }).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-                PollerRequest::AuthenticateTargets {
-                    keys,
-                    username,
-                    password,
-                } => {
-                    for key in keys {
-                        let Some(target) = target_map.get_mut(&key) else {
-                            continue;
-                        };
-                        target.username = username.clone();
-                        target.password = Some(password.clone());
-                        let target = target.clone();
-
-                        if let Some(task) = hotkeys_tasks.remove(&key) {
-                            let _ = task.stop_tx.send(());
-                            task.handle.abort();
-                        }
-
-                        let updated = {
-                            let _permit = semaphore.clone().acquire_owned().await.ok();
-                            let prior = known_states.get(&key).cloned();
-                            poll_one(&target, &settings, prior).await
-                        };
-                        known_states.insert(updated.key.clone(), updated.clone());
-                        if update_tx
-                            .send(PollerUpdate::State(Box::new(updated)))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
             }
         }
+        poller.cancel_all_tasks();
     });
 
     (update_rx, request_tx)
+}
+
+impl Poller {
+    async fn handle(&mut self, request: PollerRequest) -> Step {
+        match request {
+            PollerRequest::RefreshAll => {
+                let targets = self.targets.values().cloned().collect();
+                for state in self
+                    .run_concurrently(targets, |target, settings, prior| async move {
+                        poll_one(&target, &settings, prior).await
+                    })
+                    .await
+                {
+                    self.publish(state).await?;
+                }
+            }
+            PollerRequest::UpsertTarget(target) => {
+                if self.targets.contains_key(&target.addr) {
+                    return Ok(());
+                }
+                self.targets.insert(target.addr.clone(), target.clone());
+                let prior = self.known_states.get(&target.addr).cloned();
+                let state = self.limited(poll_one(&target, &self.settings, prior)).await;
+                self.publish(state).await?;
+            }
+            PollerRequest::RefreshBigkeys { key, force } => self.start_bigkeys(key, force).await?,
+            PollerRequest::StartHotkeys { key, metric, force } => {
+                self.start_hotkeys(key, metric, force).await?;
+            }
+            PollerRequest::StopHotkeys { key } => {
+                if let Some(stop_tx) = self
+                    .tasks
+                    .get_mut(&(key, TaskKind::Hotkeys))
+                    .and_then(|task| task.stop_tx.take())
+                {
+                    let _ = stop_tx.send(());
+                }
+            }
+            PollerRequest::KillTargets { keys, action } => {
+                let targets = self.claim_targets(&keys);
+                let results = self
+                    .run_concurrently(targets, move |target, settings, prior| async move {
+                        kill_target(&target, &settings, prior, action).await
+                    })
+                    .await;
+                for update in results {
+                    match update {
+                        PollerUpdate::State(state) => self.publish(*state).await?,
+                        PollerUpdate::Remove { key } => self.publish_removal(key).await?,
+                    }
+                }
+            }
+            PollerRequest::AuthenticateTargets {
+                keys,
+                username,
+                password,
+            } => {
+                for key in &keys {
+                    if let Some(target) = self.targets.get_mut(key) {
+                        target.username.clone_from(&username);
+                        target.password = Some(password.clone());
+                    }
+                }
+                let targets = self.claim_targets(&keys);
+                let results = self
+                    .run_concurrently(targets, |target, settings, prior| async move {
+                        poll_one(&target, &settings, prior).await
+                    })
+                    .await;
+                for state in results {
+                    self.publish(state).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Known targets among `keys`, with their background tasks cancelled
+    /// because the action is about to change their connection state.
+    fn claim_targets(&mut self, keys: &[String]) -> Vec<Target> {
+        let targets: Vec<Target> = keys
+            .iter()
+            .filter_map(|key| self.targets.get(key).cloned())
+            .collect();
+        for target in &targets {
+            self.cancel_task(&target.addr, TaskKind::Hotkeys);
+            self.cancel_task(&target.addr, TaskKind::Bigkeys);
+        }
+        targets
+    }
+
+    /// Runs `job` for every target under the concurrency limit and returns
+    /// the results in input order.
+    async fn run_concurrently<T, F, Fut>(&self, targets: Vec<Target>, job: F) -> Vec<T>
+    where
+        T: Send + 'static,
+        F: Fn(Target, RuntimeSettings, Option<InstanceState>) -> Fut,
+        Fut: Future<Output = T> + Send + 'static,
+    {
+        let jobs: Vec<Fut> = targets
+            .into_iter()
+            .map(|target| {
+                let prior = self.known_states.get(&target.addr).cloned();
+                job(target, self.settings.clone(), prior)
+            })
+            .collect();
+        run_limited(jobs, &self.semaphore).await
+    }
+
+    async fn limited<T>(&self, job: impl Future<Output = T>) -> T {
+        let _permit = self.semaphore.acquire().await.ok();
+        job.await
+    }
+
+    async fn start_bigkeys(&mut self, key: String, force: bool) -> Step {
+        let Some(prior) = self.known_states.get(&key).cloned() else {
+            return Ok(());
+        };
+        let Some(target) = self.targets.get(&key).cloned() else {
+            return Ok(());
+        };
+        let in_flight = self.tasks.contains_key(&(key.clone(), TaskKind::Bigkeys));
+        if !force && (in_flight || prior.detail.bigkeys.status == BigkeysScanStatus::Ready) {
+            return Ok(());
+        }
+
+        let readonly = bigkeys_requires_readonly(&prior);
+        let previous = prior.detail.bigkeys.clone();
+        let mut running = prior;
+        running.detail.bigkeys.status = BigkeysScanStatus::Running;
+        running.detail.bigkeys.last_error = None;
+        self.publish(running).await?;
+
+        let settings = self.settings.clone();
+        let semaphore = Arc::clone(&self.semaphore);
+        self.spawn_task(key, TaskKind::Bigkeys, None, async move {
+            let _permit = semaphore.acquire_owned().await.ok();
+            TaskOutcome::Bigkeys(poll_bigkeys(&target, &settings, readonly, previous).await)
+        });
+        Ok(())
+    }
+
+    async fn start_hotkeys(&mut self, key: String, metric: HotkeysMetric, force: bool) -> Step {
+        let Some(prior) = self.known_states.get(&key).cloned() else {
+            return Ok(());
+        };
+        let Some(target) = self.targets.get(&key).cloned() else {
+            return Ok(());
+        };
+        if !force && prior.detail.hotkeys.status == HotkeysStatus::Running {
+            return Ok(());
+        }
+
+        let mut running = prior;
+        running.detail.hotkeys.start(metric, HOTKEYS_DURATION);
+        let started = running.detail.hotkeys.clone();
+        self.publish(running).await?;
+
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let settings = self.settings.clone();
+        let semaphore = Arc::clone(&self.semaphore);
+        self.spawn_task(key, TaskKind::Hotkeys, Some(stop_tx), async move {
+            let _permit = semaphore.acquire_owned().await.ok();
+            TaskOutcome::Hotkeys(poll_hotkeys(&target, &settings, started, metric, stop_rx).await)
+        });
+        Ok(())
+    }
+
+    /// Replaces any task of the same kind; a replaced task's late result is
+    /// discarded through its generation number.
+    fn spawn_task(
+        &mut self,
+        key: String,
+        kind: TaskKind,
+        stop_tx: Option<oneshot::Sender<()>>,
+        job: impl Future<Output = TaskOutcome> + Send + 'static,
+    ) {
+        self.cancel_task(&key, kind);
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        let task_tx = self.task_tx.clone();
+        let result_key = key.clone();
+        let handle = tokio::spawn(async move {
+            let outcome = job.await;
+            let _ = task_tx
+                .send(TaskResult {
+                    key: result_key,
+                    generation,
+                    outcome,
+                })
+                .await;
+        });
+        self.tasks.insert(
+            (key, kind),
+            BackgroundTask {
+                generation,
+                stop_tx,
+                handle,
+            },
+        );
+    }
+
+    fn cancel_task(&mut self, key: &str, kind: TaskKind) {
+        if let Some(task) = self.tasks.remove(&(key.to_string(), kind)) {
+            if let Some(stop_tx) = task.stop_tx {
+                let _ = stop_tx.send(());
+            }
+            task.handle.abort();
+        }
+    }
+
+    fn cancel_all_tasks(&mut self) {
+        for (_, task) in self.tasks.drain() {
+            task.handle.abort();
+        }
+    }
+
+    /// Merges a finished task into the newest state rather than restoring
+    /// the snapshot the task started from.
+    async fn finish_task(&mut self, result: TaskResult) -> Step {
+        let kind = match result.outcome {
+            TaskOutcome::Bigkeys(_) => TaskKind::Bigkeys,
+            TaskOutcome::Hotkeys(_) => TaskKind::Hotkeys,
+        };
+        let task_key = (result.key, kind);
+        if self
+            .tasks
+            .get(&task_key)
+            .is_none_or(|task| task.generation != result.generation)
+        {
+            return Ok(());
+        }
+        self.tasks.remove(&task_key);
+        let Some(mut state) = self.known_states.get(&task_key.0).cloned() else {
+            return Ok(());
+        };
+        match result.outcome {
+            TaskOutcome::Bigkeys(bigkeys) => state.detail.bigkeys = bigkeys,
+            TaskOutcome::Hotkeys(hotkeys) => state.detail.hotkeys = hotkeys,
+        }
+        self.publish(state).await
+    }
+
+    async fn publish(&mut self, state: InstanceState) -> Step {
+        self.known_states.insert(state.key.clone(), state.clone());
+        self.update_tx
+            .send(PollerUpdate::State(Box::new(state)))
+            .await
+            .map_err(|_| Disconnected)
+    }
+
+    async fn publish_removal(&mut self, key: String) -> Step {
+        self.known_states.remove(&key);
+        self.targets.remove(&key);
+        self.update_tx
+            .send(PollerUpdate::Remove { key })
+            .await
+            .map_err(|_| Disconnected)
+    }
+}
+
+/// Spawns every job, bounded by `semaphore`, and collects results in input
+/// order. A job that panics is dropped from the results.
+async fn run_limited<T, Fut>(
+    jobs: impl IntoIterator<Item = Fut>,
+    semaphore: &Arc<Semaphore>,
+) -> Vec<T>
+where
+    T: Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+{
+    let mut set = JoinSet::new();
+    for (index, job) in jobs.into_iter().enumerate() {
+        let semaphore = Arc::clone(semaphore);
+        set.spawn(async move {
+            let _permit = semaphore.acquire_owned().await.ok();
+            (index, job.await)
+        });
+    }
+    let mut results = Vec::with_capacity(set.len());
+    while let Some(joined) = set.join_next().await {
+        if let Ok(result) = joined {
+            results.push(result);
+        }
+    }
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
 }
 
 pub async fn refresh_targets_once(
@@ -315,33 +442,11 @@ pub async fn refresh_targets_once(
     settings: RuntimeSettings,
 ) -> Vec<InstanceState> {
     let semaphore = Arc::new(Semaphore::new(settings.concurrency_limit.max(1)));
-    refresh_target_states(targets, &settings, &HashMap::new(), semaphore).await
-}
-
-async fn refresh_target_states(
-    targets: Vec<Target>,
-    settings: &RuntimeSettings,
-    known_states: &HashMap<String, InstanceState>,
-    semaphore: Arc<Semaphore>,
-) -> Vec<InstanceState> {
-    let mut set = tokio::task::JoinSet::new();
-    for target in targets {
+    let jobs = targets.into_iter().map(|target| {
         let settings = settings.clone();
-        let semaphore = semaphore.clone();
-        let prior = known_states.get(&target.addr).cloned();
-        set.spawn(async move {
-            let _permit = semaphore.acquire_owned().await.ok();
-            poll_one(&target, &settings, prior).await
-        });
-    }
-
-    let mut states = Vec::new();
-    while let Some(result) = set.join_next().await {
-        if let Ok(state) = result {
-            states.push(state);
-        }
-    }
-    states
+        async move { poll_one(&target, &settings, None).await }
+    });
+    run_limited(jobs, &semaphore).await
 }
 
 async fn poll_one(
@@ -362,16 +467,14 @@ async fn poll_one(
     let mut conn = match redis_connection::connect(target, settings).await {
         Ok(conn) => conn,
         Err(err) => {
-            let (status, message) = classify_error(&err);
-            apply_timed_failure(&mut state, status, message, connect_start);
+            apply_error(&mut state, &err, connect_start);
             return state;
         }
     };
 
     let ping_start = Instant::now();
     if let Err(err) = redis::cmd("PING").query_async::<String>(&mut conn).await {
-        let (status, message) = classify_error(&err);
-        apply_timed_failure(&mut state, status, message, ping_start);
+        apply_error(&mut state, &err, ping_start);
         return state;
     }
     let latency_ms = ping_start.elapsed().as_secs_f64() * 1000.0;
@@ -380,8 +483,7 @@ async fn poll_one(
     let info: String = match redis::cmd("INFO").query_async(&mut conn).await {
         Ok(info) => info,
         Err(err) => {
-            let (status, message) = classify_error(&err);
-            apply_timed_failure(&mut state, status, message, info_start);
+            apply_error(&mut state, &err, info_start);
             return state;
         }
     };
@@ -418,44 +520,34 @@ async fn poll_one(
 async fn poll_bigkeys(
     target: &Target,
     settings: &RuntimeSettings,
-    mut state: InstanceState,
-) -> InstanceState {
-    let mut conn = match redis_connection::connect(target, settings).await {
-        Ok(conn) => conn,
-        Err(err) => {
-            let (_, details) = classify_error(&err);
-            apply_bigkeys_failure(&mut state, details.message);
-            return state;
+    readonly: bool,
+    previous: BigkeysMetrics,
+) -> BigkeysMetrics {
+    let result = async {
+        let mut conn = redis_connection::connect(target, settings).await?;
+        if readonly {
+            redis::cmd("READONLY")
+                .query_async::<String>(&mut conn)
+                .await?;
         }
+        scan_bigkeys(&mut conn).await
     };
-
-    if let Err(err) = prepare_bigkeys_connection(&mut conn, &state).await {
-        apply_bigkeys_failure(&mut state, err.to_string());
-        return state;
+    match result.await {
+        Ok(bigkeys) => bigkeys,
+        Err(err) => bigkeys_failure(previous, &err.to_string()),
     }
-
-    match scan_bigkeys(&mut conn).await {
-        Ok(bigkeys) => state.detail.bigkeys = bigkeys,
-        Err(err) => apply_bigkeys_failure(&mut state, err.to_string()),
-    }
-
-    state
 }
 
 async fn poll_hotkeys(
     target: &Target,
     settings: &RuntimeSettings,
-    mut state: InstanceState,
+    started: HotkeysMetrics,
     metric: HotkeysMetric,
     stop_rx: oneshot::Receiver<()>,
-) -> InstanceState {
+) -> HotkeysMetrics {
     let mut conn = match redis_connection::connect(target, settings).await {
         Ok(conn) => conn,
-        Err(err) => {
-            let (_, details) = classify_error(&err);
-            apply_hotkeys_failure(&mut state, metric, details.message);
-            return state;
-        }
+        Err(err) => return hotkeys_failure(started, metric, &classify_error(&err).1.message),
     };
 
     let start_result = redis::cmd("HOTKEYS")
@@ -470,8 +562,7 @@ async fn poll_hotkeys(
         .query_async::<String>(&mut conn)
         .await;
     if let Err(err) = start_result {
-        apply_hotkeys_failure(&mut state, metric, err.to_string());
-        return state;
+        return hotkeys_failure(started, metric, &err.to_string());
     }
 
     let manually_stopped = tokio::select! {
@@ -485,87 +576,67 @@ async fn poll_hotkeys(
             .query_async::<String>(&mut conn)
             .await
     {
-        apply_hotkeys_failure(&mut state, metric, err.to_string());
-        return state;
+        return hotkeys_failure(started, metric, &err.to_string());
     }
 
     for _ in 0..HOTKEYS_GET_MAX_ATTEMPTS {
-        match redis::cmd("HOTKEYS")
+        let reply = match redis::cmd("HOTKEYS")
             .arg("GET")
             .query_async::<Value>(&mut conn)
             .await
         {
-            Ok(value) => match parse_hotkeys_get(&value, metric) {
-                Ok(mut hotkeys) if hotkeys.tracking_active => {
-                    hotkeys.started_at = state.detail.hotkeys.started_at;
-                    hotkeys.finishes_at = state.detail.hotkeys.finishes_at;
-                    state.detail.hotkeys = hotkeys;
-                    tokio::time::sleep(HOTKEYS_GET_POLL_INTERVAL).await;
-                }
-                Ok(mut hotkeys) => {
-                    hotkeys.started_at = state.detail.hotkeys.started_at;
-                    hotkeys.finishes_at = state.detail.hotkeys.finishes_at;
-                    state.detail.hotkeys = hotkeys;
-                    return state;
-                }
-                Err(err) => {
-                    apply_hotkeys_failure(&mut state, metric, err);
-                    return state;
-                }
-            },
-            Err(err) => {
-                apply_hotkeys_failure(&mut state, metric, err.to_string());
-                return state;
-            }
+            Ok(reply) => reply,
+            Err(err) => return hotkeys_failure(started, metric, &err.to_string()),
+        };
+        let mut hotkeys = match parse_hotkeys_get(&reply, metric) {
+            Ok(hotkeys) => hotkeys,
+            Err(err) => return hotkeys_failure(started, metric, &err),
+        };
+        hotkeys.started_at = started.started_at;
+        hotkeys.finishes_at = started.finishes_at;
+        if !hotkeys.tracking_active {
+            return hotkeys;
         }
+        tokio::time::sleep(HOTKEYS_GET_POLL_INTERVAL).await;
     }
 
-    apply_hotkeys_failure(
-        &mut state,
+    hotkeys_failure(
+        started,
         metric,
-        "HOTKEYS GET did not finish after sampling duration".to_string(),
-    );
-    state
+        "HOTKEYS GET did not finish after sampling duration",
+    )
 }
 
 async fn kill_target(
     target: &Target,
     settings: &RuntimeSettings,
-    state: InstanceState,
+    state: Option<InstanceState>,
     action: KillAction,
 ) -> PollerUpdate {
     let attempt_error = match action.shutdown_arg() {
         Some(mode) => request_shutdown(target, settings, mode).await.err(),
-        None => send_signal(target, &state, action).err(),
+        None => send_signal(target, state.as_ref(), action).err(),
     };
 
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let mut updated = poll_one(target, settings, Some(state)).await;
+    let mut updated = poll_one(target, settings, state).await;
 
-    if updated.status == Status::Down && !settings.leave_killed_servers {
-        return PollerUpdate::Remove {
-            key: updated.key.clone(),
+    if updated.status == Status::Down {
+        return if settings.leave_killed_servers {
+            PollerUpdate::State(Box::new(updated))
+        } else {
+            PollerUpdate::Remove { key: updated.key }
         };
     }
 
-    if updated.status == Status::Down {
-        return PollerUpdate::State(Box::new(updated));
-    }
-
-    if let Some(message) = attempt_error {
-        record_control_failure(&mut updated, action, &message);
-        return PollerUpdate::State(Box::new(updated));
-    }
-
-    record_control_failure(
-        &mut updated,
-        action,
-        &format!(
+    let message = attempt_error.unwrap_or_else(|| {
+        format!(
             "{} is still reachable after {}",
             target.addr,
             action.label()
-        ),
-    );
+        )
+    });
+    record_control_failure(&mut updated, action, &message);
     PollerUpdate::State(Box::new(updated))
 }
 
@@ -598,7 +669,11 @@ async fn request_shutdown(
     Ok(())
 }
 
-fn send_signal(target: &Target, state: &InstanceState, action: KillAction) -> Result<(), String> {
+fn send_signal(
+    target: &Target,
+    state: Option<&InstanceState>,
+    action: KillAction,
+) -> Result<(), String> {
     let Some(signal) = action.signal_name() else {
         return Err(format!("{} is not a signal action", action.label()));
     };
@@ -608,7 +683,10 @@ fn send_signal(target: &Target, state: &InstanceState, action: KillAction) -> Re
             action.label()
         ));
     }
-    let Some(process_id) = target.process_id.or(state.detail.process_id) else {
+    let Some(process_id) = target
+        .process_id
+        .or_else(|| state.and_then(|state| state.detail.process_id))
+    else {
         return Err(format!("{} requires a local process_id", action.label()));
     };
 
@@ -667,9 +745,7 @@ async fn resolve_local_process_id(
 
 fn should_try_pidfile_lookup(target: &Target) -> bool {
     target.protocol == TargetProtocol::Tcp
-        && tcp_host(&target.addr).is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost") || host.eq("127.0.0.1") || host == "::1"
-        })
+        && tcp_host(&target.addr).is_some_and(|host| is_loopback_host(&host))
 }
 
 async fn pid_from_config_get(conn: &mut impl redis::aio::ConnectionLike) -> Option<u32> {
@@ -700,17 +776,6 @@ fn record_control_failure(state: &mut InstanceState, action: KillAction, message
     let details = error_details(format!("{} failed: {message}", action.label()));
     state.last_error = Some(details.summary.clone());
     state.error_details = Some(details);
-}
-
-async fn prepare_bigkeys_connection(
-    conn: &mut impl redis::aio::ConnectionLike,
-    state: &InstanceState,
-) -> redis::RedisResult<()> {
-    if bigkeys_requires_readonly(state) {
-        redis::cmd("READONLY").query_async::<String>(conn).await?;
-    }
-
-    Ok(())
 }
 
 pub(crate) fn apply_info_to_state(
@@ -788,6 +853,11 @@ fn record_latency_sample(state: &mut InstanceState, latency_ms: f64) {
     state.last_latency_ms = Some(latency_ms);
 }
 
+fn apply_error(state: &mut InstanceState, error: &redis::RedisError, start: Instant) {
+    let (status, details) = classify_error(error);
+    apply_timed_failure(state, status, details, start);
+}
+
 fn apply_timed_failure(
     state: &mut InstanceState,
     status: Status,
@@ -800,20 +870,31 @@ fn apply_timed_failure(
     apply_failure(state, status, details);
 }
 
-fn apply_bigkeys_failure(state: &mut InstanceState, message: String) {
-    state.detail.bigkeys.status = BigkeysScanStatus::Failed;
-    state.detail.bigkeys.last_error = Some(truncate_string(message, 120));
-    state.detail.bigkeys.last_completed = Some(Instant::now());
+/// Keeps the previous results visible alongside the error.
+fn bigkeys_failure(previous: BigkeysMetrics, message: &str) -> BigkeysMetrics {
+    BigkeysMetrics {
+        status: BigkeysScanStatus::Failed,
+        last_error: Some(truncate_chars(message, TASK_ERROR_MAX_CHARS, "")),
+        last_completed: Some(Instant::now()),
+        ..previous
+    }
 }
 
-fn apply_hotkeys_failure(state: &mut InstanceState, metric: HotkeysMetric, message: String) {
-    state.detail.hotkeys.status = HotkeysStatus::Failed;
-    state.detail.hotkeys.last_error = Some(truncate_string(message, 120));
-    state.detail.hotkeys.selected_metric = Some(metric);
-    state.detail.hotkeys.tracking_active = false;
-    state.detail.hotkeys.started_at = None;
-    state.detail.hotkeys.finishes_at = None;
-    state.detail.hotkeys.last_completed = Some(Instant::now());
+fn hotkeys_failure(
+    started: HotkeysMetrics,
+    metric: HotkeysMetric,
+    message: &str,
+) -> HotkeysMetrics {
+    HotkeysMetrics {
+        status: HotkeysStatus::Failed,
+        last_error: Some(truncate_chars(message, TASK_ERROR_MAX_CHARS, "")),
+        selected_metric: Some(metric),
+        tracking_active: false,
+        started_at: None,
+        finishes_at: None,
+        last_completed: Some(Instant::now()),
+        ..started
+    }
 }
 
 fn bigkeys_requires_readonly(state: &InstanceState) -> bool {
@@ -823,7 +904,7 @@ fn bigkeys_requires_readonly(state: &InstanceState) -> bool {
 
 pub(crate) fn error_details(message: String) -> ErrorDetails {
     ErrorDetails {
-        summary: truncate_for_single_line(&message, 80),
+        summary: first_line(&message, 80),
         message,
     }
 }
@@ -900,8 +981,6 @@ async fn scan_bigkeys(
         }
         cursor = next_cursor;
     }
-
-    largest_keys.sort_by(bigkey_entry_cmp);
 
     Ok(BigkeysMetrics {
         status: BigkeysScanStatus::Ready,
@@ -1001,10 +1080,11 @@ fn key_type_size_command(key_type: &str) -> Option<&'static str> {
     }
 }
 
+/// Keeps `entries` sorted and capped at the top N without re-sorting.
 fn insert_bigkey_entry(entries: &mut Vec<BigkeyEntry>, entry: BigkeyEntry) {
-    entries.push(entry);
-    entries.sort_by(bigkey_entry_cmp);
-    if entries.len() > BIGKEYS_TOP_N {
+    let position = entries.partition_point(|existing| bigkey_entry_cmp(existing, &entry).is_le());
+    if position < BIGKEYS_TOP_N {
+        entries.insert(position, entry);
         entries.truncate(BIGKEYS_TOP_N);
     }
 }
@@ -1032,21 +1112,6 @@ fn is_unknown_command(error: &redis::RedisError) -> bool {
             .to_string()
             .to_ascii_lowercase()
             .contains("unknown command")
-}
-
-fn truncate_for_single_line(input: &str, max_chars: usize) -> String {
-    let single_line = input.lines().next().unwrap_or(input).trim();
-    if single_line.chars().count() <= max_chars {
-        return single_line.to_string();
-    }
-    single_line.chars().take(max_chars).collect()
-}
-
-fn truncate_string(input: String, max_chars: usize) -> String {
-    if input.chars().count() <= max_chars {
-        return input;
-    }
-    input.chars().take(max_chars).collect()
 }
 
 pub(crate) fn apply_cluster_shards_to_state(
@@ -1138,6 +1203,98 @@ mod tests {
         DetailMetrics, InstanceState, InstanceType, SlotRange, Status, Target, TargetProtocol,
     };
     use crate::parse::{ClusterShard, ClusterShardNode, ClusterShardRole, parse_cluster_shards};
+
+    fn idle_poller() -> (
+        super::Poller,
+        tokio::sync::mpsc::Receiver<super::PollerUpdate>,
+        tokio::sync::mpsc::Receiver<super::TaskResult>,
+    ) {
+        let settings = crate::config::default_settings();
+        let (update_tx, update_rx) = tokio::sync::mpsc::channel(16);
+        let (task_tx, task_rx) = tokio::sync::mpsc::channel(16);
+        let poller = super::Poller {
+            semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            settings,
+            targets: std::collections::HashMap::new(),
+            known_states: std::collections::HashMap::new(),
+            tasks: std::collections::HashMap::new(),
+            next_generation: 0,
+            update_tx,
+            task_tx,
+        };
+        (poller, update_rx, task_rx)
+    }
+
+    fn published_state(update: Option<super::PollerUpdate>) -> InstanceState {
+        match update {
+            Some(super::PollerUpdate::State(state)) => *state,
+            _ => panic!("expected a published state"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_results_merge_into_the_newest_state() {
+        use crate::model::{BigkeysMetrics, BigkeysScanStatus};
+
+        let (mut poller, mut updates, mut task_results) = idle_poller();
+        let mut state = InstanceState::new("a".into(), "127.0.0.1:6379".into());
+        state.ops_per_sec = Some(1);
+        assert!(poller.publish(state.clone()).await.is_ok());
+        let _ = updates.recv().await;
+
+        let scanned = BigkeysMetrics {
+            status: BigkeysScanStatus::Ready,
+            ..BigkeysMetrics::default()
+        };
+        let outcome = super::TaskOutcome::Bigkeys(scanned.clone());
+        poller.spawn_task("a".into(), super::TaskKind::Bigkeys, None, async {
+            outcome
+        });
+
+        // A refresh lands while the scan is running.
+        state.ops_per_sec = Some(99);
+        assert!(poller.publish(state).await.is_ok());
+        let _ = updates.recv().await;
+
+        let result = task_results.recv().await.expect("task reports back");
+        assert!(poller.finish_task(result).await.is_ok());
+        let merged = published_state(updates.recv().await);
+        assert_eq!(merged.ops_per_sec, Some(99));
+        assert_eq!(merged.detail.bigkeys, scanned);
+        assert!(poller.tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn results_from_replaced_tasks_are_discarded() {
+        use crate::model::BigkeysMetrics;
+
+        let (mut poller, mut updates, mut task_results) = idle_poller();
+        let state = InstanceState::new("a".into(), "127.0.0.1:6379".into());
+        assert!(poller.publish(state).await.is_ok());
+        let _ = updates.recv().await;
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        poller.spawn_task("a".into(), super::TaskKind::Bigkeys, None, async {
+            let _ = release_rx.await;
+            super::TaskOutcome::Bigkeys(BigkeysMetrics::default())
+        });
+        let superseded = super::TaskResult {
+            key: "a".into(),
+            generation: poller.next_generation,
+            outcome: super::TaskOutcome::Bigkeys(BigkeysMetrics::default()),
+        };
+        // Replacing the task aborts the first one and bumps the generation.
+        poller.spawn_task("a".into(), super::TaskKind::Bigkeys, None, async {
+            super::TaskOutcome::Bigkeys(BigkeysMetrics::default())
+        });
+        drop(release_tx);
+
+        assert!(poller.finish_task(superseded).await.is_ok());
+        assert!(updates.try_recv().is_err());
+        let current = task_results.recv().await.expect("replacement reports back");
+        assert!(poller.finish_task(current).await.is_ok());
+        assert!(updates.recv().await.is_some());
+    }
 
     #[tokio::test]
     async fn batch_actions_attempt_each_target_after_missing_targets_and_connection_errors() {

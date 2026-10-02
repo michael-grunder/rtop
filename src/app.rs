@@ -1,11 +1,14 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 
-use crate::column::{Emphasis, EmphasisLifetime, RenderCtx, SortCtx, SortKey};
+use crate::column::{CellCtx, EmphasisLifetime, SortKey};
 use crate::commandstats::CommandstatsColumn;
 use crate::discovery::{DiscoveryEvent, DiscoveryStatus, VerifiedInstance};
+use crate::hotkeys::{HotkeyEntry, HotkeysStatus};
 use crate::model::{
-    InstanceState, InstanceType, KillAction, RuntimeSettings, SortDirection, ViewMode,
+    BigkeyEntry, CommandStat, InstanceState, InstanceType, KillAction, RuntimeSettings,
+    SortDirection, ViewMode,
 };
 use crate::registry::ColumnRegistry;
 use crate::target_addr::canonical_host;
@@ -24,6 +27,15 @@ pub enum FilterPromptMode {
     Filter,
 }
 
+impl FilterPromptMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Search => "Search",
+            Self::Filter => "Filter",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverviewModal {
     None,
@@ -34,10 +46,74 @@ pub enum OverviewModal {
     AuthForm,
 }
 
+/// The panels of the detail view, in tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ColumnPickerTarget {
-    Overview,
+pub enum DetailTab {
+    Summary,
+    Latency,
+    InfoRaw,
     Commandstats,
+    Bigkeys,
+    Hotkeys,
+}
+
+impl DetailTab {
+    pub const ALL: [Self; 6] = [
+        Self::Summary,
+        Self::Latency,
+        Self::InfoRaw,
+        Self::Commandstats,
+        Self::Bigkeys,
+        Self::Hotkeys,
+    ];
+
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Summary => "Summary",
+            Self::Latency => "Latency",
+            Self::InfoRaw => "Info Raw",
+            Self::Commandstats => "Commandstats",
+            Self::Bigkeys => "Bigkeys",
+            Self::Hotkeys => "Hotkeys",
+        }
+    }
+
+    /// Lowercase mnemonic; it is also the highlighted letter in the title.
+    pub const fn shortcut(self) -> char {
+        match self {
+            Self::Summary => 's',
+            Self::Latency => 'l',
+            Self::InfoRaw => 'i',
+            Self::Commandstats => 'c',
+            Self::Bigkeys => 'b',
+            Self::Hotkeys => 'k',
+        }
+    }
+
+    /// Lowercase h/j/k/l are motions, so their tabs need the uppercase key.
+    pub fn from_shortcut(ch: char) -> Option<Self> {
+        if matches!(ch, 'h' | 'j' | 'k' | 'l') {
+            return None;
+        }
+        let ch = ch.to_ascii_lowercase();
+        Self::ALL.into_iter().find(|tab| tab.shortcut() == ch)
+    }
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Moves `steps` tabs forward (or backward when negative), wrapping around.
+    pub const fn rotate(self, steps: isize) -> Self {
+        let len = Self::ALL.len().cast_signed();
+        let next = (self.index().cast_signed() + steps % len).rem_euclid(len);
+        Self::ALL[next.cast_unsigned()]
+    }
+
+    /// Text tabs render a body of lines rather than a table.
+    pub const fn is_text(self) -> bool {
+        matches!(self, Self::Summary | Self::Latency | Self::InfoRaw)
+    }
 }
 
 pub struct ColumnPickerEntry {
@@ -60,15 +136,6 @@ pub struct AuthFormState {
     pub active_field: AuthField,
 }
 
-impl FilterPromptMode {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Search => "Search",
-            Self::Filter => "Filter",
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct DisplayRow {
     pub key: String,
@@ -76,17 +143,182 @@ pub struct DisplayRow {
     pub stale: bool,
 }
 
+/// Returns `current` moved by `delta`, clamped to `0..len` (0 when empty).
+pub const fn step_index(current: usize, delta: isize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let next = current.saturating_add_signed(delta);
+    if next >= len { len - 1 } else { next }
+}
+
+/// Scroll position of a paged list. The renderer reports the content and
+/// page sizes it actually used, so input handling can clamp against them
+/// without re-deriving the layout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Scroll {
+    offset: usize,
+    page_len: usize,
+    content_len: usize,
+}
+
+impl Scroll {
+    pub const fn offset(&self) -> usize {
+        self.offset
+    }
+
+    const fn max_offset(&self) -> usize {
+        let page_len = if self.page_len == 0 { 1 } else { self.page_len };
+        self.content_len.saturating_sub(page_len)
+    }
+
+    pub const fn scroll_by(&mut self, delta: isize) {
+        self.offset = step_index(self.offset, delta, self.max_offset() + 1);
+    }
+
+    /// Scrolls by whole pages of the last rendered size.
+    pub const fn page_by(&mut self, pages: isize) {
+        let page = if self.page_len == 0 { 1 } else { self.page_len };
+        self.scroll_by(pages.saturating_mul(page.cast_signed()));
+    }
+
+    pub const fn to_start(&mut self) {
+        self.offset = 0;
+    }
+
+    pub const fn to_end(&mut self) {
+        self.offset = self.max_offset();
+    }
+
+    /// Records the rendered dimensions and returns the visible item range.
+    pub fn viewport(&mut self, content_len: usize, page_len: usize) -> Range<usize> {
+        self.content_len = content_len;
+        self.page_len = page_len.max(1);
+        self.offset = self.offset.min(self.max_offset());
+        self.offset..(self.offset + self.page_len).min(content_len)
+    }
+}
+
+/// Case-insensitive substring matcher shared by every filter prompt.
+pub struct Matcher {
+    needle: String,
+}
+
+impl Matcher {
+    pub fn new(filter: &str) -> Self {
+        Self {
+            needle: filter.trim().to_ascii_lowercase(),
+        }
+    }
+
+    pub fn matches(&self, text: &str) -> bool {
+        self.needle.is_empty() || text.to_ascii_lowercase().contains(&self.needle)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DetailPaneState {
     pub filter: String,
     pub is_filtering: bool,
-    pub scroll_offset: usize,
+    pub scroll: Scroll,
 }
 
-pub type CommandstatsViewState = DetailPaneState;
-pub type BigkeysViewState = DetailPaneState;
-pub type HotkeysViewState = DetailPaneState;
-pub type DetailTextViewState = DetailPaneState;
+impl DetailPaneState {
+    pub fn matcher(&self) -> Matcher {
+        Matcher::new(&self.filter)
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Ordered columns with a visible subset, as edited by the column picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnSet<T> {
+    pub order: Vec<T>,
+    pub visible: Vec<T>,
+}
+
+impl<T: PartialEq + Clone> ColumnSet<T> {
+    pub fn new(order: Vec<T>, visible: impl IntoIterator<Item = T>) -> Self {
+        let mut deduped: Vec<T> = Vec::new();
+        for column in visible {
+            if order.contains(&column) && !deduped.contains(&column) {
+                deduped.push(column);
+            }
+        }
+        Self {
+            order,
+            visible: deduped,
+        }
+    }
+
+    pub fn is_visible(&self, column: &T) -> bool {
+        self.visible.contains(column)
+    }
+
+    pub fn visible_in_order(&self) -> impl Iterator<Item = &T> {
+        self.order.iter().filter(|column| self.is_visible(column))
+    }
+
+    /// Appends a newly discovered column without changing focus or visibility.
+    pub fn discover(&mut self, column: T) {
+        if !self.order.contains(&column) {
+            self.order.push(column);
+        }
+    }
+
+    /// Moves the column at `index` by `delta` and returns its new index.
+    pub fn move_entry(&mut self, index: usize, delta: isize) -> usize {
+        if index >= self.order.len() {
+            return index;
+        }
+        let next = step_index(index, delta, self.order.len());
+        let column = self.order.remove(index);
+        self.order.insert(next, column);
+        next
+    }
+
+    /// Shows or hides `column`; `can_hide` vetoes hiding (e.g. the last one).
+    pub fn toggle(&mut self, column: &T, can_hide: impl FnOnce(&Self) -> bool) -> bool {
+        if !self.is_visible(column) {
+            self.visible.push(column.clone());
+            return true;
+        }
+        if !can_hide(self) {
+            return false;
+        }
+        self.visible.retain(|visible| visible != column);
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnPickerTarget {
+    Overview,
+    Commandstats,
+}
+
+/// Values shared by every cell of one overview frame, computed once.
+pub(crate) struct RowCtx {
+    pub(crate) cluster_labels: HashMap<String, String>,
+    omit_host: bool,
+}
+
+impl RowCtx {
+    pub(crate) fn cell<'a>(&'a self, node: &'a InstanceState, tree_prefix: &'a str) -> CellCtx<'a> {
+        CellCtx {
+            snap: node,
+            omit_host: self.omit_host,
+            tree_prefix,
+            cluster_label: self
+                .cluster_labels
+                .get(node.cluster_key())
+                .map(String::as_str),
+        }
+    }
+}
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct AppState {
@@ -102,8 +334,8 @@ pub struct AppState {
     pub auth_form: Option<AuthFormState>,
     pub column_picker_reorder_mode: bool,
     column_picker_target: ColumnPickerTarget,
-    commandstats_column_order: Vec<CommandstatsColumn>,
-    visible_commandstats_columns: Vec<CommandstatsColumn>,
+    pub commandstats_columns: ColumnSet<CommandstatsColumn>,
+    pub overview_columns: ColumnSet<String>,
     pub filter: String,
     pub is_filtering: bool,
     pub filter_prompt_mode: FilterPromptMode,
@@ -111,30 +343,25 @@ pub struct AppState {
     pub active_view: ActiveView,
     pub previous_view: ActiveView,
     pub selected_index: usize,
+    /// Rows the overview table showed last frame; drives page-wise movement.
+    pub overview_page_len: usize,
     marked_keys: BTreeSet<String>,
-    pub detail_tab: usize,
-    pub summary_view: DetailTextViewState,
-    pub latency_view: DetailTextViewState,
-    pub info_raw_view: DetailTextViewState,
-    pub commandstats_view: CommandstatsViewState,
-    pub bigkeys_view: BigkeysViewState,
-    pub hotkeys_view: HotkeysViewState,
+    pub detail_tab: DetailTab,
+    detail_panes: [DetailPaneState; DetailTab::ALL.len()],
     pub force_show_host: bool,
     pub instances: HashMap<String, InstanceState>,
     pub discovery_status: DiscoveryStatus,
     pub should_quit: bool,
     pub column_registry: ColumnRegistry,
-    pub runtime_overview_column_order: Vec<String>,
-    pub runtime_visible_overview: Vec<String>,
     hotkeys_locally_reset: HashSet<String>,
     pending_transient_emphasis: HashMap<String, String>,
     transient_emphasis_records: HashMap<String, SortKey>,
 }
 
 struct TreeRenderCtx<'a> {
-    filtered_map: &'a HashMap<String, &'a InstanceState>,
+    filtered_map: &'a HashMap<&'a str, &'a InstanceState>,
     group: &'a TreeGroup,
-    cluster_labels: &'a HashMap<String, String>,
+    rows: &'a RowCtx,
 }
 
 impl AppState {
@@ -151,8 +378,14 @@ impl AppState {
             auth_form: None,
             column_picker_reorder_mode: false,
             column_picker_target: ColumnPickerTarget::Overview,
-            commandstats_column_order: CommandstatsColumn::DEFAULT.to_vec(),
-            visible_commandstats_columns: CommandstatsColumn::DEFAULT.to_vec(),
+            commandstats_columns: ColumnSet::new(
+                CommandstatsColumn::DEFAULT.to_vec(),
+                CommandstatsColumn::DEFAULT,
+            ),
+            overview_columns: ColumnSet::new(
+                column_registry.available_overview_columns(),
+                column_registry.visible_overview.clone(),
+            ),
             settings,
             filter: String::new(),
             is_filtering: false,
@@ -161,20 +394,14 @@ impl AppState {
             active_view: ActiveView::Overview,
             previous_view: ActiveView::Overview,
             selected_index: 0,
+            overview_page_len: 0,
             marked_keys: BTreeSet::new(),
-            detail_tab: 0,
-            summary_view: DetailTextViewState::default(),
-            latency_view: DetailTextViewState::default(),
-            info_raw_view: DetailTextViewState::default(),
-            commandstats_view: CommandstatsViewState::default(),
-            bigkeys_view: BigkeysViewState::default(),
-            hotkeys_view: HotkeysViewState::default(),
+            detail_tab: DetailTab::Summary,
+            detail_panes: Default::default(),
             force_show_host: false,
             instances: HashMap::new(),
             discovery_status: DiscoveryStatus::default(),
             should_quit: false,
-            runtime_overview_column_order: column_registry.available_overview_columns(),
-            runtime_visible_overview: column_registry.default_visible_overview_columns(),
             hotkeys_locally_reset: HashSet::new(),
             column_registry,
             pending_transient_emphasis: HashMap::new(),
@@ -191,14 +418,12 @@ impl AppState {
             .flat_map(|stat| stat.additional_metrics.keys())
             .collect();
         for metric in metrics {
-            let column = CommandstatsColumn::Metric(metric.clone());
-            if !self.commandstats_column_order.contains(&column) {
-                self.commandstats_column_order.push(column);
-            }
+            self.commandstats_columns
+                .discover(CommandstatsColumn::Metric(metric.clone()));
         }
         let key = update.key.clone();
         if self.hotkeys_locally_reset.contains(&key)
-            && update.detail.hotkeys.status != crate::hotkeys::HotkeysStatus::Running
+            && update.detail.hotkeys.status != HotkeysStatus::Running
         {
             update.detail.hotkeys.reset();
         }
@@ -240,6 +465,10 @@ impl AppState {
         self.visible_rows()
             .get(self.selected_index)
             .map(|row| row.key.clone())
+    }
+
+    pub fn selected_instance(&self) -> Option<&InstanceState> {
+        self.instances.get(&self.selected_key()?)
     }
 
     pub fn toggle_server_selection(&mut self) {
@@ -289,26 +518,17 @@ impl AppState {
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        let len = self.visible_rows().len();
-        if len == 0 {
-            self.selected_index = 0;
-            return;
-        }
+        self.selected_index = step_index(self.selected_index, delta, self.visible_rows().len());
+    }
 
-        let current = isize::try_from(self.selected_index).unwrap_or(isize::MAX);
-        let max_index = isize::try_from(len - 1).unwrap_or(isize::MAX);
-        let next = current.saturating_add(delta).clamp(0, max_index);
-        let next = usize::try_from(next).unwrap_or(0);
-        self.selected_index = next;
+    /// Moves the overview focus by whole pages of the last rendered table.
+    pub fn page_selection(&mut self, pages: isize) {
+        let page = self.overview_page_len.max(1).cast_signed();
+        self.move_selection(pages.saturating_mul(page));
     }
 
     pub fn clamp_selection(&mut self) {
-        let len = self.visible_rows().len();
-        if len == 0 {
-            self.selected_index = 0;
-        } else if self.selected_index >= len {
-            self.selected_index = len - 1;
-        }
+        self.move_selection(0);
     }
 
     pub fn open_help_view(&mut self) {
@@ -331,19 +551,64 @@ impl AppState {
         self.clamp_selection();
     }
 
-    pub fn start_commandstats_filter_input(&mut self, clear_existing: bool) {
-        self.start_detail_filter_input_for_tab(3, clear_existing);
+    pub const fn pane(&self, tab: DetailTab) -> &DetailPaneState {
+        &self.detail_panes[tab.index()]
     }
 
-    pub fn visible_commandstats<'a>(
-        &self,
-        stats: &'a [crate::model::CommandStat],
-    ) -> Vec<&'a crate::model::CommandStat> {
-        let needle = self.commandstats_view.filter.trim().to_ascii_lowercase();
-        let mut filtered = stats
+    pub const fn pane_mut(&mut self, tab: DetailTab) -> &mut DetailPaneState {
+        &mut self.detail_panes[tab.index()]
+    }
+
+    pub const fn active_pane(&self) -> &DetailPaneState {
+        self.pane(self.detail_tab)
+    }
+
+    pub const fn active_pane_mut(&mut self) -> &mut DetailPaneState {
+        self.pane_mut(self.detail_tab)
+    }
+
+    pub fn is_detail_tab(&self, tab: DetailTab) -> bool {
+        self.active_view == ActiveView::Detail && self.detail_tab == tab
+    }
+
+    /// The detail pane whose filter prompt currently owns keyboard input.
+    pub fn editing_pane(&self) -> Option<DetailTab> {
+        (self.active_view == ActiveView::Detail && self.active_pane().is_filtering)
+            .then_some(self.detail_tab)
+    }
+
+    /// Switches detail tabs; an unfinished filter prompt does not follow.
+    pub const fn set_detail_tab(&mut self, tab: DetailTab) {
+        self.active_pane_mut().is_filtering = false;
+        self.detail_tab = tab;
+    }
+
+    pub fn start_active_detail_filter_input(&mut self, clear_existing: bool) {
+        let pane = self.active_pane_mut();
+        if clear_existing {
+            pane.filter.clear();
+        }
+        pane.is_filtering = true;
+        pane.scroll.to_start();
+    }
+
+    pub fn clear_detail_filters(&mut self) {
+        self.detail_panes
+            .iter_mut()
+            .for_each(DetailPaneState::reset);
+    }
+
+    pub fn close_detail_view(&mut self) {
+        self.clear_detail_filters();
+        self.active_view = ActiveView::Overview;
+    }
+
+    pub fn visible_commandstats<'a>(&self, stats: &'a [CommandStat]) -> Vec<&'a CommandStat> {
+        let matcher = self.pane(DetailTab::Commandstats).matcher();
+        let mut filtered: Vec<_> = stats
             .iter()
-            .filter(|stat| needle.is_empty() || stat.command.to_ascii_lowercase().contains(&needle))
-            .collect::<Vec<_>>();
+            .filter(|stat| matcher.matches(&stat.command))
+            .collect();
         filtered.sort_by(|left, right| {
             right
                 .calls
@@ -353,280 +618,52 @@ impl AppState {
         filtered
     }
 
-    pub fn clamp_commandstats_scroll(
-        &mut self,
-        stats: &[crate::model::CommandStat],
-        page_len: usize,
-    ) {
-        let visible_len = self.visible_commandstats(stats).len();
-        let max_offset = visible_len.saturating_sub(page_len.max(1));
-        if self.commandstats_view.scroll_offset > max_offset {
-            self.commandstats_view.scroll_offset = max_offset;
-        }
-    }
-
-    pub fn move_commandstats_scroll(
-        &mut self,
-        delta: isize,
-        stats: &[crate::model::CommandStat],
-        page_len: usize,
-    ) {
-        let visible_len = self.visible_commandstats(stats).len();
-        let max_offset = visible_len.saturating_sub(page_len.max(1));
-        let current = isize::try_from(self.commandstats_view.scroll_offset).unwrap_or(isize::MAX);
-        let max_index = isize::try_from(max_offset).unwrap_or(isize::MAX);
-        let next = current.saturating_add(delta).clamp(0, max_index);
-        self.commandstats_view.scroll_offset = usize::try_from(next).unwrap_or(0);
-    }
-
-    pub fn clamp_bigkeys_scroll(&mut self, rows_len: usize, page_len: usize) {
-        let max_offset = rows_len.saturating_sub(page_len.max(1));
-        if self.bigkeys_view.scroll_offset > max_offset {
-            self.bigkeys_view.scroll_offset = max_offset;
-        }
-    }
-
-    pub fn move_bigkeys_scroll(&mut self, delta: isize, rows_len: usize, page_len: usize) {
-        let max_offset = rows_len.saturating_sub(page_len.max(1));
-        let current = isize::try_from(self.bigkeys_view.scroll_offset).unwrap_or(isize::MAX);
-        let max_index = isize::try_from(max_offset).unwrap_or(isize::MAX);
-        let next = current.saturating_add(delta).clamp(0, max_index);
-        self.bigkeys_view.scroll_offset = usize::try_from(next).unwrap_or(0);
-    }
-
-    pub const fn detail_text_view(&self, detail_tab: usize) -> Option<&DetailTextViewState> {
-        match detail_tab {
-            0 => Some(&self.summary_view),
-            1 => Some(&self.latency_view),
-            2 => Some(&self.info_raw_view),
-            _ => None,
-        }
-    }
-
-    pub const fn detail_text_view_mut(
-        &mut self,
-        detail_tab: usize,
-    ) -> Option<&mut DetailTextViewState> {
-        match detail_tab {
-            0 => Some(&mut self.summary_view),
-            1 => Some(&mut self.latency_view),
-            2 => Some(&mut self.info_raw_view),
-            _ => None,
-        }
-    }
-
-    pub fn start_detail_text_filter_input(&mut self, clear_existing: bool) {
-        self.start_detail_filter_input_for_tab(self.detail_tab, clear_existing);
-    }
-
-    pub fn visible_detail_text_lines<'a>(
-        &self,
-        detail_tab: usize,
-        lines: &'a [String],
-    ) -> Vec<&'a str> {
-        let needle = self
-            .detail_text_view(detail_tab)
-            .map_or("", |view| view.filter.trim())
-            .to_ascii_lowercase();
-        lines
-            .iter()
-            .filter_map(|line| {
-                if needle.is_empty() || line.to_ascii_lowercase().contains(&needle) {
-                    Some(line.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    pub fn clamp_detail_text_scroll(
-        &mut self,
-        detail_tab: usize,
-        rows_len: usize,
-        page_len: usize,
-    ) {
-        let max_offset = rows_len.saturating_sub(page_len.max(1));
-        if let Some(view) = self.detail_text_view_mut(detail_tab)
-            && view.scroll_offset > max_offset
-        {
-            view.scroll_offset = max_offset;
-        }
-    }
-
-    pub fn move_detail_text_scroll(
-        &mut self,
-        detail_tab: usize,
-        delta: isize,
-        rows_len: usize,
-        page_len: usize,
-    ) {
-        let max_offset = rows_len.saturating_sub(page_len.max(1));
-        if let Some(view) = self.detail_text_view_mut(detail_tab) {
-            let current = isize::try_from(view.scroll_offset).unwrap_or(isize::MAX);
-            let max_index = isize::try_from(max_offset).unwrap_or(isize::MAX);
-            let next = current.saturating_add(delta).clamp(0, max_index);
-            view.scroll_offset = usize::try_from(next).unwrap_or(0);
-        }
-    }
-
-    pub fn start_bigkeys_filter_input(&mut self, clear_existing: bool) {
-        self.start_detail_filter_input_for_tab(4, clear_existing);
-    }
-
-    pub const fn detail_pane_view(&self, detail_tab: usize) -> Option<&DetailPaneState> {
-        match detail_tab {
-            0 => Some(&self.summary_view),
-            1 => Some(&self.latency_view),
-            2 => Some(&self.info_raw_view),
-            3 => Some(&self.commandstats_view),
-            4 => Some(&self.bigkeys_view),
-            5 => Some(&self.hotkeys_view),
-            _ => None,
-        }
-    }
-
-    pub const fn detail_pane_view_mut(
-        &mut self,
-        detail_tab: usize,
-    ) -> Option<&mut DetailPaneState> {
-        match detail_tab {
-            0 => Some(&mut self.summary_view),
-            1 => Some(&mut self.latency_view),
-            2 => Some(&mut self.info_raw_view),
-            3 => Some(&mut self.commandstats_view),
-            4 => Some(&mut self.bigkeys_view),
-            5 => Some(&mut self.hotkeys_view),
-            _ => None,
-        }
-    }
-
-    pub fn active_detail_view_mut(&mut self) -> Option<&mut DetailPaneState> {
-        if self.active_view != ActiveView::Detail {
-            return None;
-        }
-
-        self.detail_pane_view_mut(self.detail_tab)
-    }
-
-    pub fn start_active_detail_filter_input(&mut self, clear_existing: bool) {
-        self.start_detail_filter_input_for_tab(self.detail_tab, clear_existing);
-    }
-
-    pub fn clear_detail_filters(&mut self) {
-        for detail_tab in 0..=5 {
-            if let Some(view) = self.detail_pane_view_mut(detail_tab) {
-                view.filter.clear();
-                view.is_filtering = false;
-                view.scroll_offset = 0;
-            }
-        }
-    }
-
-    pub fn close_detail_view(&mut self) {
-        self.clear_detail_filters();
-        self.active_view = ActiveView::Overview;
-    }
-
-    fn start_detail_filter_input_for_tab(&mut self, detail_tab: usize, clear_existing: bool) {
-        if let Some(view) = self.detail_pane_view_mut(detail_tab) {
-            if clear_existing {
-                view.filter.clear();
-            }
-            view.is_filtering = true;
-            view.scroll_offset = 0;
-        }
-    }
-
-    pub fn visible_bigkeys<'a>(
-        &self,
-        entries: &'a [crate::model::BigkeyEntry],
-    ) -> Vec<&'a crate::model::BigkeyEntry> {
-        let needle = self.bigkeys_view.filter.trim().to_ascii_lowercase();
+    pub fn visible_bigkeys<'a>(&self, entries: &'a [BigkeyEntry]) -> Vec<&'a BigkeyEntry> {
+        let matcher = self.pane(DetailTab::Bigkeys).matcher();
         entries
             .iter()
-            .filter(|entry| {
-                needle.is_empty()
-                    || entry.key.to_ascii_lowercase().contains(&needle)
-                    || entry.key_type.to_ascii_lowercase().contains(&needle)
-            })
+            .filter(|entry| matcher.matches(&entry.key) || matcher.matches(&entry.key_type))
             .collect()
     }
 
-    pub fn clamp_hotkeys_scroll(&mut self, rows_len: usize, page_len: usize) {
-        let max_offset = rows_len.saturating_sub(page_len.max(1));
-        if self.hotkeys_view.scroll_offset > max_offset {
-            self.hotkeys_view.scroll_offset = max_offset;
-        }
-    }
-
-    pub fn move_hotkeys_scroll(&mut self, delta: isize, rows_len: usize, page_len: usize) {
-        let max_offset = rows_len.saturating_sub(page_len.max(1));
-        let current = isize::try_from(self.hotkeys_view.scroll_offset).unwrap_or(isize::MAX);
-        let max_index = isize::try_from(max_offset).unwrap_or(isize::MAX);
-        let next = current.saturating_add(delta).clamp(0, max_index);
-        self.hotkeys_view.scroll_offset = usize::try_from(next).unwrap_or(0);
-    }
-
-    pub fn visible_hotkeys<'a>(
-        &self,
-        entries: &'a [crate::hotkeys::HotkeyEntry],
-    ) -> Vec<&'a crate::hotkeys::HotkeyEntry> {
-        let needle = self.hotkeys_view.filter.trim().to_ascii_lowercase();
+    pub fn visible_hotkeys<'a>(&self, entries: &'a [HotkeyEntry]) -> Vec<&'a HotkeyEntry> {
+        let matcher = self.pane(DetailTab::Hotkeys).matcher();
         entries
             .iter()
-            .filter(|entry| needle.is_empty() || entry.key.to_ascii_lowercase().contains(&needle))
+            .filter(|entry| matcher.matches(&entry.key))
             .collect()
+    }
+
+    pub fn visible_detail_text_lines<'a>(&self, tab: DetailTab, body: &'a str) -> Vec<&'a str> {
+        let matcher = self.pane(tab).matcher();
+        body.lines().filter(|line| matcher.matches(line)).collect()
     }
 
     pub fn visible_rows(&self) -> Vec<DisplayRow> {
-        let mut nodes: Vec<&InstanceState> = self.instances.values().collect();
-        nodes.retain(|node| self.matches_filter(node));
-        let cluster_labels = self.cluster_labels();
-        let should_omit_host = self.should_omit_host_in_rendering();
+        let filter = Matcher::new(&self.filter);
+        let mut nodes: Vec<&InstanceState> = self
+            .instances
+            .values()
+            .filter(|node| matches_filter(&filter, node))
+            .collect();
+        let rows = self.row_ctx();
 
-        match self.view_mode {
-            ViewMode::Tree => self.build_tree_rows(nodes, should_omit_host, &cluster_labels),
-            ViewMode::Flat => {
-                sort_instances(
-                    &mut nodes,
-                    &self.sort_by,
-                    self.sort_direction,
-                    &cluster_labels,
-                    should_omit_host,
-                    &self.column_registry,
-                );
-                nodes
-                    .into_iter()
-                    .map(|node| self.to_display_row(node, ""))
-                    .collect()
-            }
-            ViewMode::Primary => {
-                nodes.retain(|node| node.kind != InstanceType::Replica);
-                sort_instances(
-                    &mut nodes,
-                    &self.sort_by,
-                    self.sort_direction,
-                    &cluster_labels,
-                    should_omit_host,
-                    &self.column_registry,
-                );
-                nodes
-                    .into_iter()
-                    .map(|node| self.to_display_row(node, ""))
-                    .collect()
-            }
+        if self.view_mode == ViewMode::Tree {
+            return self.build_tree_rows(&nodes, &rows);
         }
+        if self.view_mode == ViewMode::Primary {
+            nodes.retain(|node| node.kind != InstanceType::Replica);
+        }
+        self.sort_nodes(&mut nodes, &rows, |_| 0);
+        nodes
+            .into_iter()
+            .map(|node| self.to_display_row(node, ""))
+            .collect()
     }
 
     pub fn visible_column_keys(&self) -> Vec<String> {
-        self.runtime_overview_column_order
-            .iter()
-            .filter(|key| {
-                self.runtime_visible_overview
-                    .iter()
-                    .any(|visible| visible == *key)
-            })
+        self.overview_columns
+            .visible_in_order()
             .filter(|key| self.column_registry.column(key).is_some())
             .filter(|key| !self.is_column_auto_hidden(key))
             .cloned()
@@ -646,7 +683,8 @@ impl AppState {
     }
 
     pub fn available_overview_columns(&self) -> Vec<String> {
-        self.runtime_overview_column_order
+        self.overview_columns
+            .order
             .iter()
             .filter(|key| self.column_registry.column(key).is_some())
             .cloned()
@@ -661,16 +699,19 @@ impl AppState {
         }
     }
 
+    pub fn column_label(&self, key: &str) -> String {
+        self.column_registry
+            .column(key)
+            .map_or_else(|| key.to_string(), |column| column.header().to_string())
+    }
+
     pub fn sort_label(&self) -> String {
-        self.column_registry.column(&self.sort_by).map_or_else(
-            || self.sort_by.clone(),
-            |column| column.header().to_string(),
-        )
+        self.column_label(&self.sort_by)
     }
 
     pub fn open_sort_picker(&mut self) {
-        let columns = self.sortable_columns();
-        self.sort_picker_index = columns
+        self.sort_picker_index = self
+            .sortable_columns()
             .iter()
             .position(|key| *key == self.sort_by)
             .unwrap_or(0);
@@ -678,12 +719,11 @@ impl AppState {
     }
 
     pub fn open_column_picker(&mut self) {
-        self.column_picker_target =
-            if self.active_view == ActiveView::Detail && self.detail_tab == 3 {
-                ColumnPickerTarget::Commandstats
-            } else {
-                ColumnPickerTarget::Overview
-            };
+        self.column_picker_target = if self.is_detail_tab(DetailTab::Commandstats) {
+            ColumnPickerTarget::Commandstats
+        } else {
+            ColumnPickerTarget::Overview
+        };
         self.column_picker_index = self
             .column_picker_entries()
             .iter()
@@ -694,9 +734,8 @@ impl AppState {
     }
 
     pub fn visible_commandstats_columns(&self) -> Vec<CommandstatsColumn> {
-        self.commandstats_column_order
-            .iter()
-            .filter(|column| self.visible_commandstats_columns.contains(column))
+        self.commandstats_columns
+            .visible_in_order()
             .cloned()
             .collect()
     }
@@ -704,11 +743,12 @@ impl AppState {
     pub fn column_picker_entries(&self) -> Vec<ColumnPickerEntry> {
         match self.column_picker_target {
             ColumnPickerTarget::Commandstats => self
-                .commandstats_column_order
+                .commandstats_columns
+                .order
                 .iter()
                 .map(|column| ColumnPickerEntry {
                     label: column.header().to_string(),
-                    visible: self.visible_commandstats_columns.contains(column),
+                    visible: self.commandstats_columns.is_visible(column),
                     suffix: "",
                 })
                 .collect(),
@@ -716,14 +756,11 @@ impl AppState {
                 .available_overview_columns()
                 .into_iter()
                 .map(|key| ColumnPickerEntry {
-                    label: self
-                        .column_registry
-                        .column(&key)
-                        .map_or_else(|| key.clone(), |column| column.header().to_string()),
+                    label: self.column_label(&key),
                     visible: self.is_column_visible(&key),
                     suffix: self
                         .column_auto_hidden_suffix(&key)
-                        .unwrap_or_else(|| if key == self.sort_by { " (sort)" } else { "" }),
+                        .unwrap_or(if key == self.sort_by { " (sort)" } else { "" }),
                 })
                 .collect(),
         }
@@ -772,10 +809,14 @@ impl AppState {
     }
 
     pub fn close_auth_form(&mut self) {
+        self.discard_auth_form();
+        self.overview_modal = OverviewModal::None;
+    }
+
+    fn discard_auth_form(&mut self) {
         if let Some(mut form) = self.auth_form.take() {
             form.password.clear();
         }
-        self.overview_modal = OverviewModal::None;
     }
 
     pub const fn toggle_auth_field(&mut self) {
@@ -809,58 +850,38 @@ impl AppState {
     pub fn close_overview_modal(&mut self) {
         self.kill_target_keys.clear();
         self.column_picker_reorder_mode = false;
-        if let Some(mut form) = self.auth_form.take() {
-            form.password.clear();
-        }
+        self.discard_auth_form();
         self.overview_modal = OverviewModal::None;
     }
 
     pub fn move_sort_picker_selection(&mut self, delta: isize) {
-        let columns = self.sortable_columns();
-        if columns.is_empty() {
-            self.sort_picker_index = 0;
-            return;
-        }
-        let current = isize::try_from(self.sort_picker_index).unwrap_or(isize::MAX);
-        let max_index = isize::try_from(columns.len() - 1).unwrap_or(isize::MAX);
-        let next = current.saturating_add(delta).clamp(0, max_index);
-        let next = usize::try_from(next).unwrap_or(0);
-        self.sort_picker_index = next;
+        self.sort_picker_index =
+            step_index(self.sort_picker_index, delta, self.sortable_columns().len());
     }
 
     pub fn apply_sort_picker_selection(&mut self) {
         let columns = self.sortable_columns();
-        let Some(chosen_key) = columns.get(self.sort_picker_index).cloned() else {
-            self.overview_modal = OverviewModal::None;
-            return;
-        };
-        if self.sort_by == chosen_key {
-            self.sort_direction = self.sort_direction.toggle();
-        } else {
-            self.sort_by = chosen_key;
-            self.sort_direction = default_sort_direction_for_column(&self.sort_by);
+        if let Some(chosen_key) = columns.get(self.sort_picker_index) {
+            if self.sort_by == *chosen_key {
+                self.sort_direction = self.sort_direction.toggle();
+            } else {
+                self.set_sort_column(chosen_key.clone());
+            }
+            self.clamp_selection();
         }
         self.overview_modal = OverviewModal::None;
-        self.clamp_selection();
     }
 
     pub fn move_column_picker_selection(&mut self, delta: isize) {
-        let columns = self.column_picker_entries();
-        if columns.is_empty() {
-            self.column_picker_index = 0;
-            return;
-        }
-        let current = isize::try_from(self.column_picker_index).unwrap_or(isize::MAX);
-        let max_index = isize::try_from(columns.len() - 1).unwrap_or(isize::MAX);
-        let next = current.saturating_add(delta).clamp(0, max_index);
-        self.column_picker_index = usize::try_from(next).unwrap_or(0);
+        self.column_picker_index = step_index(
+            self.column_picker_index,
+            delta,
+            self.column_picker_entries().len(),
+        );
     }
 
-    pub fn move_kill_picker_selection(&mut self, delta: isize) {
-        let current = isize::try_from(self.kill_picker_index).unwrap_or(isize::MAX);
-        let max_index = isize::try_from(KillAction::ALL.len().saturating_sub(1)).unwrap_or(0);
-        let next = current.saturating_add(delta).clamp(0, max_index);
-        self.kill_picker_index = usize::try_from(next).unwrap_or(0);
+    pub const fn move_kill_picker_selection(&mut self, delta: isize) {
+        self.kill_picker_index = step_index(self.kill_picker_index, delta, KillAction::ALL.len());
     }
 
     pub fn set_column_picker_reorder_mode(&mut self, enabled: bool) {
@@ -868,79 +889,62 @@ impl AppState {
     }
 
     pub fn move_selected_column(&mut self, delta: isize) {
-        if self.column_picker_target == ColumnPickerTarget::Commandstats {
-            self.column_picker_index = move_ordered_column(
-                &mut self.commandstats_column_order,
-                self.column_picker_index,
-                delta,
-            );
-            return;
-        }
-        let columns = self.available_overview_columns();
-        let Some(chosen_key) = columns.get(self.column_picker_index).cloned() else {
-            return;
+        let index = self.column_picker_index;
+        self.column_picker_index = match self.column_picker_target {
+            ColumnPickerTarget::Commandstats => self.commandstats_columns.move_entry(index, delta),
+            ColumnPickerTarget::Overview => {
+                let Some(order_index) = self.picked_overview_column().and_then(|key| {
+                    self.overview_columns
+                        .order
+                        .iter()
+                        .position(|candidate| *candidate == key)
+                }) else {
+                    return;
+                };
+                self.overview_columns.move_entry(order_index, delta)
+            }
         };
-        let Some(chosen_order_idx) = self
-            .runtime_overview_column_order
-            .iter()
-            .position(|key| key == &chosen_key)
-        else {
-            return;
-        };
-
-        self.column_picker_index = move_ordered_column(
-            &mut self.runtime_overview_column_order,
-            chosen_order_idx,
-            delta,
-        );
     }
 
     pub fn toggle_selected_column_visibility(&mut self) {
-        if self.column_picker_target == ColumnPickerTarget::Commandstats {
-            let Some(column) = self.commandstats_column_order.get(self.column_picker_index) else {
-                return;
-            };
-            if self.visible_commandstats_columns.contains(column) {
-                if self.visible_commandstats_columns.len() > 1 {
-                    self.visible_commandstats_columns
-                        .retain(|visible| visible != column);
+        match self.column_picker_target {
+            ColumnPickerTarget::Commandstats => {
+                let Some(column) = self
+                    .commandstats_columns
+                    .order
+                    .get(self.column_picker_index)
+                    .cloned()
+                else {
+                    return;
+                };
+                self.commandstats_columns
+                    .toggle(&column, |set| set.visible.len() > 1);
+            }
+            ColumnPickerTarget::Overview => {
+                let Some(key) = self.picked_overview_column() else {
+                    return;
+                };
+                // Auto-hidden columns do not count towards the last visible one.
+                let shown_after_hiding = self
+                    .visible_column_keys()
+                    .iter()
+                    .filter(|visible| **visible != key)
+                    .count();
+                if self
+                    .overview_columns
+                    .toggle(&key, |_| shown_after_hiding > 0)
+                {
+                    self.ensure_sort_column_visible();
+                    self.clamp_selection();
                 }
-            } else {
-                self.visible_commandstats_columns.push(column.clone());
             }
-            return;
         }
-        let columns = self.available_overview_columns();
-        let Some(chosen_key) = columns.get(self.column_picker_index).cloned() else {
-            return;
-        };
+    }
 
-        if self
-            .runtime_visible_overview
-            .iter()
-            .any(|key| key == &chosen_key)
-        {
-            let next_visible = self
-                .runtime_visible_overview
-                .iter()
-                .filter(|key| key.as_str() != chosen_key)
-                .filter(|key| self.column_registry.column(key).is_some())
-                .filter(|key| !self.is_column_auto_hidden(key))
-                .count();
-            if next_visible == 0 {
-                return;
-            }
-            self.runtime_visible_overview
-                .retain(|key| key != &chosen_key);
-            self.ensure_sort_column_visible();
-            self.clamp_selection();
-            return;
-        }
-
-        self.runtime_visible_overview.push(chosen_key);
-        self.normalize_runtime_visible_columns();
-        self.ensure_sort_column_visible();
-        self.clamp_selection();
+    fn picked_overview_column(&self) -> Option<String> {
+        self.available_overview_columns()
+            .into_iter()
+            .nth(self.column_picker_index)
     }
 
     pub fn cycle_sort_mode(&mut self) {
@@ -952,9 +956,7 @@ impl AppState {
             .iter()
             .position(|key| *key == self.sort_by)
             .unwrap_or(0);
-        let next_idx = (current_idx + 1) % columns.len();
-        self.sort_by.clone_from(&columns[next_idx]);
-        self.sort_direction = default_sort_direction_for_column(&self.sort_by);
+        self.set_sort_column(columns[(current_idx + 1) % columns.len()].clone());
         self.clamp_selection();
     }
 
@@ -985,7 +987,8 @@ impl AppState {
     }
 
     pub fn is_column_visible(&self, column_key: &str) -> bool {
-        self.runtime_visible_overview
+        self.overview_columns
+            .visible
             .iter()
             .any(|key| key == column_key)
     }
@@ -993,16 +996,16 @@ impl AppState {
     pub fn render_cell(&self, row: &DisplayRow, column_key: &str) -> Option<String> {
         let node = self.instances.get(&row.key)?;
         let column = self.column_registry.column(column_key)?;
-        let cluster_labels = self.cluster_labels();
-        let ctx = self.render_ctx(row, node, &cluster_labels);
-        Some(column.render_cell(&ctx).text)
+        Some(column.render_cell(&self.row_ctx().cell(node, &row.tree_prefix)))
     }
 
-    pub fn take_emphasized_rows_by_column(
+    /// Winning row key per emphasized column, including transient records
+    /// reached since the last call.
+    pub(crate) fn take_emphasized_rows_by_column(
         &mut self,
         rows: &[DisplayRow],
+        row_ctx: &RowCtx,
     ) -> HashMap<String, String> {
-        let cluster_labels = self.cluster_labels();
         let mut emphasized = std::mem::take(&mut self.pending_transient_emphasis);
 
         for column_key in self.visible_column_keys() {
@@ -1020,21 +1023,15 @@ impl AppState {
                 .iter()
                 .filter_map(|row| {
                     let node = self.instances.get(&row.key)?;
-                    let sort_ctx = self.sort_ctx(node, &cluster_labels);
-                    let sort_key = column.sort_key(&sort_ctx);
-                    if matches!(sort_key, SortKey::Null) {
-                        None
-                    } else {
-                        Some((row.key.as_str(), sort_key))
-                    }
+                    let sort_key = column.sort_key(&row_ctx.cell(node, ""));
+                    (!sort_key.is_null()).then_some((row.key.as_str(), sort_key))
                 })
                 .reduce(|best, candidate| {
-                    let ordering = candidate.1.compare(&best.1);
-                    let take_candidate = match rule {
-                        Emphasis::Max => ordering.is_gt(),
-                        Emphasis::Min => ordering.is_lt(),
-                    };
-                    if take_candidate { candidate } else { best }
+                    if rule.prefers(&candidate.1, &best.1) {
+                        candidate
+                    } else {
+                        best
+                    }
                 });
 
             if let Some((key, _)) = winner {
@@ -1046,13 +1043,14 @@ impl AppState {
     }
 
     fn track_transient_emphasis(&mut self, updated_key: &str) {
-        let cluster_labels = self.cluster_labels();
         let Some(node) = self.instances.get(updated_key) else {
             return;
         };
+        let row_ctx = self.row_ctx();
+        let ctx = row_ctx.cell(node, "");
 
-        for column_key in self.runtime_overview_column_order.clone() {
-            let Some(column) = self.column_registry.column(&column_key) else {
+        for column_key in &self.overview_columns.order {
+            let Some(column) = self.column_registry.column(column_key) else {
                 continue;
             };
             let Some(rule) = column.emphasis() else {
@@ -1062,133 +1060,118 @@ impl AppState {
                 continue;
             }
 
-            let sort_ctx = self.sort_ctx(node, &cluster_labels);
-            let sort_key = column.sort_key(&sort_ctx);
-            if matches!(sort_key, SortKey::Null) {
+            let sort_key = column.sort_key(&ctx);
+            if sort_key.is_null() {
                 continue;
             }
-
-            let should_replace =
-                self.transient_emphasis_records
-                    .get(&column_key)
-                    .is_none_or(|best| match rule {
-                        Emphasis::Max => sort_key.compare(best).is_gt(),
-                        Emphasis::Min => sort_key.compare(best).is_lt(),
-                    });
-
-            if should_replace {
+            let is_record = self
+                .transient_emphasis_records
+                .get(column_key)
+                .is_none_or(|best| rule.prefers(&sort_key, best));
+            if is_record {
                 self.transient_emphasis_records
                     .insert(column_key.clone(), sort_key);
                 self.pending_transient_emphasis
-                    .insert(column_key, updated_key.to_string());
+                    .insert(column_key.clone(), updated_key.to_string());
             }
         }
     }
 
-    fn build_tree_rows(
-        &self,
-        filtered_nodes: Vec<&InstanceState>,
-        should_omit_host: bool,
-        cluster_labels: &HashMap<String, String>,
-    ) -> Vec<DisplayRow> {
-        let mut filtered_map: HashMap<String, &InstanceState> = HashMap::new();
-        for node in filtered_nodes {
-            filtered_map.insert(node.key.clone(), node);
-        }
+    fn build_tree_rows(&self, filtered_nodes: &[&InstanceState], rows: &RowCtx) -> Vec<DisplayRow> {
+        let filtered_map: HashMap<&str, &InstanceState> = filtered_nodes
+            .iter()
+            .map(|node| (node.key.as_str(), *node))
+            .collect();
 
         let mut out = Vec::new();
         for group in build_tree_groups(&self.instances) {
             let mut roots: Vec<&InstanceState> = group
                 .roots
                 .iter()
-                .filter_map(|key| filtered_map.get(key))
-                .copied()
+                .filter_map(|key| filtered_map.get(key.as_str()).copied())
                 .collect();
-            sort_tree_roots(
-                &mut roots,
-                &self.sort_by,
-                self.sort_direction,
-                cluster_labels,
-                should_omit_host,
-                &self.column_registry,
-            );
+            self.sort_nodes(&mut roots, rows, |node| root_kind_rank(node.kind));
             let mut rendered = HashSet::new();
             let ctx = TreeRenderCtx {
                 filtered_map: &filtered_map,
                 group: &group,
-                cluster_labels,
+                rows,
             };
 
             for root in roots {
-                rendered.insert(root.key.clone());
+                rendered.insert(root.key.as_str());
                 out.push(self.to_display_row(root, ""));
-                self.append_tree_children(
-                    &mut out,
-                    &ctx,
-                    &root.key,
-                    "",
-                    should_omit_host,
-                    &mut rendered,
-                );
+                self.append_tree_children(&mut out, &ctx, &root.key, "", &mut rendered);
             }
         }
 
         out
     }
 
-    fn append_tree_children(
+    fn append_tree_children<'a>(
         &self,
         out: &mut Vec<DisplayRow>,
-        ctx: &TreeRenderCtx<'_>,
+        ctx: &TreeRenderCtx<'a>,
         parent_key: &str,
         indent: &str,
-        should_omit_host: bool,
-        rendered: &mut HashSet<String>,
+        rendered: &mut HashSet<&'a str>,
     ) {
-        let mut children: Vec<&InstanceState> = ctx
+        let mut children: Vec<&'a InstanceState> = ctx
             .group
             .children
             .get(parent_key)
-            .map(|keys| {
-                keys.iter()
-                    .filter_map(|key| ctx.filtered_map.get(key))
-                    .copied()
-                    .collect::<Vec<&InstanceState>>()
-            })
-            .unwrap_or_default();
-        sort_instances(
-            &mut children,
-            &self.sort_by,
-            self.sort_direction,
-            ctx.cluster_labels,
-            should_omit_host,
-            &self.column_registry,
-        );
+            .into_iter()
+            .flatten()
+            .filter_map(|key| ctx.filtered_map.get(key.as_str()).copied())
+            .collect();
+        self.sort_nodes(&mut children, ctx.rows, |_| 0);
 
-        for (idx, child) in children.iter().enumerate() {
-            if rendered.contains(&child.key) {
+        let last_index = children.len().saturating_sub(1);
+        for (idx, child) in children.into_iter().enumerate() {
+            if !rendered.insert(child.key.as_str()) {
                 continue;
             }
-            rendered.insert(child.key.clone());
-
-            let is_last = idx + 1 == children.len();
-            let branch = if is_last { "└─ " } else { "├─ " };
-            out.push(self.to_display_row(child, &format!("{indent}{branch}")));
-
-            let next_indent = if is_last {
-                format!("{indent}   ")
+            let (branch, continuation) = if idx == last_index {
+                ("└─ ", "   ")
             } else {
-                format!("{indent}│  ")
+                ("├─ ", "│  ")
             };
+            out.push(self.to_display_row(child, &format!("{indent}{branch}")));
             self.append_tree_children(
                 out,
                 ctx,
                 &child.key,
-                &next_indent,
-                should_omit_host,
+                &format!("{indent}{continuation}"),
                 rendered,
             );
         }
+    }
+
+    /// Sorts by `group_rank` first, then the active sort column, then address.
+    /// Sort keys are computed once per node rather than per comparison.
+    fn sort_nodes(
+        &self,
+        nodes: &mut Vec<&InstanceState>,
+        rows: &RowCtx,
+        group_rank: impl Fn(&InstanceState) -> u8,
+    ) {
+        let column = self.column_registry.column(&self.sort_by);
+        let mut keyed: Vec<(u8, SortKey, &InstanceState)> = nodes
+            .drain(..)
+            .map(|node| {
+                let key = column.map_or(SortKey::Null, |column| {
+                    column.sort_key(&rows.cell(node, ""))
+                });
+                (group_rank(node), key, node)
+            })
+            .collect();
+        keyed.sort_by(|(rank_a, key_a, a), (rank_b, key_b, b)| {
+            rank_a
+                .cmp(rank_b)
+                .then_with(|| apply_direction(key_a.cmp(key_b), self.sort_direction))
+                .then_with(|| a.addr.cmp(&b.addr))
+        });
+        nodes.extend(keyed.into_iter().map(|(_, _, node)| node));
     }
 
     fn to_display_row(&self, node: &InstanceState, prefix: &str) -> DisplayRow {
@@ -1199,39 +1182,25 @@ impl AppState {
         }
     }
 
-    fn matches_filter(&self, node: &InstanceState) -> bool {
-        if self.filter.trim().is_empty() {
-            return true;
+    pub(crate) fn row_ctx(&self) -> RowCtx {
+        RowCtx {
+            cluster_labels: self.cluster_labels(),
+            omit_host: self.should_omit_host_in_rendering(),
         }
-        let needle = self.filter.to_ascii_lowercase();
-        node.alias
-            .as_deref()
-            .is_some_and(|s| s.to_ascii_lowercase().contains(&needle))
-            || node.addr.to_ascii_lowercase().contains(&needle)
-            || node
-                .cluster_id
-                .as_deref()
-                .is_some_and(|s| s.to_ascii_lowercase().contains(&needle))
-            || node
-                .tags
-                .iter()
-                .any(|tag| tag.to_ascii_lowercase().contains(&needle))
     }
 
+    /// Maps raw cluster ids to short stable labels ("1", "2", ...).
     pub(crate) fn cluster_labels(&self) -> HashMap<String, String> {
-        let mut ordered = BTreeSet::<String>::new();
-        for instance in self.instances.values() {
-            let raw_cluster = instance
-                .cluster_id
-                .clone()
-                .unwrap_or_else(|| "Standalone".to_string());
-            ordered.insert(raw_cluster);
-        }
+        let ordered: BTreeSet<&str> = self
+            .instances
+            .values()
+            .map(InstanceState::cluster_key)
+            .collect();
 
         ordered
             .into_iter()
             .enumerate()
-            .map(|(idx, raw_cluster)| (raw_cluster, (idx + 1).to_string()))
+            .map(|(idx, raw_cluster)| (raw_cluster.to_string(), (idx + 1).to_string()))
             .collect()
     }
 
@@ -1250,72 +1219,6 @@ impl AppState {
         hosts.all(|host| host.as_deref() == Some(first.as_str()))
     }
 
-    fn render_ctx<'a>(
-        &'a self,
-        row: &'a DisplayRow,
-        node: &'a InstanceState,
-        cluster_labels: &'a HashMap<String, String>,
-    ) -> RenderCtx<'a> {
-        let raw_cluster = node
-            .cluster_id
-            .clone()
-            .unwrap_or_else(|| "Standalone".to_string());
-        let cluster_label = cluster_labels.get(&raw_cluster).map(String::as_str);
-        RenderCtx {
-            snap: node,
-            omit_host: self.should_omit_host_in_rendering(),
-            tree_prefix: &row.tree_prefix,
-            cluster_label,
-        }
-    }
-
-    fn sort_ctx<'a>(
-        &'a self,
-        node: &'a InstanceState,
-        cluster_labels: &'a HashMap<String, String>,
-    ) -> SortCtx<'a> {
-        let raw_cluster = node
-            .cluster_id
-            .clone()
-            .unwrap_or_else(|| "Standalone".to_string());
-        SortCtx {
-            snap: node,
-            omit_host: self.should_omit_host_in_rendering(),
-            cluster_label: cluster_labels.get(&raw_cluster).map(String::as_str),
-        }
-    }
-
-    fn normalize_runtime_visible_columns(&mut self) {
-        let registry_columns = self.column_registry.available_overview_columns();
-        let mut ordered = Vec::with_capacity(registry_columns.len());
-        for key in &self.runtime_overview_column_order {
-            if registry_columns.iter().any(|candidate| candidate == key)
-                && !ordered.iter().any(|existing| existing == key)
-            {
-                ordered.push(key.clone());
-            }
-        }
-        for key in &registry_columns {
-            if !ordered.iter().any(|existing| existing == key) {
-                ordered.push(key.clone());
-            }
-        }
-        self.runtime_overview_column_order = ordered;
-
-        let mut deduped = Vec::with_capacity(self.runtime_visible_overview.len());
-        for key in &self.runtime_visible_overview {
-            if self
-                .runtime_overview_column_order
-                .iter()
-                .any(|candidate| candidate == key)
-                && !deduped.iter().any(|existing| existing == key)
-            {
-                deduped.push(key.clone());
-            }
-        }
-        self.runtime_visible_overview = deduped;
-    }
-
     fn is_column_auto_hidden(&self, column_key: &str) -> bool {
         match column_key {
             "addr" => !self.show_address_column(),
@@ -1324,117 +1227,32 @@ impl AppState {
         }
     }
 
+    fn set_sort_column(&mut self, key: String) {
+        self.sort_direction = default_sort_direction_for_column(&key);
+        self.sort_by = key;
+    }
+
     fn ensure_sort_column_visible(&mut self) {
-        if self
-            .visible_column_keys()
-            .iter()
-            .any(|key| key == &self.sort_by)
-        {
+        let visible = self.visible_column_keys();
+        if visible.contains(&self.sort_by) {
             return;
         }
-
-        if let Some(next_sort) = self.visible_column_keys().into_iter().next() {
-            self.sort_by = next_sort;
-            self.sort_direction = default_sort_direction_for_column(&self.sort_by);
+        if let Some(next_sort) = visible.into_iter().next() {
+            self.set_sort_column(next_sort);
         }
     }
 }
 
-fn move_ordered_column<T>(columns: &mut Vec<T>, index: usize, delta: isize) -> usize {
-    if index >= columns.len() {
-        return index;
-    }
-    let current = isize::try_from(index).unwrap_or(isize::MAX);
-    let max_index = isize::try_from(columns.len() - 1).unwrap_or(isize::MAX);
-    let next = usize::try_from(current.saturating_add(delta).clamp(0, max_index)).unwrap_or(index);
-    if next != index {
-        let column = columns.remove(index);
-        columns.insert(next, column);
-    }
-    next
-}
-
-fn sort_instances(
-    instances: &mut Vec<&InstanceState>,
-    sort_by: &str,
-    direction: SortDirection,
-    cluster_labels: &HashMap<String, String>,
-    omit_host: bool,
-    registry: &ColumnRegistry,
-) {
-    instances.sort_by(|a, b| {
-        compare_instances(
-            a,
-            b,
-            sort_by,
-            direction,
-            cluster_labels,
-            omit_host,
-            registry,
-        )
-    });
-}
-
-fn compare_instances(
-    a: &InstanceState,
-    b: &InstanceState,
-    sort_by: &str,
-    direction: SortDirection,
-    cluster_labels: &HashMap<String, String>,
-    omit_host: bool,
-    registry: &ColumnRegistry,
-) -> Ordering {
-    let ordering = registry.column(sort_by).map_or_else(
-        || a.addr.cmp(&b.addr),
-        |column| {
-            let a_cluster = a
-                .cluster_id
-                .clone()
-                .unwrap_or_else(|| "Standalone".to_string());
-            let b_cluster = b
-                .cluster_id
-                .clone()
-                .unwrap_or_else(|| "Standalone".to_string());
-            let a_ctx = SortCtx {
-                snap: a,
-                omit_host,
-                cluster_label: cluster_labels.get(&a_cluster).map(String::as_str),
-            };
-            let b_ctx = SortCtx {
-                snap: b,
-                omit_host,
-                cluster_label: cluster_labels.get(&b_cluster).map(String::as_str),
-            };
-            column.sort_key(&a_ctx).compare(&column.sort_key(&b_ctx))
-        },
-    );
-
-    apply_direction(ordering, direction).then_with(|| a.addr.cmp(&b.addr))
-}
-
-fn sort_tree_roots(
-    instances: &mut Vec<&InstanceState>,
-    sort_by: &str,
-    direction: SortDirection,
-    cluster_labels: &HashMap<String, String>,
-    omit_host: bool,
-    registry: &ColumnRegistry,
-) {
-    instances.sort_by(|a, b| {
-        root_kind_rank(a.kind)
-            .cmp(&root_kind_rank(b.kind))
-            .then_with(|| {
-                compare_instances(
-                    a,
-                    b,
-                    sort_by,
-                    direction,
-                    cluster_labels,
-                    omit_host,
-                    registry,
-                )
-            })
-    });
+fn matches_filter(filter: &Matcher, node: &InstanceState) -> bool {
+    node.alias
+        .as_deref()
+        .is_some_and(|alias| filter.matches(alias))
+        || filter.matches(&node.addr)
+        || node
+            .cluster_id
+            .as_deref()
+            .is_some_and(|cluster| filter.matches(cluster))
+        || node.tags.iter().any(|tag| filter.matches(tag))
 }
 
 const fn apply_direction(ordering: Ordering, direction: SortDirection) -> Ordering {
@@ -1462,7 +1280,10 @@ const fn root_kind_rank(kind: InstanceType) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActiveView, AppState, AuthField, FilterPromptMode, OverviewModal};
+    use super::{
+        ActiveView, AppState, AuthField, DetailTab, FilterPromptMode, OverviewModal, Scroll,
+        step_index,
+    };
     use crate::hotkeys::{HotkeysMetric, HotkeysStatus};
     use crate::model::{
         CommandStat, InstanceState, InstanceType, RuntimeSettings, SortDirection, SortMode,
@@ -1491,6 +1312,13 @@ mod tests {
             settings(),
             ColumnRegistry::load(None, true, SortMode::Address),
         )
+    }
+
+    fn scroll_to(app: &mut AppState, tab: DetailTab, offset: usize) {
+        let scroll = &mut app.pane_mut(tab).scroll;
+        scroll.viewport(100, 1);
+        scroll.scroll_by(offset.cast_signed());
+        assert_eq!(scroll.offset(), offset);
     }
 
     fn app_with_servers() -> AppState {
@@ -1858,7 +1686,7 @@ mod tests {
         let overview_visible = app.visible_column_keys();
         let overview_sort = (app.sort_by.clone(), app.sort_direction);
         app.active_view = ActiveView::Detail;
-        app.detail_tab = 3;
+        app.detail_tab = DetailTab::Commandstats;
         app.open_column_picker();
         assert_eq!(
             app.visible_commandstats_columns(),
@@ -1886,7 +1714,7 @@ mod tests {
         app.close_overview_modal();
         app.move_selection(1);
         app.active_view = ActiveView::Detail;
-        app.detail_tab = 3;
+        app.detail_tab = DetailTab::Commandstats;
         app.apply_update(InstanceState::new("new".into(), "127.0.0.1:6382".into()));
         app.open_column_picker();
         assert_eq!(
@@ -1908,7 +1736,7 @@ mod tests {
         ));
         app.apply_update(server.clone());
         app.active_view = ActiveView::Detail;
-        app.detail_tab = 3;
+        app.detail_tab = DetailTab::Commandstats;
         app.open_column_picker();
         assert_eq!(
             app.visible_commandstats_columns(),
@@ -1958,7 +1786,7 @@ mod tests {
 
         let mut app = app();
         app.active_view = ActiveView::Detail;
-        app.detail_tab = 3;
+        app.detail_tab = DetailTab::Commandstats;
         app.open_column_picker();
         for index in 0..4 {
             app.column_picker_index = index;
@@ -1993,8 +1821,8 @@ mod tests {
     #[test]
     fn available_overview_columns_keep_visible_columns_first_in_runtime_order() {
         let mut app = app();
-        app.runtime_visible_overview = vec!["ops".to_string(), "alias".to_string()];
-        app.runtime_overview_column_order = vec![
+        app.overview_columns.visible = vec!["ops".to_string(), "alias".to_string()];
+        app.overview_columns.order = vec![
             "ops".to_string(),
             "alias".to_string(),
             "cluster".to_string(),
@@ -2033,7 +1861,7 @@ mod tests {
     #[test]
     fn column_picker_keeps_at_least_one_visible_column() {
         let mut app = app();
-        app.runtime_visible_overview = vec!["alias".to_string()];
+        app.overview_columns.visible = vec!["alias".to_string()];
         app.open_column_picker();
         app.column_picker_index = app
             .available_overview_columns()
@@ -2043,7 +1871,7 @@ mod tests {
 
         app.toggle_selected_column_visibility();
 
-        assert_eq!(app.runtime_visible_overview, vec!["alias".to_string()]);
+        assert_eq!(app.overview_columns.visible, vec!["alias".to_string()]);
         assert_eq!(app.visible_column_keys(), vec!["alias".to_string()]);
     }
 
@@ -2052,7 +1880,7 @@ mod tests {
         let mut app = app();
         app.apply_update(InstanceState::new("a".into(), "127.0.0.1:6379".into()));
         app.apply_update(InstanceState::new("b".into(), "127.0.0.1:6380".into()));
-        app.runtime_visible_overview = vec!["alias".to_string(), "addr".to_string()];
+        app.overview_columns.visible = vec!["alias".to_string(), "addr".to_string()];
         app.open_column_picker();
         app.column_picker_index = app
             .available_overview_columns()
@@ -2063,7 +1891,7 @@ mod tests {
         app.toggle_selected_column_visibility();
 
         assert_eq!(
-            app.runtime_visible_overview,
+            app.overview_columns.visible,
             vec!["alias".to_string(), "addr".to_string()]
         );
         assert_eq!(app.visible_column_keys(), vec!["alias".to_string()]);
@@ -2072,7 +1900,7 @@ mod tests {
     #[test]
     fn auto_hidden_type_column_does_not_count_as_last_visible_column() {
         let mut app = app();
-        app.runtime_visible_overview = vec!["alias".to_string(), "role".to_string()];
+        app.overview_columns.visible = vec!["alias".to_string(), "role".to_string()];
         app.open_column_picker();
         app.column_picker_index = app
             .available_overview_columns()
@@ -2083,7 +1911,7 @@ mod tests {
         app.toggle_selected_column_visibility();
 
         assert_eq!(
-            app.runtime_visible_overview,
+            app.overview_columns.visible,
             vec!["alias".to_string(), "role".to_string()]
         );
         assert_eq!(app.visible_column_keys(), vec!["alias".to_string()]);
@@ -2113,9 +1941,9 @@ mod tests {
     #[test]
     fn moving_selected_column_reorders_runtime_columns() {
         let mut app = app();
-        app.runtime_overview_column_order =
+        app.overview_columns.order =
             vec!["alias".to_string(), "ops".to_string(), "status".to_string()];
-        app.runtime_visible_overview =
+        app.overview_columns.visible =
             vec!["alias".to_string(), "ops".to_string(), "status".to_string()];
         app.open_column_picker();
         app.column_picker_index = 1;
@@ -2123,7 +1951,7 @@ mod tests {
         app.move_selected_column(1);
 
         assert_eq!(
-            app.runtime_overview_column_order,
+            app.overview_columns.order,
             vec!["alias".to_string(), "status".to_string(), "ops".to_string()]
         );
         assert_eq!(app.column_picker_index, 2);
@@ -2132,12 +1960,12 @@ mod tests {
     #[test]
     fn moving_hidden_column_reorders_runtime_order() {
         let mut app = app();
-        app.runtime_overview_column_order = vec![
+        app.overview_columns.order = vec![
             "alias".to_string(),
             "ops".to_string(),
             "cluster".to_string(),
         ];
-        app.runtime_visible_overview = vec!["alias".to_string(), "ops".to_string()];
+        app.overview_columns.visible = vec!["alias".to_string(), "ops".to_string()];
         app.open_column_picker();
         app.column_picker_index = app
             .available_overview_columns()
@@ -2148,7 +1976,7 @@ mod tests {
         app.move_selected_column(-1);
 
         assert_eq!(
-            app.runtime_overview_column_order,
+            app.overview_columns.order,
             vec![
                 "alias".to_string(),
                 "cluster".to_string(),
@@ -2161,13 +1989,13 @@ mod tests {
     #[test]
     fn toggling_column_visibility_keeps_picker_order_stable() {
         let mut app = app();
-        app.runtime_overview_column_order = vec![
+        app.overview_columns.order = vec![
             "alias".to_string(),
             "ops".to_string(),
             "cluster".to_string(),
             "status".to_string(),
         ];
-        app.runtime_visible_overview = vec![
+        app.overview_columns.visible = vec![
             "alias".to_string(),
             "ops".to_string(),
             "cluster".to_string(),
@@ -2220,13 +2048,13 @@ mod tests {
     #[test]
     fn moving_column_swaps_with_hidden_neighbors_in_picker_order() {
         let mut app = app();
-        app.runtime_overview_column_order = vec![
+        app.overview_columns.order = vec![
             "alias".to_string(),
             "cluster".to_string(),
             "ops".to_string(),
             "status".to_string(),
         ];
-        app.runtime_visible_overview =
+        app.overview_columns.visible =
             vec!["alias".to_string(), "ops".to_string(), "status".to_string()];
         app.open_column_picker();
         app.column_picker_index = app
@@ -2238,7 +2066,7 @@ mod tests {
         app.move_selected_column(-1);
 
         assert_eq!(
-            app.runtime_overview_column_order,
+            app.overview_columns.order,
             vec![
                 "alias".to_string(),
                 "ops".to_string(),
@@ -2275,7 +2103,8 @@ mod tests {
         app.apply_update(c);
 
         let rows = app.visible_rows();
-        let emphasized = app.take_emphasized_rows_by_column(&rows);
+        let row_ctx = app.row_ctx();
+        let emphasized = app.take_emphasized_rows_by_column(&rows, &row_ctx);
 
         assert_eq!(emphasized.get("lat_last"), Some(&"b".to_string()));
         assert_eq!(emphasized.get("lat_max"), Some(&"c".to_string()));
@@ -2296,11 +2125,13 @@ mod tests {
         app.apply_update(b);
 
         let rows = app.visible_rows();
-        let emphasized = app.take_emphasized_rows_by_column(&rows);
+        let row_ctx = app.row_ctx();
+        let emphasized = app.take_emphasized_rows_by_column(&rows, &row_ctx);
         assert_eq!(emphasized.get("lat_max"), Some(&"b".to_string()));
 
         let rows = app.visible_rows();
-        let emphasized = app.take_emphasized_rows_by_column(&rows);
+        let row_ctx = app.row_ctx();
+        let emphasized = app.take_emphasized_rows_by_column(&rows, &row_ctx);
         assert_eq!(emphasized.get("lat_max"), None);
 
         let mut b = InstanceState::new("b".into(), "127.0.0.1:6380".into());
@@ -2308,14 +2139,15 @@ mod tests {
         app.apply_update(b);
 
         let rows = app.visible_rows();
-        let emphasized = app.take_emphasized_rows_by_column(&rows);
+        let row_ctx = app.row_ctx();
+        let emphasized = app.take_emphasized_rows_by_column(&rows, &row_ctx);
         assert_eq!(emphasized.get("lat_max"), Some(&"b".to_string()));
     }
 
     #[test]
     fn visible_commandstats_filters_and_sorts_by_calls_desc() {
         let mut app = app();
-        app.commandstats_view.filter = "clu".to_string();
+        app.pane_mut(DetailTab::Commandstats).filter = "clu".to_string();
 
         let stats = vec![
             CommandStat {
@@ -2323,21 +2155,21 @@ mod tests {
                 calls: 100,
                 usec: 1_000,
                 usec_per_call: 10.0,
-                additional_metrics: Default::default(),
+                additional_metrics: std::collections::BTreeMap::new(),
             },
             CommandStat {
                 command: "cluster|shards".into(),
                 calls: 500,
                 usec: 2_000,
                 usec_per_call: 4.0,
-                additional_metrics: Default::default(),
+                additional_metrics: std::collections::BTreeMap::new(),
             },
             CommandStat {
                 command: "cluster|info".into(),
                 calls: 50,
                 usec: 500,
                 usec_per_call: 10.0,
-                additional_metrics: Default::default(),
+                additional_metrics: std::collections::BTreeMap::new(),
             },
         ];
 
@@ -2348,61 +2180,58 @@ mod tests {
     }
 
     #[test]
-    fn commandstats_scroll_is_clamped_to_visible_page() {
-        let mut app = app();
-        app.commandstats_view.scroll_offset = 10;
+    fn scroll_is_clamped_to_the_rendered_viewport() {
+        let mut scroll = Scroll::default();
+        assert_eq!(scroll.viewport(4, 3), 0..3);
+        scroll.scroll_by(10);
+        assert_eq!(scroll.offset(), 1);
+        assert_eq!(scroll.viewport(4, 3), 1..4);
+        scroll.scroll_by(-5);
+        assert_eq!(scroll.offset(), 0);
+        scroll.to_end();
+        assert_eq!(scroll.offset(), 1);
+        scroll.page_by(-1);
+        assert_eq!(scroll.offset(), 0);
+        assert_eq!(scroll.viewport(30, 10), 0..10);
+        scroll.page_by(2);
+        assert_eq!(scroll.viewport(30, 10), 20..30);
+        // Content shrinking between frames pulls the offset back into range.
+        assert_eq!(scroll.viewport(12, 10), 2..12);
+        assert_eq!(scroll.viewport(0, 10), 0..0);
+    }
 
-        let stats = vec![
-            CommandStat {
-                command: "a".into(),
-                calls: 4,
-                usec: 4,
-                usec_per_call: 1.0,
-                additional_metrics: Default::default(),
-            },
-            CommandStat {
-                command: "b".into(),
-                calls: 3,
-                usec: 3,
-                usec_per_call: 1.0,
-                additional_metrics: Default::default(),
-            },
-            CommandStat {
-                command: "c".into(),
-                calls: 2,
-                usec: 2,
-                usec_per_call: 1.0,
-                additional_metrics: Default::default(),
-            },
-            CommandStat {
-                command: "d".into(),
-                calls: 1,
-                usec: 1,
-                usec_per_call: 1.0,
-                additional_metrics: Default::default(),
-            },
-        ];
+    #[test]
+    fn step_index_saturates_and_handles_empty_lists() {
+        assert_eq!(step_index(0, -1, 3), 0);
+        assert_eq!(step_index(1, 1, 3), 2);
+        assert_eq!(step_index(1, isize::MAX, 3), 2);
+        assert_eq!(step_index(2, isize::MIN, 3), 0);
+        assert_eq!(step_index(5, 0, 0), 0);
+    }
 
-        app.clamp_commandstats_scroll(&stats, 3);
-        assert_eq!(app.commandstats_view.scroll_offset, 1);
-
-        app.move_commandstats_scroll(-5, &stats, 3);
-        assert_eq!(app.commandstats_view.scroll_offset, 0);
+    #[test]
+    fn detail_tabs_rotate_and_map_shortcuts() {
+        assert_eq!(DetailTab::Summary.rotate(-1), DetailTab::Hotkeys);
+        assert_eq!(DetailTab::Hotkeys.rotate(1), DetailTab::Summary);
+        assert_eq!(DetailTab::Latency.rotate(13), DetailTab::InfoRaw);
+        assert_eq!(DetailTab::from_shortcut('K'), Some(DetailTab::Hotkeys));
+        assert_eq!(DetailTab::from_shortcut('k'), None);
     }
 
     #[test]
     fn start_bigkeys_filter_input_sets_clear_behavior() {
         let mut app = app();
-        app.bigkeys_view.filter = "session".to_string();
+        app.detail_tab = DetailTab::Bigkeys;
+        app.pane_mut(DetailTab::Bigkeys).filter = "session".to_string();
 
-        app.start_bigkeys_filter_input(false);
-        assert!(app.bigkeys_view.is_filtering);
-        assert_eq!(app.bigkeys_view.filter, "session");
+        app.start_active_detail_filter_input(false);
+        assert!(app.pane(DetailTab::Bigkeys).is_filtering);
+        assert_eq!(app.pane(DetailTab::Bigkeys).filter, "session");
 
-        app.start_bigkeys_filter_input(true);
-        assert!(app.bigkeys_view.is_filtering);
-        assert_eq!(app.bigkeys_view.filter, "");
-        assert_eq!(app.bigkeys_view.scroll_offset, 0);
+        app.start_active_detail_filter_input(true);
+        assert!(app.pane(DetailTab::Bigkeys).is_filtering);
+        assert_eq!(app.pane(DetailTab::Bigkeys).filter, "");
+        assert_eq!(app.pane(DetailTab::Bigkeys).scroll.offset(), 0);
     }
 
     #[test]
@@ -2429,12 +2258,12 @@ mod tests {
             },
         ];
 
-        app.bigkeys_view.filter = "set".to_string();
+        app.pane_mut(DetailTab::Bigkeys).filter = "set".to_string();
         let visible = app.visible_bigkeys(&entries);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].key, "timeline");
 
-        app.bigkeys_view.filter = "session".to_string();
+        app.pane_mut(DetailTab::Bigkeys).filter = "session".to_string();
         let visible = app.visible_bigkeys(&entries);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].key, "session:1");
@@ -2443,46 +2272,29 @@ mod tests {
     #[test]
     fn start_detail_text_filter_input_sets_clear_behavior() {
         let mut app = app();
-        app.detail_tab = 2;
-        app.info_raw_view.filter = "run_id".to_string();
+        app.detail_tab = DetailTab::InfoRaw;
+        app.pane_mut(DetailTab::InfoRaw).filter = "run_id".to_string();
 
-        app.start_detail_text_filter_input(false);
-        assert!(app.info_raw_view.is_filtering);
-        assert_eq!(app.info_raw_view.filter, "run_id");
+        app.start_active_detail_filter_input(false);
+        assert!(app.pane(DetailTab::InfoRaw).is_filtering);
+        assert_eq!(app.pane(DetailTab::InfoRaw).filter, "run_id");
 
-        app.start_detail_text_filter_input(true);
-        assert!(app.info_raw_view.is_filtering);
-        assert_eq!(app.info_raw_view.filter, "");
-        assert_eq!(app.info_raw_view.scroll_offset, 0);
+        app.start_active_detail_filter_input(true);
+        assert!(app.pane(DetailTab::InfoRaw).is_filtering);
+        assert_eq!(app.pane(DetailTab::InfoRaw).filter, "");
+        assert_eq!(app.pane(DetailTab::InfoRaw).scroll.offset(), 0);
     }
 
     #[test]
     fn visible_detail_text_lines_filters_case_insensitively() {
         let mut app = app();
-        app.detail_tab = 2;
-        app.info_raw_view.filter = "RUN_ID".to_string();
+        app.detail_tab = DetailTab::InfoRaw;
+        app.pane_mut(DetailTab::InfoRaw).filter = "RUN_ID".to_string();
 
-        let lines = vec![
-            "# Server".to_string(),
-            "run_id:abc123".to_string(),
-            "redis_version:8.0.0".to_string(),
-        ];
+        let body = "# Server\nrun_id:abc123\nredis_version:8.0.0";
 
-        let visible = app.visible_detail_text_lines(2, &lines);
+        let visible = app.visible_detail_text_lines(DetailTab::InfoRaw, body);
         assert_eq!(visible, vec!["run_id:abc123"]);
-    }
-
-    #[test]
-    fn detail_text_scroll_is_clamped_to_visible_page() {
-        let mut app = app();
-        app.detail_tab = 0;
-        app.summary_view.scroll_offset = 10;
-
-        app.clamp_detail_text_scroll(0, 4, 3);
-        assert_eq!(app.summary_view.scroll_offset, 1);
-
-        app.move_detail_text_scroll(0, -5, 4, 3);
-        assert_eq!(app.summary_view.scroll_offset, 0);
     }
 
     #[test]
@@ -2490,60 +2302,58 @@ mod tests {
         let mut app = app();
 
         app.active_view = ActiveView::Detail;
-        app.detail_tab = 0;
-        app.summary_view.filter = "memory".to_string();
+        app.detail_tab = DetailTab::Summary;
+        app.pane_mut(DetailTab::Summary).filter = "memory".to_string();
         app.start_active_detail_filter_input(false);
-        assert!(app.summary_view.is_filtering);
-        assert_eq!(app.summary_view.filter, "memory");
+        assert!(app.pane(DetailTab::Summary).is_filtering);
+        assert_eq!(app.pane(DetailTab::Summary).filter, "memory");
 
-        app.detail_tab = 3;
-        app.commandstats_view.filter = "get".to_string();
-        app.commandstats_view.scroll_offset = 7;
+        app.detail_tab = DetailTab::Commandstats;
+        app.pane_mut(DetailTab::Commandstats).filter = "get".to_string();
+        scroll_to(&mut app, DetailTab::Commandstats, 7);
         app.start_active_detail_filter_input(true);
-        assert!(app.commandstats_view.is_filtering);
-        assert_eq!(app.commandstats_view.filter, "");
-        assert_eq!(app.commandstats_view.scroll_offset, 0);
+        assert!(app.pane(DetailTab::Commandstats).is_filtering);
+        assert_eq!(app.pane(DetailTab::Commandstats).filter, "");
+        assert_eq!(app.pane(DetailTab::Commandstats).scroll.offset(), 0);
 
-        app.detail_tab = 4;
-        app.bigkeys_view.filter = "session".to_string();
+        app.detail_tab = DetailTab::Bigkeys;
+        app.pane_mut(DetailTab::Bigkeys).filter = "session".to_string();
         app.start_active_detail_filter_input(false);
-        assert!(app.bigkeys_view.is_filtering);
-        assert_eq!(app.bigkeys_view.filter, "session");
+        assert!(app.pane(DetailTab::Bigkeys).is_filtering);
+        assert_eq!(app.pane(DetailTab::Bigkeys).filter, "session");
 
-        app.detail_tab = 5;
-        app.hotkeys_view.filter = "alpha".to_string();
+        app.detail_tab = DetailTab::Hotkeys;
+        app.pane_mut(DetailTab::Hotkeys).filter = "alpha".to_string();
         app.start_active_detail_filter_input(false);
-        assert!(app.hotkeys_view.is_filtering);
-        assert_eq!(app.hotkeys_view.filter, "alpha");
+        assert!(app.pane(DetailTab::Hotkeys).is_filtering);
+        assert_eq!(app.pane(DetailTab::Hotkeys).filter, "alpha");
     }
 
     #[test]
     fn close_detail_view_clears_all_detail_filters() {
         let mut app = app();
         app.active_view = ActiveView::Detail;
-        app.summary_view.filter = "sum".to_string();
-        app.summary_view.is_filtering = true;
-        app.summary_view.scroll_offset = 1;
-        app.latency_view.filter = "lat".to_string();
-        app.info_raw_view.filter = "raw".to_string();
-        app.commandstats_view.filter = "cmd".to_string();
-        app.bigkeys_view.filter = "key".to_string();
-        app.bigkeys_view.is_filtering = true;
-        app.bigkeys_view.scroll_offset = 3;
-        app.hotkeys_view.filter = "hot".to_string();
-        app.hotkeys_view.is_filtering = true;
-        app.hotkeys_view.scroll_offset = 4;
+        app.pane_mut(DetailTab::Summary).filter = "sum".to_string();
+        app.pane_mut(DetailTab::Summary).is_filtering = true;
+        scroll_to(&mut app, DetailTab::Summary, 1);
+        app.pane_mut(DetailTab::Latency).filter = "lat".to_string();
+        app.pane_mut(DetailTab::InfoRaw).filter = "raw".to_string();
+        app.pane_mut(DetailTab::Commandstats).filter = "cmd".to_string();
+        app.pane_mut(DetailTab::Bigkeys).filter = "key".to_string();
+        app.pane_mut(DetailTab::Bigkeys).is_filtering = true;
+        scroll_to(&mut app, DetailTab::Bigkeys, 3);
+        app.pane_mut(DetailTab::Hotkeys).filter = "hot".to_string();
+        app.pane_mut(DetailTab::Hotkeys).is_filtering = true;
+        scroll_to(&mut app, DetailTab::Hotkeys, 4);
 
         app.close_detail_view();
 
         assert_eq!(app.active_view, ActiveView::Overview);
-        for detail_tab in 0..=5 {
-            let view = app
-                .detail_pane_view(detail_tab)
-                .expect("detail pane should exist");
+        for tab in DetailTab::ALL {
+            let view = app.pane(tab);
             assert_eq!(view.filter, "");
             assert!(!view.is_filtering);
-            assert_eq!(view.scroll_offset, 0);
+            assert_eq!(view.scroll.offset(), 0);
         }
     }
 
@@ -2561,7 +2371,7 @@ mod tests {
             },
         ];
 
-        app.hotkeys_view.filter = "alp".to_string();
+        app.pane_mut(DetailTab::Hotkeys).filter = "alp".to_string();
         let visible = app.visible_hotkeys(&entries);
 
         assert_eq!(visible.len(), 1);

@@ -2,6 +2,14 @@
 
 ### Added
 
+- Color overview `Status` cells with the theme's `warning_color` and
+  `critical_color`, which were previously accepted but unused. JSON frames
+  expose the same severity as an optional per-cell `tone`.
+
+- Add `PgUp`/`PgDn`, `g`/`G`, and `Home`/`End` navigation for the overview,
+  detail panes, and pickers (`NG` jumps to row `N`), and `Shift+Tab` to move
+  to the previous detail tab.
+
 - Discover additional Commandstats columns from server-reported metrics,
   including `rejected_calls`, `failed_calls`, and unknown future fields. Keep
   the four default columns, offer additional metrics unchecked in the picker,
@@ -68,6 +76,18 @@
 
 ### Changed
 
+- Run batch authentication and stop actions concurrently (within the
+  concurrency limit) while still reporting results in selection order.
+
+- Compute overview sort keys once per row and per-frame values (cluster labels,
+  host rendering) once per frame instead of once per comparison or cell.
+
+- Internal cleanup: columns compute a single typed value used for rendering,
+  sorting, and emphasis; detail panes share one tab enum, filter, and scroll
+  model; overview and Commandstats column pickers share one column-set type;
+  JSON output serializes the core types directly; duplicate color parsing,
+  localhost detection, and truncation helpers were consolidated.
+
 - Reserve lowercase motion keys for navigation: kill/Hotkeys require `K` and
   Latency requires `L`. Move host display to `o`/`O`, retaining `H` for help
   and case-insensitive shortcuts for actions without motion-key conflicts.
@@ -131,6 +151,28 @@
   autodiscovery for matching endpoints.
 
 ### Fixed
+
+- Make the last rows of detail panes reachable. Scrolling was clamped using a
+  page size derived from the terminal height rather than the rendered pane, so
+  the final rows of long `Info Raw`, `Commandstats`, `Bigkeys`, and `Hotkeys`
+  lists could never be shown, and tables left rows unused.
+
+- Show the overview's refresh, view, sort, host, and filter summary. It was
+  rendered into a two-row bordered box with no room for text; it now sits in
+  the table border, which also frees two rows for instances.
+
+- Ignore key-release events in filter prompts so terminals with enhanced
+  keyboard reporting no longer insert every typed character twice.
+
+- Run `Bigkeys` scans in the background instead of inside the poller loop,
+  which stalled refreshes for every server until the scan finished.
+
+- Merge finished `Bigkeys`/`Hotkeys` results into the newest instance state.
+  Previously a completed task restored the snapshot it started from,
+  discarding newer metrics and concurrent results. Results from replaced tasks
+  are ignored.
+
+- Avoid back-to-back catch-up refreshes after a slow polling pass.
 
 - Finish the `rtop` rename in the TUI title and verbose startup output; verify
   default config discovery uses `rtop.toml`.

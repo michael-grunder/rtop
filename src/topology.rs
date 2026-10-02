@@ -26,7 +26,7 @@ pub fn build_tree_groups(instances: &HashMap<String, InstanceState>) -> Vec<Tree
     for node in &nodes {
         match &node.parent_addr {
             Some(parent) => {
-                let parent_key = if nodes.iter().any(|candidate| candidate.key == *parent) {
+                let parent_key = if instances.contains_key(parent) {
                     Some(parent.as_str())
                 } else {
                     key_by_addr.get(parent.as_str()).copied()

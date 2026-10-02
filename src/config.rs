@@ -330,21 +330,8 @@ fn parse_theme(raw: Option<ThemeConfig>) -> Result<Option<UiTheme>> {
 }
 
 fn parse_color(raw: &str, field: &str) -> Result<UiColor> {
-    let normalized = raw.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "black" => Ok(UiColor::Black),
-        "red" => Ok(UiColor::Red),
-        "green" => Ok(UiColor::Green),
-        "yellow" => Ok(UiColor::Yellow),
-        "blue" => Ok(UiColor::Blue),
-        "magenta" => Ok(UiColor::Magenta),
-        "cyan" => Ok(UiColor::Cyan),
-        "gray" | "grey" => Ok(UiColor::Gray),
-        "white" => Ok(UiColor::White),
-        _ => bail!(
-            "invalid color for {field}: {raw} (supported: black, red, green, yellow, blue, magenta, cyan, gray, white)"
-        ),
-    }
+    raw.parse()
+        .map_err(|err| anyhow::anyhow!("invalid color for {field}: {err}"))
 }
 
 #[cfg(test)]
