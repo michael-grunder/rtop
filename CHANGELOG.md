@@ -76,6 +76,10 @@
 
 ### Changed
 
+- Merge the server Latency detail pane into Summary, including last, maximum,
+  and average latency plus sample count. Remove the separate Latency tab and
+  its `L` shortcut.
+
 - Run batch authentication and stop actions concurrently (within the
   concurrency limit) while still reporting results in selection order.
 

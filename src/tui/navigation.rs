@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn motion_keys_and_counts_leave_text_fields_and_help_alone() {
-        for context in 0..10 {
+        for context in 0..4 + DetailTab::ALL.len() {
             let mut app = app();
             match context {
                 0 => app.is_filtering = true,
@@ -440,7 +440,7 @@ mod tests {
         type_keys(&mut nav, &mut app, "k", now);
         assert_eq!(app.pane(DetailTab::Summary).scroll.offset(), 1);
         type_keys(&mut nav, &mut app, "2l", now);
-        assert_eq!(app.detail_tab, DetailTab::InfoRaw);
+        assert_eq!(app.detail_tab, DetailTab::Commandstats);
         type_keys(&mut nav, &mut app, "3h", now);
         assert_eq!(app.detail_tab, DetailTab::Hotkeys);
         type_keys(&mut nav, &mut app, "l", now);

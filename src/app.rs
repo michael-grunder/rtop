@@ -50,7 +50,6 @@ pub enum OverviewModal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailTab {
     Summary,
-    Latency,
     InfoRaw,
     Commandstats,
     Bigkeys,
@@ -58,9 +57,8 @@ pub enum DetailTab {
 }
 
 impl DetailTab {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 5] = [
         Self::Summary,
-        Self::Latency,
         Self::InfoRaw,
         Self::Commandstats,
         Self::Bigkeys,
@@ -70,7 +68,6 @@ impl DetailTab {
     pub const fn title(self) -> &'static str {
         match self {
             Self::Summary => "Summary",
-            Self::Latency => "Latency",
             Self::InfoRaw => "Info Raw",
             Self::Commandstats => "Commandstats",
             Self::Bigkeys => "Bigkeys",
@@ -82,7 +79,6 @@ impl DetailTab {
     pub const fn shortcut(self) -> char {
         match self {
             Self::Summary => 's',
-            Self::Latency => 'l',
             Self::InfoRaw => 'i',
             Self::Commandstats => 'c',
             Self::Bigkeys => 'b',
@@ -112,7 +108,7 @@ impl DetailTab {
 
     /// Text tabs render a body of lines rather than a table.
     pub const fn is_text(self) -> bool {
-        matches!(self, Self::Summary | Self::Latency | Self::InfoRaw)
+        matches!(self, Self::Summary | Self::InfoRaw)
     }
 }
 
@@ -2213,7 +2209,9 @@ mod tests {
     fn detail_tabs_rotate_and_map_shortcuts() {
         assert_eq!(DetailTab::Summary.rotate(-1), DetailTab::Hotkeys);
         assert_eq!(DetailTab::Hotkeys.rotate(1), DetailTab::Summary);
-        assert_eq!(DetailTab::Latency.rotate(13), DetailTab::InfoRaw);
+        assert_eq!(DetailTab::Summary.rotate(1), DetailTab::InfoRaw);
+        assert_eq!(DetailTab::InfoRaw.rotate(-1), DetailTab::Summary);
+        assert_eq!(DetailTab::Summary.rotate(11), DetailTab::InfoRaw);
         assert_eq!(DetailTab::from_shortcut('K'), Some(DetailTab::Hotkeys));
         assert_eq!(DetailTab::from_shortcut('k'), None);
     }
@@ -2336,7 +2334,6 @@ mod tests {
         app.pane_mut(DetailTab::Summary).filter = "sum".to_string();
         app.pane_mut(DetailTab::Summary).is_filtering = true;
         scroll_to(&mut app, DetailTab::Summary, 1);
-        app.pane_mut(DetailTab::Latency).filter = "lat".to_string();
         app.pane_mut(DetailTab::InfoRaw).filter = "raw".to_string();
         app.pane_mut(DetailTab::Commandstats).filter = "cmd".to_string();
         app.pane_mut(DetailTab::Bigkeys).filter = "key".to_string();

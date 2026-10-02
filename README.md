@@ -14,7 +14,8 @@
     `slots` (`Slots`, the full comma separated range list such as
     `0-5460,9000`), both sourced from `CLUSTER SHARDS` and populated only for
     cluster primaries; replicas and non-cluster instances leave them blank
-- Detail screen with summary, latency, raw `INFO`, `INFO COMMANDSTATS`, an on-demand `bigkeys`
+- Detail screen with summary (including last, maximum, and average latency in
+  milliseconds plus sample count), raw `INFO`, `INFO COMMANDSTATS`, an on-demand `bigkeys`
   view, and a timed `hotkeys` view for CPU/NET sampling, including full
   server-reported error details when polling fails
 - Tree, flat, and primary-only overview modes
@@ -52,16 +53,16 @@
 - `Esc`: clear server selections in the overview, or quit if none are selected;
   close the active overlay window, go back from detail/help, or stop filter editing
 - `h` / `l` or `Left` / `Right`: cycle detail tabs (`Tab` advances, `Shift+Tab` goes back)
-- `S` / `L` / `I` / `C` / `B` / `K`: jump to `Summary` / `Latency` / `Info Raw` / `Commandstats` / `Bigkeys` / `Hotkeys` in detail view
+- `S` / `I` / `C` / `B` / `K`: jump to `Summary` / `Info Raw` / `Commandstats` / `Bigkeys` / `Hotkeys` in detail view
 - `Shift+Up/Down`: reorder columns inside the column picker
 - `o` / `O`: toggle host rendering (default auto-hides host when all targets share one host)
-- `/`: start filter input in overview, or filter the active detail pane in detail view (`Summary`, `Latency`, `Info Raw`, `Commandstats`, `Bigkeys`, or `Hotkeys`)
+- `/`: start filter input in overview, or filter the active detail pane in detail view (`Summary`, `Info Raw`, `Commandstats`, `Bigkeys`, or `Hotkeys`)
 - `C` / `N`: start CPU or NET sampling while the `Hotkeys` tab is open
 - `X`: stop active `Hotkeys` sampling early, or reset the `Hotkeys` pane back to its idle prompt
 - `r` / `R`: refresh now, rerun the on-demand `Bigkeys` scan, or rerun `Hotkeys` sampling for the last selected metric while that tab is open
 
 Shortcuts without a motion-key conflict remain case insensitive. Kill and the
-Hotkeys detail tab require `K`; the Latency tab requires `L`. Lowercase
+Hotkeys detail tab require `K`. Lowercase
 `h`/`j`/`k`/`l` are reserved for movement. While editing filters or credentials,
 letters and digits are entered as text. `j`/`k` also navigate the sort, column,
 and kill pickers. Help remains on `H`, `F1`, and `?`.

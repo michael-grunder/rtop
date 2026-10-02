@@ -909,7 +909,7 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) {
         area: body_area,
     };
     match tab {
-        DetailTab::Summary | DetailTab::Latency | DetailTab::InfoRaw => {
+        DetailTab::Summary | DetailTab::InfoRaw => {
             draw_detail_text(frame, &pane, &mut scroll, &detail_text_body(instance, tab));
         }
         DetailTab::Commandstats => {
@@ -1295,7 +1295,6 @@ fn format_aligned_rows(rows: &[(&str, String)]) -> String {
 fn detail_text_body(instance: &InstanceState, tab: DetailTab) -> String {
     match tab {
         DetailTab::Summary => summary_detail_body(instance),
-        DetailTab::Latency => latency_detail_body(instance),
         DetailTab::InfoRaw => instance
             .detail
             .raw_info
@@ -1350,19 +1349,6 @@ fn summary_detail_body(instance: &InstanceState) -> String {
         ("evicted_keys", format_optional_u64(detail.evicted_keys)),
         ("expired_keys", format_optional_u64(detail.expired_keys)),
         ("master", replication_source),
-    ]);
-    if let Some(details) = &instance.error_details {
-        let _ = write!(
-            body,
-            "\n\nerror_summary : {}\nerror_details : {}",
-            details.summary, details.message
-        );
-    }
-    body
-}
-
-fn latency_detail_body(instance: &InstanceState) -> String {
-    format_aligned_rows(&[
         (
             "last_latency_ms",
             instance
@@ -1375,7 +1361,15 @@ fn latency_detail_body(instance: &InstanceState) -> String {
             "window_samples",
             format_with_commas(instance.latency_window.len() as u64),
         ),
-    ])
+    ]);
+    if let Some(details) = &instance.error_details {
+        let _ = write!(
+            body,
+            "\n\nerror_summary : {}\nerror_details : {}",
+            details.summary, details.message
+        );
+    }
+    body
 }
 
 fn format_optional_u64(value: Option<u64>) -> String {
@@ -1509,7 +1503,7 @@ const fn help_bindings() -> &'static [(&'static str, &'static str)] {
             "g / G, Home / End",
             "Jump to the first or last row (NG jumps to row N)",
         ),
-        ("Case", "K (kill/Hotkeys), L (Latency) require uppercase"),
+        ("Case", "K (kill/Hotkeys) requires uppercase"),
         ("f or /", "Edit the overview filter (keeps existing text)"),
         (
             "Esc",
@@ -1519,8 +1513,8 @@ const fn help_bindings() -> &'static [(&'static str, &'static str)] {
         ("Tab/Right/l", "Next detail panel"),
         ("Shift+Tab/Left/h", "Previous detail panel"),
         (
-            "S / L / I / C / B / K",
-            "Jump to Summary, Latency, Info Raw, Commandstats, Bigkeys, or Hotkeys in detail",
+            "S / I / C / B / K",
+            "Jump to Summary, Info Raw, Commandstats, Bigkeys, or Hotkeys in detail",
         ),
         (
             "Up/Down/j/k",
@@ -2347,7 +2341,7 @@ mod tests {
     fn detail_tab_shortcuts_reserve_lowercase_motion_keys() {
         for (ch, expected) in [
             ('s', Some(DetailTab::Summary)),
-            ('L', Some(DetailTab::Latency)),
+            ('L', None),
             ('i', Some(DetailTab::InfoRaw)),
             ('C', Some(DetailTab::Commandstats)),
             ('b', Some(DetailTab::Bigkeys)),
@@ -2885,7 +2879,7 @@ mod tests {
 
         let lines = buffer_lines(terminal.backend().buffer());
         assert!(lines.iter().any(|line| line.contains("[S]ummary")));
-        assert!(lines.iter().any(|line| line.contains("[L]atency")));
+        assert!(!lines.iter().any(|line| line.contains("[L]atency")));
         assert!(lines.iter().any(|line| line.contains("[I]nfo Raw")));
         assert!(lines.iter().any(|line| line.contains("[C]ommandstats")));
         assert!(lines.iter().any(|line| line.contains("[B]igkeys")));
@@ -2898,7 +2892,7 @@ mod tests {
             default_settings(),
             ColumnRegistry::load(None, true, crate::model::SortMode::Address),
         );
-        app.detail_tab = DetailTab::Latency;
+        app.detail_tab = DetailTab::Summary;
 
         let backend = TestBackend::new(100, 3);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -2909,7 +2903,7 @@ mod tests {
         let buffer = terminal.backend().buffer().clone();
         let lines = buffer_lines(&buffer);
         assert!(lines.iter().any(|line| line.contains("[S]ummary")));
-        assert!(lines.iter().any(|line| line.contains("[L]atency")));
+        assert!(!lines.iter().any(|line| line.contains("[L]atency")));
         assert!(lines.iter().any(|line| line.contains("[I]nfo Raw")));
         assert!(lines.iter().any(|line| line.contains("[C]ommandstats")));
         assert!(lines.iter().any(|line| line.contains("[B]igkeys")));
@@ -2917,18 +2911,18 @@ mod tests {
 
         let line_index = lines
             .iter()
-            .position(|line| line.contains("[L]atency"))
-            .expect("latency tab rendered");
+            .position(|line| line.contains("[S]ummary"))
+            .expect("summary tab rendered");
         let tab_row = &lines[line_index];
         let width = usize::from(buffer.area.width);
-        let latency_col = char_column(tab_row, "[L]atency");
-        let latency_idx = line_index * width + latency_col;
+        let summary_col = char_column(tab_row, "[S]ummary");
+        let summary_idx = line_index * width + summary_col;
 
-        assert_eq!(buffer.content()[latency_idx].symbol(), "[");
-        assert_eq!(buffer.content()[latency_idx].fg, background_color(&app));
-        assert_eq!(buffer.content()[latency_idx].bg, carat_color(&app));
+        assert_eq!(buffer.content()[summary_idx].symbol(), "[");
+        assert_eq!(buffer.content()[summary_idx].fg, background_color(&app));
+        assert_eq!(buffer.content()[summary_idx].bg, carat_color(&app));
         assert!(
-            buffer.content()[latency_idx]
+            buffer.content()[summary_idx]
                 .modifier
                 .contains(Modifier::BOLD)
         );
@@ -3190,6 +3184,68 @@ mod tests {
     }
 
     #[test]
+    fn detail_summary_includes_latency_and_filters_it() {
+        let mut app = AppState::new(default_settings(), test_registry());
+        app.active_view = ActiveView::Detail;
+        app.detail_tab = DetailTab::Summary;
+
+        let mut instance = InstanceState::new("a".into(), "127.0.0.1:6379".into());
+        instance.last_latency_ms = Some(1.25);
+        instance.max_latency_ms = 2.5;
+        instance.avg_latency_ms = 1.875;
+        instance.latency_window = [2.5, 1.25].into();
+        app.apply_update(instance);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 28)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("detail draw succeeds");
+        let rendered = buffer_lines(terminal.backend().buffer())
+            .join("\n")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for row in [
+            "used_memory : -",
+            "last_latency_ms : 1.25",
+            "max_latency_ms : 2.50",
+            "avg_latency_ms : 1.88",
+            "window_samples : 2",
+        ] {
+            assert!(rendered.contains(row), "missing summary row: {row}");
+        }
+
+        app.pane_mut(DetailTab::Summary).filter = "latency".into();
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("filtered detail draw succeeds");
+        let rendered = buffer_lines(terminal.backend().buffer())
+            .join("\n")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(rendered.contains("Summary 1-3 / 3 filter=/latency"));
+        assert!(rendered.contains("last_latency_ms : 1.25"));
+        assert!(rendered.contains("max_latency_ms : 2.50"));
+        assert!(rendered.contains("avg_latency_ms : 1.88"));
+        assert!(!rendered.contains("used_memory"));
+        assert!(!rendered.contains("window_samples"));
+    }
+
+    #[test]
+    fn detail_summary_without_latency_samples_shows_defaults() {
+        let instance = InstanceState::new("a".into(), "127.0.0.1:6379".into());
+        let body = super::detail_text_body(&instance, DetailTab::Summary)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(body.contains("last_latency_ms : -"));
+        assert!(body.contains("max_latency_ms : 0.00"));
+        assert!(body.contains("avg_latency_ms : 0.00"));
+        assert!(body.contains("window_samples : 0"));
+    }
+
+    #[test]
     fn detail_summary_tab_pages_lines_with_scroll_offset() {
         let mut app = crate::app::AppState::new(
             default_settings(),
@@ -3223,12 +3279,12 @@ mod tests {
             .expect("detail draw succeeds");
 
         let lines = buffer_lines(terminal.backend().buffer());
-        assert!(lines.iter().any(|line| line.contains("Summary 3-9 / 14")));
-        assert!(!lines.iter().any(|line| line.contains("status           :")));
-        assert!(!lines.iter().any(|line| line.contains("used_memory      :")));
+        assert!(lines.iter().any(|line| line.contains("Summary 3-9 / 18")));
+        assert!(!lines.iter().any(|line| line.contains("status ")));
+        assert!(!lines.iter().any(|line| line.contains("used_memory ")));
         assert!(lines.iter().any(|line| line.contains("used_memory_rss")));
         assert!(lines.iter().any(|line| line.contains("commands")));
-        assert!(!lines.iter().any(|line| line.contains("master           :")));
+        assert!(!lines.iter().any(|line| line.contains("master ")));
     }
 
     #[test]
