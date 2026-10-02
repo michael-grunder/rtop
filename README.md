@@ -155,6 +155,8 @@ Examples:
 ```bash
 rtop 127.0.0.1:6379 127.0.0.1:6380
 rtop 6379 6380
+rtop -r 500ms 6379
+rtop --refresh-rate 2s 6379 6380
 rtop
 rtop 192.168.0.148
 rtop --autodiscover 192.168.0.148 --autodiscover 192.168.0.149
@@ -208,7 +210,7 @@ Important options:
 - `--target <ALIAS_OR_ADDRESS>` (select a target for config commands)
 - `--once`
 - `--output <tui|json>`
-- `--refresh <DURATION>`
+- `-r, --refresh-rate <DURATION>` (`--refresh` remains an alias)
 - `--connect-timeout <DURATION>`
 - `--command-timeout <DURATION>`
 - `-n, --concurrency <N>`
@@ -220,6 +222,19 @@ Important options:
 - `-a, --auth <PASSWORD>`
 - `--user <USERNAME>`
 - `-v, --verbose`
+
+Polling defaults to **1 second**. Use `-r` / `--refresh-rate` with an explicit unit,
+such as `500ms`, `1s`, or `2s`, to set the interval between polling passes.
+To persist the interval, set it in milliseconds in your TOML config:
+
+```toml
+[global]
+refresh_interval_ms = 1000
+```
+
+The CLI option overrides the configured interval. The interval must be greater
+than zero. It applies to polling in both the TUI and JSON stream modes;
+`--once` still performs only one polling pass.
 
 `--once` skips the interactive TUI. It performs one polling pass for explicit
 targets, runs autodiscovery/verification for any configured discovery hosts,

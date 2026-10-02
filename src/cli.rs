@@ -83,7 +83,13 @@ struct Cli {
     )]
     config_target: Option<String>,
 
-    #[arg(long = "refresh", value_name = "DURATION")]
+    /// Polling interval, e.g. 500ms or 2s (default: 1s, configurable in TOML).
+    #[arg(
+        short = 'r',
+        long = "refresh-rate",
+        visible_alias = "refresh",
+        value_name = "DURATION"
+    )]
     refresh: Option<String>,
 
     #[arg(long = "connect-timeout", value_name = "DURATION")]
@@ -200,6 +206,11 @@ fn build_launch_config_from(mut args: Cli) -> Result<LaunchConfig> {
 
     if let Some(refresh) = args.refresh.as_deref() {
         settings.refresh_interval = humantime::parse_duration(refresh)?;
+    }
+    if settings.refresh_interval.is_zero() {
+        bail!(
+            "polling interval must be greater than zero (--refresh-rate or global.refresh_interval_ms)"
+        );
     }
     if let Some(timeout) = args.connect_timeout.as_deref() {
         settings.connect_timeout = humantime::parse_duration(timeout)?;
@@ -561,6 +572,7 @@ fn dedupe_discovery_targets(input: Vec<DiscoveryTarget>) -> Vec<DiscoveryTarget>
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::Duration;
 
     use clap::Parser;
     use tempfile::tempdir;
@@ -577,6 +589,77 @@ mod tests {
         assert!(VERSION.contains(" ["));
         assert!(VERSION.contains("] ("));
         assert!(VERSION.ends_with(')'));
+    }
+
+    #[test]
+    fn polling_interval_defaults_to_one_second() {
+        let cli = super::Cli::parse_from(["rtop", "--no-config"]);
+        let launch = super::build_launch_config_from(cli).unwrap();
+        assert_eq!(launch.settings.refresh_interval, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn refresh_rate_options_set_polling_interval() {
+        for option in ["-r", "--refresh-rate", "--refresh"] {
+            for (value, expected) in [
+                ("500ms", Duration::from_millis(500)),
+                ("2s", Duration::from_secs(2)),
+                ("1.5s", Duration::from_millis(1500)),
+            ] {
+                let cli = super::Cli::parse_from(["rtop", "--no-config", option, value]);
+                let launch = super::build_launch_config_from(cli).unwrap();
+                assert_eq!(launch.settings.refresh_interval, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_polling_intervals_are_rejected() {
+        for option in ["-r", "--refresh-rate", "--refresh"] {
+            for value in ["0s", "0ms", "nonsense", "-1s"] {
+                let cli = super::Cli::try_parse_from([
+                    "rtop".to_string(),
+                    "--no-config".to_string(),
+                    format!("{option}={value}"),
+                ]);
+                if let Ok(cli) = cli {
+                    assert!(super::build_launch_config_from(cli).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_rate_overrides_toml_polling_interval() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rtop.toml");
+        for interval_ms in [0, 2500] {
+            fs::write(
+                &path,
+                format!("[global]\nrefresh_interval_ms = {interval_ms}\n"),
+            )
+            .unwrap();
+            let args = ["rtop", "--config-file", path.to_str().unwrap()];
+            let configured = super::build_launch_config_from(super::Cli::parse_from(args));
+            if interval_ms == 0 {
+                assert!(
+                    configured
+                        .unwrap_err()
+                        .to_string()
+                        .contains("greater than zero")
+                );
+            } else {
+                assert_eq!(
+                    configured.unwrap().settings.refresh_interval,
+                    Duration::from_millis(interval_ms)
+                );
+            }
+            for option in ["-r", "--refresh-rate", "--refresh"] {
+                let cli = super::Cli::parse_from(args.into_iter().chain([option, "750ms"]));
+                let launch = super::build_launch_config_from(cli).unwrap();
+                assert_eq!(launch.settings.refresh_interval, Duration::from_millis(750));
+            }
+        }
     }
 
     #[test]

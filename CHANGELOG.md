@@ -2,6 +2,11 @@
 
 ### Added
 
+- Add `-r` / `--refresh-rate` to control the polling interval with durations such as
+  `500ms` or `2s`, retaining `--refresh` as an alias. Default to 1 second and
+  override TOML `[global].refresh_interval_ms` when supplied. Reject zero
+  polling intervals before starting the timer.
+
 - Color overview `Status` cells with the theme's `warning_color` and
   `critical_color`, which were previously accepted but unused. JSON frames
   expose the same severity as an optional per-cell `tone`.
