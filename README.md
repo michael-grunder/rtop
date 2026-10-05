@@ -36,6 +36,11 @@
 
 ## Activity panel
 
+Press `m` / `M` in the main overview to hide or show the top activity metrics
+panel, giving the server table more room when hidden. It is visible by default;
+the toggle lasts for the current session. Metrics and history continue updating
+while hidden.
+
 The top of the main overview shows activity for all monitored servers. Use
 `j`/`k` or `Up`/`Down` to move focus in the main server table,
 then `Space` to select servers. With any servers selected, the panel sums only
@@ -78,6 +83,7 @@ table format.
 - `H`: open full help page
 - `f` or `/`: edit the overview filter, keeping existing text
 - `t`: cycle Tree / Flat / Primary (overview)
+- `m` / `M`: show or hide the top activity metrics panel (overview)
 - `s`: open Sort By to choose from currently visible overview columns
 - `c`: open the column picker for the overview or the active `Commandstats` pane
 - `Space`: toggle selection of the focused overview server

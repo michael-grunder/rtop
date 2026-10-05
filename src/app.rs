@@ -319,6 +319,7 @@ impl RowCtx {
 #[allow(clippy::struct_excessive_bools)]
 pub struct AppState {
     pub(crate) activity: crate::activity::Activity,
+    pub show_activity: bool,
     pub settings: RuntimeSettings,
     pub view_mode: ViewMode,
     pub sort_by: String,
@@ -365,6 +366,7 @@ impl AppState {
     pub fn new(settings: RuntimeSettings, column_registry: ColumnRegistry) -> Self {
         Self {
             activity: crate::activity::Activity::default(),
+            show_activity: true,
             view_mode: settings.default_view,
             sort_by: column_registry.default_sort_by.clone(),
             sort_direction: column_registry.default_sort_direction,

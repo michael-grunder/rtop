@@ -2,6 +2,8 @@
 
 ### Added
 
+- Add `m` / `M` to show or hide the top activity metrics panel for the current
+  session, expanding the server table while keeping metric history updating.
 - Add `-r` / `--refresh-rate` to control the polling interval with durations such as
   `500ms` or `2s`, retaining `--refresh` as an alias. Default to 1 second and
   override TOML `[global].refresh_interval_ms` when supplied. Reject zero

@@ -423,6 +423,7 @@ fn handle_overview_shortcut(app: &mut AppState, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Char(' ') => app.toggle_server_selection(),
+        KeyCode::Char('m' | 'M') => app.show_activity = !app.show_activity,
         KeyCode::F(5) | KeyCode::Char('t' | 'T') => app.cycle_view_mode(),
         KeyCode::F(6) | KeyCode::Char('s' | 'S') => app.open_sort_picker(),
         KeyCode::F(7) | KeyCode::Char('c' | 'C' | 'v' | 'V') => app.open_column_picker(),
@@ -625,9 +626,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut AppState) {
 
     match app.active_view {
         ActiveView::Overview => {
-            let height = match main.height {
-                13.. => 6,
-                10.. => 4,
+            let height = match (app.show_activity, main.height) {
+                (true, 13..) => 6,
+                (true, 10..) => 4,
                 _ => 0,
             };
             let [activity_area, table] =
@@ -1450,7 +1451,7 @@ fn status_bar_actions(app: &AppState) -> Line<'static> {
     }
 
     let footer_actions = format!(
-        "[H]elp  [F]ilter /  [T]ree:{}  [S]ortBy  [C]olumns  [A]uth  [K]ill  [Space]Select",
+        "[H]elp  [F]ilter /  [T]ree:{}  [M]etrics  [S]ortBy  [C]olumns  [A]uth  [K]ill  [Space]Select",
         app.view_mode.footer_label()
     );
     Line::from(app.discovery_status.footer_summary().map_or_else(
@@ -1489,6 +1490,7 @@ const fn help_bindings() -> &'static [(&'static str, &'static str)] {
         ("Ctrl+C", "Quit immediately"),
         ("H / F1", "Open full help page"),
         ("t / F5", "Cycle Tree, Flat, and Primary view in overview"),
+        ("m / M", "Show or hide the top activity metrics panel"),
         ("s / F6", "Choose sort column in overview"),
         (
             "c / F7 / v",
@@ -2018,6 +2020,75 @@ mod tests {
     }
 
     #[test]
+    fn metrics_toggle_reclaims_table_space_and_restores_panel() {
+        for (height, panel_height) in [(24, 6), (12, 4), (10, 0)] {
+            let mut app = app_with_selected_servers();
+            let selected = app.selected_key();
+            let mut terminal = Terminal::new(TestBackend::new(120, height)).unwrap();
+            assert!(app.show_activity);
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let original_page_len = app.overview_page_len;
+            let history_len = app.activity.history.len();
+
+            assert!(handle_overview_shortcut(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            ));
+            assert!(!app.show_activity);
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let lines = buffer_lines(terminal.backend().buffer());
+            assert!(!lines.iter().any(|line| line.contains("Activity |")));
+            assert!(lines.last().unwrap().contains("[M]etrics"));
+            assert_eq!(app.overview_page_len, original_page_len + panel_height);
+            assert_eq!(app.selected_key(), selected);
+            assert_eq!(app.selected_server_count(), 2);
+            assert!(app.activity.history.len() >= history_len);
+
+            // Sampling continues while hidden, preserving the existing history.
+            app.sample_activity(std::time::Instant::now() + app.settings.refresh_interval);
+            assert!(app.activity.history.len() > history_len);
+            assert!(handle_overview_shortcut(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT),
+            ));
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            assert!(app.show_activity);
+            assert_eq!(app.overview_page_len, original_page_len);
+            let lines = buffer_lines(terminal.backend().buffer());
+            assert_eq!(lines[0].contains("Activity |"), panel_height > 0);
+        }
+        assert!(help_bindings().iter().any(|(keys, _)| *keys == "m / M"));
+    }
+
+    #[test]
+    fn metrics_toggle_ignores_help_overlay_modifiers_and_non_press_events() {
+        let mut app = AppState::new(default_settings(), test_registry());
+        app.show_help = true;
+        assert!(!handle_overview_shortcut(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        ));
+        app.show_help = false;
+        for kind in [KeyEventKind::Release, KeyEventKind::Repeat] {
+            assert!(!handle_overview_shortcut(
+                &mut app,
+                KeyEvent::new_with_kind(KeyCode::Char('m'), KeyModifiers::NONE, kind),
+            ));
+        }
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+        ] {
+            assert!(!handle_overview_shortcut(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('m'), modifiers),
+            ));
+        }
+        assert!(app.show_activity);
+    }
+
+    #[test]
     fn activity_panel_handles_small_empty_and_scrolled_views() {
         let mut app = AppState::new(default_settings(), test_registry());
         for (width, height) in [(120, 24), (80, 12), (20, 10), (1, 1), (0, 0)] {
@@ -2380,7 +2451,7 @@ mod tests {
     fn overview_shortcuts_do_not_interfere_with_other_input_contexts() {
         let mut app = AppState::new(default_settings(), test_registry());
         let shortcuts = [
-            'a', 'A', 'f', 'F', '/', 't', 'T', 's', 'S', 'c', 'C', 'k', 'K',
+            'a', 'A', 'f', 'F', '/', 't', 'T', 's', 'S', 'c', 'C', 'k', 'K', 'm', 'M',
         ];
         for view in [ActiveView::Detail, ActiveView::Help] {
             app.active_view = view;
