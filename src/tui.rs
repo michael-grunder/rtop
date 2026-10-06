@@ -30,7 +30,7 @@ use crate::app::{
 };
 use crate::cli::{LaunchConfig, OutputMode};
 use crate::column::{EmphasisStyle, Tone, format_bytes};
-use crate::commandstats::CommandstatsColumn;
+use crate::commandstats::{CommandstatsColumn, aggregate_commandstats};
 use crate::discovery::{self, DiscoveryEvent};
 use crate::hotkeys::{HotkeysMetric, HotkeysMetrics, HotkeysStatus};
 use crate::model::{BigkeysMetrics, BigkeysScanStatus, CommandStat, InstanceState, KillAction};
@@ -398,14 +398,17 @@ fn handle_commandstats_shortcut(app: &mut AppState, key: KeyEvent) -> bool {
         || app.show_help
         || key.kind != KeyEventKind::Press
         || has_command_modifier(key)
-        || !matches!(
-            key.code,
-            KeyCode::F(7) | KeyCode::Char('c' | 'C' | 'v' | 'V')
-        )
     {
         return false;
     }
-    app.open_column_picker();
+    match key.code {
+        KeyCode::F(7) | KeyCode::Char('c' | 'C' | 'v' | 'V') => app.open_column_picker(),
+        KeyCode::Char('p' | 'P') => {
+            app.commandstats_compact = !app.commandstats_compact;
+            app.active_pane_mut().scroll.to_start();
+        }
+        _ => return false,
+    }
     true
 }
 
@@ -885,7 +888,19 @@ fn shrink_widths_to_fit(widths: &mut [u16], target: u16) {
 }
 
 fn draw_detail(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) {
-    let Some(instance) = app.selected_instance() else {
+    let commandstats_nodes: Vec<_> = if app.detail_tab == DetailTab::Commandstats {
+        app.action_target_keys()
+            .iter()
+            .filter_map(|key| app.instances.get(key))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let Some(instance) = commandstats_nodes
+        .first()
+        .copied()
+        .or_else(|| app.selected_instance())
+    else {
         frame.render_widget(
             Paragraph::new("No instance selected")
                 .style(base_style(app))
@@ -898,15 +913,22 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) {
     let [header_area, body_area] =
         Layout::vertical([Constraint::Length(3), Constraint::Min(5)]).areas(area);
 
-    let title = format!(
-        "{} ({})  role={}  status={}  version={} uptime={}s",
-        instance.display_name(),
-        instance.addr,
-        instance.kind.as_str(),
-        instance.status.as_str(),
-        instance.detail.redis_version.as_deref().unwrap_or("-"),
-        format_optional_u64(instance.detail.uptime_seconds),
-    );
+    let title = if commandstats_nodes.len() > 1 {
+        format!(
+            "Commandstats totals for {} selected nodes",
+            commandstats_nodes.len()
+        )
+    } else {
+        format!(
+            "{} ({})  role={}  status={}  version={} uptime={}s",
+            instance.display_name(),
+            instance.addr,
+            instance.kind.as_str(),
+            instance.status.as_str(),
+            instance.detail.redis_version.as_deref().unwrap_or("-"),
+            format_optional_u64(instance.detail.uptime_seconds),
+        )
+    };
     frame.render_widget(
         Paragraph::new(title)
             .style(base_style(app))
@@ -928,7 +950,16 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) {
             draw_detail_text(frame, &pane, &mut scroll, &detail_text_body(instance, tab));
         }
         DetailTab::Commandstats => {
-            draw_commandstats(frame, &pane, &mut scroll, &instance.detail.commandstats);
+            let stats = if commandstats_nodes.len() > 1 {
+                std::borrow::Cow::Owned(aggregate_commandstats(
+                    commandstats_nodes
+                        .iter()
+                        .flat_map(|node| &node.detail.commandstats),
+                ))
+            } else {
+                std::borrow::Cow::Borrowed(instance.detail.commandstats.as_slice())
+            };
+            draw_commandstats(frame, &pane, &mut scroll, &stats, commandstats_nodes.len());
         }
         DetailTab::Bigkeys => draw_bigkeys(frame, &pane, &mut scroll, &instance.detail.bigkeys),
         DetailTab::Hotkeys => draw_hotkeys(frame, &pane, &mut scroll, &instance.detail.hotkeys),
@@ -1012,11 +1043,38 @@ fn draw_commandstats(
     pane: &PaneCtx<'_>,
     scroll: &mut Scroll,
     stats: &[CommandStat],
+    node_count: usize,
 ) {
     let app = pane.app;
     let visible = app.visible_commandstats(stats);
-    let range = scroll.viewport(visible.len(), pane.page_len(1));
-    let block = pane.block(pane.title("Commandstats", &range, visible.len()));
+    let command_width = visible
+        .iter()
+        .map(|stat| Line::from(stat.command.as_str()).width())
+        .max()
+        .unwrap_or(0)
+        .max(7);
+    let calls_width = visible
+        .iter()
+        .map(|stat| format_with_commas(stat.calls).len())
+        .max()
+        .unwrap_or(0)
+        .max(5);
+    let pair_width = command_width + 1 + calls_width;
+    let pairs = if app.commandstats_compact {
+        ((usize::from(pane.area.width.saturating_sub(2)) + 2) / (pair_width + 2)).max(1)
+    } else {
+        1
+    };
+    let rows = scroll.viewport(visible.len().div_ceil(pairs), pane.page_len(1));
+    let range = rows.start * pairs..(rows.end * pairs).min(visible.len());
+    let mut title = pane.title("Commandstats", &range, visible.len());
+    if node_count > 1 {
+        let _ = write!(title, "  {node_count} nodes");
+    }
+    if app.commandstats_compact {
+        title.push_str("  compact");
+    }
+    let block = pane.block(title);
 
     if stats.is_empty() {
         pane.message(frame, block, "INFO COMMANDSTATS not available".into());
@@ -1031,8 +1089,47 @@ fn draw_commandstats(
         return;
     }
 
+    if app.commandstats_compact {
+        let rows = visible[range]
+            .chunks(pairs)
+            .map(|row| {
+                Row::new(row.iter().map(|stat| {
+                    Cell::from(format!(
+                        "{}{} {:>calls_width$}",
+                        stat.command,
+                        " ".repeat(command_width - Line::from(stat.command.as_str()).width()),
+                        format_with_commas(stat.calls)
+                    ))
+                }))
+            })
+            .collect();
+        let widths = vec![Constraint::Length(u16::try_from(pair_width).unwrap_or(u16::MAX)); pairs];
+        let header = (0..pairs).map(|_| {
+            Cell::from(format!(
+                "{:<command_width$} {:>calls_width$}",
+                "Command", "Calls"
+            ))
+        });
+        frame.render_widget(
+            pane.table(rows, widths, header, block).column_spacing(2),
+            pane.area,
+        );
+        return;
+    }
+
+    draw_commandstats_table(frame, pane, stats, &visible[range], block);
+}
+
+fn draw_commandstats_table(
+    frame: &mut ratatui::Frame<'_>,
+    pane: &PaneCtx<'_>,
+    stats: &[CommandStat],
+    visible: &[&CommandStat],
+    block: Block<'static>,
+) {
+    let app = pane.app;
     let columns = app.visible_commandstats_columns();
-    let rows: Vec<Row<'_>> = visible[range]
+    let rows: Vec<Row<'_>> = visible
         .iter()
         .map(|stat| {
             Row::new(columns.iter().map(|column| {
@@ -1479,7 +1576,7 @@ fn detail_footer_actions(app: &AppState) -> Line<'static> {
         );
     }
     if app.detail_tab == DetailTab::Commandstats {
-        spans.push(Span::raw("  [F7]Columns"));
+        spans.push(Span::raw("  [P]Compact  [F7]Columns"));
     }
     Line::from(spans)
 }
@@ -1491,6 +1588,7 @@ const fn help_bindings() -> &'static [(&'static str, &'static str)] {
         ("H / F1", "Open full help page"),
         ("t / F5", "Cycle Tree, Flat, and Primary view in overview"),
         ("m / M", "Show or hide the top activity metrics panel"),
+        ("p / P", "Toggle compact Commandstats (command/calls pairs)"),
         ("s / F6", "Choose sort column in overview"),
         (
             "c / F7 / v",
@@ -1506,7 +1604,7 @@ const fn help_bindings() -> &'static [(&'static str, &'static str)] {
         ),
         (
             "Space",
-            "Select server for activity totals and batch actions (none = all activity)",
+            "Select server for Commandstats, activity totals and batch actions (none = all activity)",
         ),
         ("N + motion", "Move N steps with h/j/k/l or arrow keys"),
         (
@@ -3122,6 +3220,198 @@ mod tests {
             buffer.content()[summary_idx]
                 .modifier
                 .contains(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn commandstats_compact_toggle_preserves_columns_and_respects_input_context() {
+        let mut app = AppState::new(default_settings(), test_registry());
+        let key = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert!(!handle_commandstats_shortcut(&mut app, key));
+        app.active_view = ActiveView::Detail;
+        assert!(!handle_commandstats_shortcut(&mut app, key));
+        app.detail_tab = DetailTab::Commandstats;
+        let columns = app.visible_commandstats_columns();
+        app.active_pane_mut().scroll.viewport(20, 5);
+        app.active_pane_mut().scroll.to_end();
+        assert!(handle_commandstats_shortcut(&mut app, key));
+        assert!(app.commandstats_compact);
+        assert_eq!(app.active_pane().scroll.offset(), 0);
+        app.active_pane_mut().is_filtering = true;
+        assert!(!handle_commandstats_shortcut(&mut app, key));
+        app.active_pane_mut().is_filtering = false;
+        app.show_help = true;
+        assert!(!handle_commandstats_shortcut(&mut app, key));
+        app.show_help = false;
+        app.open_column_picker();
+        assert!(!handle_commandstats_shortcut(&mut app, key));
+        app.close_overview_modal();
+        assert!(!handle_commandstats_shortcut(
+            &mut app,
+            KeyEvent::new(key.code, KeyModifiers::CONTROL)
+        ));
+        assert!(!handle_commandstats_shortcut(
+            &mut app,
+            KeyEvent::new_with_kind(key.code, key.modifiers, KeyEventKind::Release)
+        ));
+        app.close_detail_view();
+        assert!(app.commandstats_compact);
+        app.active_view = ActiveView::Detail;
+        assert!(handle_commandstats_shortcut(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT)
+        ));
+        assert!(!app.commandstats_compact);
+        assert_eq!(app.visible_commandstats_columns(), columns);
+    }
+
+    #[test]
+    fn commandstats_compact_packs_sorted_rows_and_scrolls_after_resize_and_filter() {
+        let mut app = AppState::new(default_settings(), test_registry());
+        app.active_view = ActiveView::Detail;
+        app.detail_tab = DetailTab::Commandstats;
+        app.commandstats_compact = true;
+        let mut instance = InstanceState::new("a".into(), "127.0.0.1:6379".into());
+        instance.detail.commandstats = (0..31)
+            .rev()
+            .map(|idx| CommandStat {
+                command: format!("cmd{idx:02}"),
+                calls: 100 - idx,
+                usec: 10,
+                usec_per_call: 1.0,
+                additional_metrics: Default::default(),
+            })
+            .collect();
+        app.apply_update(instance);
+        // A 43-cell body fits three 13-cell pairs plus two 2-cell gaps exactly.
+        let mut terminal = Terminal::new(TestBackend::new(45, 13)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let lines = buffer_lines(terminal.backend().buffer());
+        let row = lines.iter().find(|line| line.contains("cmd00")).unwrap();
+        assert!(row.find("cmd00").unwrap() < row.find("cmd01").unwrap());
+        assert!(row.find("cmd01").unwrap() < row.find("cmd02").unwrap());
+        assert!(row.contains("100") && row.contains("99") && row.contains("98"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Commandstats 1-15 / 31"))
+        );
+        assert!(!lines.iter().any(|line| line.contains("Usec")));
+        app.active_pane_mut().scroll.page_by(1);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let lines = buffer_lines(terminal.backend().buffer());
+        assert!(lines.iter().any(|line| line.contains("cmd15")));
+        assert!(!lines.iter().any(|line| line.contains("cmd14")));
+        app.active_pane_mut().scroll.to_end();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            buffer_lines(terminal.backend().buffer())
+                .iter()
+                .any(|line| line.contains("cmd30"))
+        );
+
+        // One cell less only fits two pairs; navigation still reaches the last item.
+        terminal.backend_mut().resize(44, 13);
+        terminal.autoresize().unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.active_pane_mut().scroll.to_start();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let lines = buffer_lines(terminal.backend().buffer());
+        let row = lines.iter().find(|line| line.contains("cmd00")).unwrap();
+        assert!(row.contains("cmd01"));
+        assert!(!row.contains("cmd02"));
+        app.active_pane_mut().scroll.to_end();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            buffer_lines(terminal.backend().buffer())
+                .iter()
+                .any(|line| line.contains("cmd30"))
+        );
+        app.active_pane_mut().filter = "cmd0".into();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.active_pane().scroll.offset(), 0);
+        let lines = buffer_lines(terminal.backend().buffer());
+        assert!(lines.iter().any(|line| line.contains("cmd09")));
+        assert!(!lines.iter().any(|line| line.contains("cmd10")));
+        app.active_pane_mut().filter = "absent".into();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            buffer_lines(terminal.backend().buffer())
+                .iter()
+                .any(|line| line.contains("No commandstats match"))
+        );
+        terminal.backend_mut().resize(5, 8);
+        terminal.autoresize().unwrap();
+        app.active_pane_mut().filter.clear();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn commandstats_totals_follow_selection_including_hidden_nodes() {
+        let mut app = AppState::new(default_settings(), test_registry());
+        app.active_view = ActiveView::Detail;
+        app.detail_tab = DetailTab::Commandstats;
+        for (key, port, calls, usec) in
+            [("a", 6379, 2, 10), ("b", 6380, 8, 10), ("c", 6381, 50, 500)]
+        {
+            let mut instance = InstanceState::new(key.into(), format!("127.0.0.1:{port}"));
+            instance.detail.commandstats = vec![CommandStat {
+                command: "get".into(),
+                calls,
+                usec,
+                usec_per_call: crate::column::u64_to_f64(usec) / crate::column::u64_to_f64(calls),
+                additional_metrics: Default::default(),
+            }];
+            app.apply_update(instance);
+        }
+        app.select_server_range(&["a".into(), "b".into()]);
+        app.filter = "6381".into();
+        app.clamp_selection();
+        assert_eq!(app.selected_key().as_deref(), Some("c"));
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        for compact in [false, true] {
+            app.commandstats_compact = compact;
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let lines = buffer_lines(terminal.backend().buffer());
+            assert!(lines.iter().any(|line| line.contains("2 selected nodes")));
+            assert!(lines.iter().any(|line| line.contains("2 nodes")));
+            let row = lines.iter().find(|line| line.contains("get")).unwrap();
+            assert!(row.contains("10"));
+            assert!(!row.contains("50"));
+            if !compact {
+                assert!(row.contains("20") && row.contains("2.00"));
+            }
+        }
+        app.clear_server_selection();
+        app.select_server_range(&["a".into()]);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let lines = buffer_lines(terminal.backend().buffer());
+        assert!(lines.iter().any(|line| line.contains("127.0.0.1:6379")));
+        assert!(
+            lines
+                .iter()
+                .find(|line| line.contains("get"))
+                .unwrap()
+                .contains('2')
+        );
+        app.clear_server_selection();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let lines = buffer_lines(terminal.backend().buffer());
+        assert!(lines.iter().any(|line| line.contains("127.0.0.1:6381")));
+        assert!(
+            lines
+                .iter()
+                .find(|line| line.contains("get"))
+                .unwrap()
+                .contains("50")
+        );
+        app.select_server_range(&["a".into(), "b".into()]);
+        app.filter = "no visible nodes".into();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            buffer_lines(terminal.backend().buffer())
+                .iter()
+                .any(|line| line.contains("2 selected nodes"))
         );
     }
 

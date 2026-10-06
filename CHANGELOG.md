@@ -2,6 +2,12 @@
 
 ### Added
 
+- Add a session-local `p` / `P` compact Commandstats toggle that fits sorted
+  command/call pairs across each row, with filtering, scrolling, and resizing.
+- Combine Commandstats for Space-selected nodes, including hidden selections,
+  and label totals with the node count. Sum counters and derive `Usec/Call`
+  from total time and calls; fall back to the focused node without selections.
+
 - Add `m` / `M` to show or hide the top activity metrics panel for the current
   session, expanding the server table while keeping metric history updating.
 - Add `-r` / `--refresh-rate` to control the polling interval with durations such as

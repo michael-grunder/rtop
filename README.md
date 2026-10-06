@@ -86,6 +86,7 @@ table format.
 - `m` / `M`: show or hide the top activity metrics panel (overview)
 - `s`: open Sort By to choose from currently visible overview columns
 - `c`: open the column picker for the overview or the active `Commandstats` pane
+- `p` / `P`: toggle compact layout in `Commandstats`
 - `Space`: toggle selection of the focused overview server
 - `a`: enter one username and password and retry all selected servers
 - `K`: open the kill picker for selected servers; `Enter` chooses the action,
@@ -128,6 +129,23 @@ Use `Up/Down` or `j/k` to select a column,
 the picker. At least one column stays visible. Choices apply to all servers'
 commandstats for the current session, independently of overview columns.
 Rows remain sorted by calls even when the `Calls` column is hidden.
+
+Press `p` in `Commandstats` to toggle a compact grid of `Command Calls` pairs,
+fitting as many pairs per row as the pane width allows. Commands remain sorted
+by calls descending, left to right then top to bottom (ties sort by name).
+Filtering and scrolling, including page and first/last-row navigation, still
+work; resizing recalculates the grid. The toggle lasts for the session and
+preserves your normal column choices. Toggling starts at the top of the pane.
+
+Commandstats uses the overview's Space-selected nodes, including selections
+hidden by the overview filter or view. With no selections it uses the focused
+node. Multiple selections show combined totals by command and a node count in
+the detail pane. `Calls`, `Usec`, and additional unsigned integer counters are
+summed; `Usec/Call` is total microseconds divided by total calls (zero for no
+calls). Missing commands contribute zero; missing extra metrics contribute
+nothing, and non-counter extra values show `-` in combined totals. Totals use
+the latest stored samples from each node, which may have different uptimes or
+counter reset times; they are server execution counts, not unique client requests.
 
 Prefix a motion with a positive count: `10j` moves down ten rows, `3k` moves
 up three, and `2l` advances two detail tabs. Counts also work with arrow keys;

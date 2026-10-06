@@ -333,6 +333,7 @@ pub struct AppState {
     pub column_picker_reorder_mode: bool,
     column_picker_target: ColumnPickerTarget,
     pub commandstats_columns: ColumnSet<CommandstatsColumn>,
+    pub commandstats_compact: bool,
     pub overview_columns: ColumnSet<String>,
     pub filter: String,
     pub is_filtering: bool,
@@ -382,6 +383,7 @@ impl AppState {
                 CommandstatsColumn::DEFAULT.to_vec(),
                 CommandstatsColumn::DEFAULT,
             ),
+            commandstats_compact: false,
             overview_columns: ColumnSet::new(
                 column_registry.available_overview_columns(),
                 column_registry.visible_overview.clone(),
