@@ -103,6 +103,9 @@
 
 ### Changed
 
+- Show `CONFIG RESETSTAT` results only when at least one node fails; close
+  the confirmation immediately and let successful resets finish silently.
+
 - Size help popups to their content and keep detail help focused on pane
   controls, leaving global navigation in overview help. Simplify Commandstats
   reset confirmation to a server count and `y/N`, with Enter defaulting to No.

@@ -159,7 +159,8 @@ The compact confirmation shows only the server count: `y`/`Y` confirms;
 This sends `CONFIG RESETSTAT`, which resets server-wide statistics including
 command, error, hit/miss, and connection counters, not just the displayed rows.
 Each node is attempted independently using its credentials and configured
-timeouts; results report success or failure per node and stats are refreshed.
+timeouts and stats are refreshed. Results appear only if at least one node
+fails, reporting success or failure per node; successful resets are silent.
 
 Prefix a motion with a positive count: `10j` moves down ten rows, `3k` moves
 up three, and `2l` advances two detail tabs. Counts also work with arrow keys;

@@ -102,6 +102,9 @@ impl Feeds {
                 PollerUpdate::State(state) => app.apply_update(*state),
                 PollerUpdate::Remove { key } => app.remove_instance(&key),
                 PollerUpdate::ResetStatsComplete { results } => {
+                    if results.iter().all(|(_, result)| result.is_ok()) {
+                        continue;
+                    }
                     app.reset_stats_result = results
                         .into_iter()
                         .map(|(key, result)| match result {
@@ -285,9 +288,7 @@ fn handle_key(app: &mut AppState, key: KeyEvent, feeds: &Feeds) -> Result<()> {
                     },
                     "reset statistics",
                 )?;
-                app.reset_stats_result = "Resetting statistics…".to_string();
-                app.popup_scroll.to_start();
-                app.overview_modal = OverviewModal::ResetStatsResult;
+                app.close_overview_modal();
             } else if key.code == KeyCode::Enter
                 || (app.overview_modal == OverviewModal::ResetStatsConfirmation
                     && matches!(key.code, KeyCode::Char('n' | 'N')))
@@ -2743,7 +2744,8 @@ mod tests {
         assert!(
             matches!(requests.try_recv().unwrap(), PollerRequest::ResetStats { keys } if keys == expected)
         );
-        super::handle_key(&mut app, press(KeyCode::Enter), &feeds).unwrap();
+        assert_eq!(app.overview_modal, OverviewModal::None);
+        assert!(app.reset_stats_result.is_empty());
         assert!(requests.try_recv().is_err());
         super::handle_key(&mut app, press(KeyCode::Char('R')), &feeds).unwrap();
         assert_eq!(app.reset_stats_targets, ["127.0.0.1:6381"]);
@@ -2794,6 +2796,27 @@ mod tests {
         );
         assert_eq!(app.overview_modal, OverviewModal::ResetStatsConfirmation);
         assert_eq!(app.reset_stats_targets.len(), 2);
+    }
+
+    #[test]
+    fn successful_reset_does_not_show_results() {
+        let mut app = app_with_selected_servers();
+        let (mut feeds, _) = test_feeds();
+        let (updates, receiver) = mpsc::channel(1);
+        feeds.updates_rx = receiver;
+        updates
+            .try_send(crate::poller::PollerUpdate::ResetStatsComplete {
+                results: vec![
+                    ("node-a".to_string(), Ok(())),
+                    ("node-b".to_string(), Ok(())),
+                ],
+            })
+            .unwrap();
+        feeds.drain_into(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.overview_modal, OverviewModal::None);
+        assert!(app.reset_stats_result.is_empty());
     }
 
     #[test]
