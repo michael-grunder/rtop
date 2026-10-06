@@ -81,7 +81,8 @@ table format.
 - `q`: quit from the overview, or close the active overlay window
 - `Ctrl+C`: quit immediately
 - `H` / `F1` / `?`: open context-specific help in a popup; overview help covers
-  navigation and selection, while detail help lists the active pane's controls.
+  global keys, navigation and selection. Compact detail help lists only the
+  active pane's controls, filtering, and tab switching.
   Use `j`/`k`, arrows, `PgUp`/`PgDn`, or `Home`/`End` to scroll; `Esc`/`q` closes it.
 - `f` or `/`: edit the overview filter, keeping existing text
 - `t`: cycle Tree / Flat / Primary (overview)
@@ -153,7 +154,8 @@ counter reset times; they are server execution counts, not unique client request
 
 Press `r` / `R` in Commandstats to reset statistics on exactly those nodes,
 including hidden selections (or the focused node when nothing is selected).
-The confirmation lists the target nodes: `Enter` confirms, `Esc`/`q` cancels.
+The compact confirmation shows only the server count: `y`/`Y` confirms;
+`Enter`, `n`/`N`, or `Esc`/`q` cancels (the default is No).
 This sends `CONFIG RESETSTAT`, which resets server-wide statistics including
 command, error, hit/miss, and connection counters, not just the displayed rows.
 Each node is attempted independently using its credentials and configured

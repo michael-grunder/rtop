@@ -103,6 +103,10 @@
 
 ### Changed
 
+- Size help popups to their content and keep detail help focused on pane
+  controls, leaving global navigation in overview help. Simplify Commandstats
+  reset confirmation to a server count and `y/N`, with Enter defaulting to No.
+
 - Remove the duplicate server strip from the activity panel, returning one row
   to the main table. Activity totals still follow the table's server selections.
 
