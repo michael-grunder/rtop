@@ -101,6 +101,19 @@ impl Feeds {
             match update {
                 PollerUpdate::State(state) => app.apply_update(*state),
                 PollerUpdate::Remove { key } => app.remove_instance(&key),
+                PollerUpdate::ResetStatsComplete { results } => {
+                    app.reset_stats_result = results
+                        .into_iter()
+                        .map(|(key, result)| match result {
+                            Ok(()) => format!("{key}: statistics reset"),
+                            Err(error) => format!("{key}: reset failed: {error}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if app.overview_modal == OverviewModal::ResetStatsResult {
+                        app.popup_scroll.to_start();
+                    }
+                }
             }
         }
         while let Ok(event) = self.discovery_rx.try_recv() {
@@ -230,6 +243,10 @@ fn handle_key(app: &mut AppState, key: KeyEvent, feeds: &Feeds) -> Result<()> {
     if handle_overlay_quit_key(app, key) {
         return Ok(());
     }
+    if app.show_help {
+        handle_help_key(app, key);
+        return Ok(());
+    }
     if app.is_filtering {
         handle_overview_filter_key(app, key);
         return Ok(());
@@ -253,6 +270,31 @@ fn handle_key(app: &mut AppState, key: KeyEvent, feeds: &Feeds) -> Result<()> {
     if handle_kill_key(app, key, feeds)? {
         return Ok(());
     }
+    if matches!(
+        app.overview_modal,
+        OverviewModal::ResetStatsConfirmation | OverviewModal::ResetStatsResult
+    ) {
+        scroll_popup(app, key);
+        if key.kind == KeyEventKind::Press
+            && !has_command_modifier(key)
+            && key.code == KeyCode::Enter
+        {
+            if app.overview_modal == OverviewModal::ResetStatsConfirmation {
+                feeds.send_required(
+                    PollerRequest::ResetStats {
+                        keys: app.reset_stats_targets.clone(),
+                    },
+                    "reset statistics",
+                )?;
+                app.reset_stats_result = "Resetting statistics…".to_string();
+                app.popup_scroll.to_start();
+                app.overview_modal = OverviewModal::ResetStatsResult;
+            } else {
+                app.close_overview_modal();
+            }
+        }
+        return Ok(());
+    }
     if key.kind != KeyEventKind::Press {
         return Ok(());
     }
@@ -264,8 +306,10 @@ fn handle_key(app: &mut AppState, key: KeyEvent, feeds: &Feeds) -> Result<()> {
     }
 
     match key.code {
-        KeyCode::F(1) | KeyCode::Char('H') => app.open_help_view(),
-        KeyCode::Char('?') => app.show_help = !app.show_help,
+        KeyCode::F(1) | KeyCode::Char('H' | '?') => {
+            app.show_help = true;
+            app.popup_scroll.to_start();
+        }
         KeyCode::Char('r' | 'R') => feeds.send(PollerRequest::RefreshAll),
         KeyCode::Enter
             if app.active_view == ActiveView::Overview && app.selected_key().is_some() =>
@@ -273,7 +317,6 @@ fn handle_key(app: &mut AppState, key: KeyEvent, feeds: &Feeds) -> Result<()> {
             app.active_view = ActiveView::Detail;
         }
         KeyCode::Char('q') | KeyCode::Esc if handle_primary_view_quit_key(app, key) => {}
-        KeyCode::Esc if app.active_view == ActiveView::Help => app.close_help_view(),
         _ => {}
     }
     Ok(())
@@ -407,6 +450,13 @@ fn handle_commandstats_shortcut(app: &mut AppState, key: KeyEvent) -> bool {
         return false;
     }
     match key.code {
+        KeyCode::Char('r' | 'R') => {
+            app.reset_stats_targets = app.action_target_keys();
+            if !app.reset_stats_targets.is_empty() {
+                app.popup_scroll.to_start();
+                app.overview_modal = OverviewModal::ResetStatsConfirmation;
+            }
+        }
         KeyCode::F(7) | KeyCode::Char('c' | 'C' | 'v' | 'V') => app.open_column_picker(),
         KeyCode::Char('p' | 'P') => {
             app.commandstats_compact = !app.commandstats_compact;
@@ -627,6 +677,15 @@ const fn is_shift_modifier(modifier: ModifierKeyCode) -> bool {
 // ---------------------------------------------------------------------------
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut AppState) {
+    if app.overview_modal == OverviewModal::None
+        && !app.reset_stats_result.is_empty()
+        && !app.show_help
+        && !app.is_filtering
+        && app.editing_pane().is_none()
+    {
+        app.overview_modal = OverviewModal::ResetStatsResult;
+        app.popup_scroll.to_start();
+    }
     app.sample_activity(std::time::Instant::now());
     let area = frame.area();
     frame.render_widget(Block::default().style(base_style(app)), area);
@@ -647,7 +706,6 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut AppState) {
             draw_overview(frame, app, table);
         }
         ActiveView::Detail => draw_detail(frame, app, main),
-        ActiveView::Help => draw_help_page(frame, app, main),
     }
     draw_status_bar(frame, app, status);
 
@@ -657,6 +715,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut AppState) {
         OverviewModal::ColumnPicker => draw_column_picker(frame, area, app),
         OverviewModal::KillPicker => draw_kill_picker(frame, area, app),
         OverviewModal::KillConfirmation => draw_kill_confirmation(frame, area, app),
+        OverviewModal::ResetStatsConfirmation | OverviewModal::ResetStatsResult => {
+            draw_reset_stats_popup(frame, area, app);
+        }
         OverviewModal::AuthForm => draw_auth_form(frame, area, app),
     }
 
@@ -1509,17 +1570,6 @@ fn format_with_commas(value: u64) -> String {
     out
 }
 
-fn draw_help_page(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
-    let rows: Vec<Row<'_>> = help_bindings()
-        .iter()
-        .map(|(keys, action)| Row::new([*keys, *action]))
-        .collect();
-    let table = Table::new(rows, [Constraint::Length(24), Constraint::Min(20)])
-        .header(Row::new(["Keys", "Action"]).style(base_style(app).add_modifier(Modifier::BOLD)))
-        .block(bordered(app, "Help (Esc to go back)"));
-    frame.render_widget(table, area);
-}
-
 fn draw_status_bar(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
     let [prompt_area, actions_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
@@ -1581,24 +1631,21 @@ fn detail_footer_actions(app: &AppState) -> Line<'static> {
         );
     }
     if app.detail_tab == DetailTab::Commandstats {
-        spans.push(Span::raw("  [P]Compact  [F7]Columns"));
+        spans.push(Span::raw("  [P]Compact  [F7]Columns  [R]eset"));
     }
+    spans.push(Span::raw("  [H]elp"));
     Line::from(spans)
 }
 
-const fn help_bindings() -> &'static [(&'static str, &'static str)] {
+const fn overview_help_bindings() -> &'static [(&'static str, &'static str)] {
     &[
         ("q", "Quit, or close the active overlay"),
         ("Ctrl+C", "Quit immediately"),
-        ("H / F1", "Open full help page"),
+        ("H / F1", "Open help for the current view"),
         ("t / F5", "Cycle Tree, Flat, and Primary view in overview"),
         ("m / M", "Show or hide the top activity metrics panel"),
-        ("p / P", "Toggle compact Commandstats (command/calls pairs)"),
         ("s / F6", "Choose sort column in overview"),
-        (
-            "c / F7 / v",
-            "Toggle and reorder overview or Commandstats columns",
-        ),
+        ("c / F7 / v", "Toggle and reorder overview columns"),
         (
             "a / F8",
             "Enter credentials for selected servers (or the focused server)",
@@ -1636,29 +1683,9 @@ const fn help_bindings() -> &'static [(&'static str, &'static str)] {
             "Close overlay/filter/detail/help; clear selection, then quit",
         ),
         ("Enter", "Open detail view for the focused server"),
-        ("Tab/Right/l", "Next detail panel"),
-        ("Shift+Tab/Left/h", "Previous detail panel"),
-        (
-            "S / I / C / B / K",
-            "Jump to Summary, Info Raw, Commandstats, Bigkeys, or Hotkeys in detail",
-        ),
-        (
-            "Up/Down/j/k",
-            "Move focus in overview or scroll detail panes with long content",
-        ),
+        ("Up/Down/j/k", "Move focus in overview"),
         ("?", "Toggle help overlay"),
-        (
-            "C / N",
-            "Start CPU or NET hotkeys sampling while on Hotkeys",
-        ),
-        (
-            "X",
-            "Stop active Hotkeys sampling early, or reset the Hotkeys pane when idle/complete",
-        ),
-        (
-            "r / R",
-            "Refresh now, or rerun Bigkeys/Hotkeys while on those panes",
-        ),
+        ("r / R", "Refresh now"),
         ("F3", "Start search input in overview"),
         (
             "F4",
@@ -1672,10 +1699,7 @@ const fn help_bindings() -> &'static [(&'static str, &'static str)] {
             "o / O",
             "Toggle host rendering (auto hide when all hosts are the same)",
         ),
-        (
-            "/",
-            "Start filter input in overview or the active detail pane",
-        ),
+        ("/", "Start filter input in overview"),
         ("Backspace", "Delete filter character while editing"),
     ]
 }
@@ -1700,21 +1724,151 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-fn draw_help_overlay(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
-    let popup = centered_percent(area, 80, 70);
-    let text = help_bindings()
+fn help_bindings(app: &AppState) -> Vec<(&'static str, &'static str)> {
+    let view = app.active_view;
+    if view != ActiveView::Detail {
+        return overview_help_bindings().to_vec();
+    }
+    let mut bindings = vec![
+        ("H / F1 / ?", "Open help for this panel"),
+        ("Esc", "Return to overview"),
+        ("Ctrl+C", "Quit immediately"),
+        ("Up/Down/j/k", "Scroll this panel"),
+        ("PgUp / PgDn", "Scroll a page at a time"),
+        (
+            "g / G, Home / End",
+            "Jump to first or last row; NG jumps to row N",
+        ),
+        ("N + motion", "Move N steps with h/j/k/l or arrow keys"),
+        ("Tab/Right/l", "Next detail panel"),
+        ("Shift+Tab/Left/h", "Previous detail panel"),
+        (
+            "S / I / B / K",
+            "Open Summary / Info Raw / Bigkeys / Hotkeys",
+        ),
+        ("/", "Edit this panel's filter"),
+        (
+            "Enter / Esc",
+            "Finish filter editing; Backspace deletes a character",
+        ),
+    ];
+    if !matches!(app.detail_tab, DetailTab::Commandstats | DetailTab::Hotkeys) {
+        bindings.push(("C", "Open Commandstats"));
+    }
+    bindings.extend_from_slice(match app.detail_tab {
+        DetailTab::Commandstats => &[
+            (
+                "c / C / v / V / F7",
+                "Choose columns; Space/Enter toggles, Shift+Up/Down reorders",
+            ),
+            ("p / P", "Toggle compact command/calls layout"),
+            (
+                "r / R",
+                "Reset statistics on all nodes shown here (confirmation required)",
+            ),
+        ][..],
+        DetailTab::Bigkeys => &[("r / R", "Rerun the Bigkeys scan")][..],
+        DetailTab::Hotkeys => &[
+            ("C / N", "Start CPU / NET hotkeys sampling"),
+            (
+                "X",
+                "Stop sampling early, or reset this panel when idle/complete",
+            ),
+            ("r / R", "Rerun sampling with the last selected metric"),
+        ][..],
+        DetailTab::Summary | DetailTab::InfoRaw => &[("r / R", "Refresh now")][..],
+    });
+    bindings
+}
+
+fn scroll_popup(app: &mut AppState, key: KeyEvent) {
+    if key.kind == KeyEventKind::Release || has_command_modifier(key) {
+        return;
+    }
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => app.popup_scroll.scroll_by(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.popup_scroll.scroll_by(1),
+        KeyCode::PageUp => app.popup_scroll.page_by(-1),
+        KeyCode::PageDown => app.popup_scroll.page_by(1),
+        KeyCode::Home | KeyCode::Char('g') => app.popup_scroll.to_start(),
+        KeyCode::End | KeyCode::Char('G') => app.popup_scroll.to_end(),
+        _ => {}
+    }
+}
+
+fn handle_help_key(app: &mut AppState, key: KeyEvent) {
+    if key.kind == KeyEventKind::Press
+        && matches!(
+            key.code,
+            KeyCode::Char('H' | '?' | 'q') | KeyCode::F(1) | KeyCode::Esc
+        )
+    {
+        app.show_help = false;
+    } else {
+        scroll_popup(app, key);
+    }
+}
+
+fn draw_help_overlay(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) {
+    let view = app.active_view;
+    let context = if view == ActiveView::Detail {
+        app.detail_tab.title()
+    } else {
+        "Overview"
+    };
+    let title = format!("{context} Help — ↑↓/PgUp/PgDn scroll; Esc/q closes");
+    let text = help_bindings(app)
         .iter()
         .map(|(keys, description)| format!("{keys}: {description}"))
         .collect::<Vec<_>>()
         .join("\n");
+    draw_text_popup(frame, app, area, title, text);
+}
+
+fn draw_text_popup(
+    frame: &mut ratatui::Frame<'_>,
+    app: &mut AppState,
+    area: Rect,
+    title: String,
+    text: String,
+) {
+    let popup = centered_percent(area, 90, 85);
+    let paragraph = Paragraph::new(text)
+        .style(base_style(app))
+        .wrap(Wrap { trim: false });
+    let lines = paragraph.line_count(popup.width.saturating_sub(2));
+    let range = app
+        .popup_scroll
+        .viewport(lines, usize::from(popup.height.saturating_sub(2)));
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(text)
-            .style(base_style(app))
-            .block(bordered(app, "Help"))
-            .wrap(Wrap { trim: false }),
+        paragraph
+            .scroll((u16::try_from(range.start).unwrap_or(u16::MAX), 0))
+            .block(bordered(app, title)),
         popup,
     );
+}
+
+fn draw_reset_stats_popup(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut AppState) {
+    let (title, text) = if app.overview_modal == OverviewModal::ResetStatsConfirmation {
+        (
+            "Confirm statistics reset",
+            format!(
+                "Run CONFIG RESETSTAT on {} nodes?\nThis resets server statistics, including command, error, hit/miss and connection counters.\n\n{}\n\nEnter confirms; Esc or q cancels. ↑↓/PgUp/PgDn scroll.",
+                app.reset_stats_targets.len(),
+                app.reset_stats_targets.join("\n")
+            ),
+        )
+    } else {
+        (
+            "Statistics reset results",
+            format!(
+                "{}\n\nEnter/Esc/q closes; ↑↓/PgUp/PgDn scroll.",
+                app.reset_stats_result
+            ),
+        )
+    };
+    draw_text_popup(frame, app, area, title.to_string(), text);
 }
 
 /// Single-column selectable list used by every picker dialog.
@@ -1987,7 +2141,7 @@ mod tests {
         detail_tabs_widget, draw, draw_status_bar, edit_text_input, format_aligned_rows,
         format_with_commas, handle_column_picker_key, handle_commandstats_shortcut,
         handle_overlay_quit_key, handle_overview_shortcut, handle_primary_view_quit_key,
-        help_bindings, is_force_quit_key, selected_signal_supported,
+        is_force_quit_key, overview_help_bindings, selected_signal_supported,
     };
     use crate::app::{ActiveView, AppState, DetailTab, OverviewModal};
     use crate::column::{Align, CellCtx, Column, SortKey, WidthHint};
@@ -2166,7 +2320,11 @@ mod tests {
             let lines = buffer_lines(terminal.backend().buffer());
             assert_eq!(lines[0].contains("Activity |"), panel_height > 0);
         }
-        assert!(help_bindings().iter().any(|(keys, _)| *keys == "m / M"));
+        assert!(
+            overview_help_bindings()
+                .iter()
+                .any(|(keys, _)| *keys == "m / M")
+        );
     }
 
     #[test]
@@ -2435,13 +2593,215 @@ mod tests {
     }
 
     #[test]
-    fn help_bindings_include_help_page_shortcut() {
-        assert!(help_bindings().iter().any(|(keys, _)| *keys == "H / F1"));
+    fn help_is_contextual_scrollable_and_blocks_underlying_commands() {
+        let mut app = app_with_selected_servers();
+        let (feeds, mut requests) = test_feeds();
+        let mut terminal = Terminal::new(TestBackend::new(64, 16)).unwrap();
+        for view in [ActiveView::Overview, ActiveView::Detail] {
+            app.active_view = view;
+            for tab in DetailTab::ALL {
+                app.detail_tab = tab;
+                let bindings = super::help_bindings(&app);
+                assert_eq!(
+                    bindings.iter().any(|(keys, _)| *keys == "Space"),
+                    view == ActiveView::Overview
+                );
+                assert_eq!(
+                    bindings.iter().any(|(keys, _)| *keys == "X"),
+                    view == ActiveView::Detail && tab == DetailTab::Hotkeys
+                );
+                assert_eq!(
+                    bindings
+                        .iter()
+                        .any(|(_, text)| text.contains("Reset statistics")),
+                    view == ActiveView::Detail && tab == DetailTab::Commandstats
+                );
+                for code in [KeyCode::Char('H'), KeyCode::F(1), KeyCode::Char('?')] {
+                    super::handle_key(&mut app, KeyEvent::new(code, KeyModifiers::NONE), &feeds)
+                        .unwrap();
+                    assert!(app.show_help);
+                    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                    let context = if view == ActiveView::Overview {
+                        "Overview"
+                    } else {
+                        tab.title()
+                    };
+                    assert!(
+                        buffer_lines(terminal.backend().buffer())
+                            .join("\n")
+                            .contains(&format!("{context} Help"))
+                    );
+                    for blocked in ['R', '/', ' ', 'C', 'p'] {
+                        super::handle_key(
+                            &mut app,
+                            KeyEvent::new(KeyCode::Char(blocked), KeyModifiers::NONE),
+                            &feeds,
+                        )
+                        .unwrap();
+                    }
+                    assert!(requests.try_recv().is_err());
+                    assert_eq!(app.overview_modal, OverviewModal::None);
+                    assert_eq!(app.detail_tab, tab);
+                    assert!(!app.is_filtering);
+                    assert!(app.editing_pane().is_none());
+                    super::handle_key(
+                        &mut app,
+                        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+                        &feeds,
+                    )
+                    .unwrap();
+                    assert!(app.popup_scroll.offset() > 0);
+                    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                    super::handle_key(
+                        &mut app,
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                        &feeds,
+                    )
+                    .unwrap();
+                    assert!(!app.show_help);
+                    assert_eq!(app.active_view, view);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn commandstats_reset_confirms_captured_nodes_and_can_be_cancelled() {
+        let mut app = app_with_selected_servers();
+        let expected = app.action_target_keys();
+        app.filter = "6381".to_string(); // Both selected nodes are hidden.
+        app.clamp_selection();
+        app.active_view = ActiveView::Detail;
+        app.detail_tab = DetailTab::Commandstats;
+        let (feeds, mut requests) = test_feeds();
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for cancel in [KeyCode::Esc, KeyCode::Char('q')] {
+            super::handle_key(&mut app, press(KeyCode::Char('R')), &feeds).unwrap();
+            assert_eq!(app.overview_modal, OverviewModal::ResetStatsConfirmation);
+            assert_eq!(app.reset_stats_targets, expected);
+            assert!(requests.try_recv().is_err());
+            super::handle_key(&mut app, press(cancel), &feeds).unwrap();
+            assert_eq!(app.overview_modal, OverviewModal::None);
+            assert_eq!(app.reset_stats_targets, Vec::<String>::new());
+            assert!(requests.try_recv().is_err());
+        }
+        super::handle_key(&mut app, press(KeyCode::Char('r')), &feeds).unwrap();
+        app.clear_server_selection(); // Confirmation must retain its original targets.
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            super::handle_key(
+                &mut app,
+                KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind),
+                &feeds,
+            )
+            .unwrap();
+            assert!(requests.try_recv().is_err());
+        }
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("CONFIG RESETSTAT on 2 nodes"));
+        for key in &expected {
+            assert!(rendered.contains(key));
+        }
+        super::handle_key(&mut app, press(KeyCode::Enter), &feeds).unwrap();
+        assert!(
+            matches!(requests.try_recv().unwrap(), PollerRequest::ResetStats { keys } if keys == expected)
+        );
+        super::handle_key(&mut app, press(KeyCode::Enter), &feeds).unwrap();
+        assert!(requests.try_recv().is_err());
+        super::handle_key(&mut app, press(KeyCode::Char('R')), &feeds).unwrap();
+        assert_eq!(app.reset_stats_targets, ["127.0.0.1:6381"]);
+    }
+
+    #[test]
+    fn commandstats_reset_respects_input_context_and_queue_errors() {
+        let mut app = app_with_selected_servers();
+        app.active_view = ActiveView::Detail;
+        app.detail_tab = DetailTab::Commandstats;
+        let (feeds, mut requests) = test_feeds();
+        let key = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE);
+        app.start_active_detail_filter_input(false);
+        super::handle_key(&mut app, key, &feeds).unwrap();
+        assert_eq!(app.active_pane().filter, "R");
+        app.active_pane_mut().is_filtering = false;
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            assert!(!handle_commandstats_shortcut(
+                &mut app,
+                KeyEvent::new_with_kind(key.code, key.modifiers, kind)
+            ));
+        }
+        assert!(!handle_commandstats_shortcut(
+            &mut app,
+            KeyEvent::new(key.code, KeyModifiers::CONTROL)
+        ));
+        assert!(requests.try_recv().is_err());
+        super::handle_key(&mut app, key, &feeds).unwrap();
+        feeds.send(PollerRequest::RefreshAll); // Fill the request queue.
+        assert!(
+            super::handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &feeds
+            )
+            .is_err()
+        );
+        assert_eq!(app.overview_modal, OverviewModal::ResetStatsConfirmation);
+        assert_eq!(app.reset_stats_targets.len(), 2);
+    }
+
+    #[test]
+    fn reset_results_wait_for_active_input_and_show_each_node_outcome() {
+        let mut app = app_with_selected_servers();
+        let (mut feeds, _) = test_feeds();
+        let (updates, receiver) = mpsc::channel(1);
+        feeds.updates_rx = receiver;
+        app.open_auth_form();
+        updates
+            .try_send(crate::poller::PollerUpdate::ResetStatsComplete {
+                results: vec![
+                    ("node-a".to_string(), Ok(())),
+                    ("node-b".to_string(), Err("NOPERM".to_string())),
+                ],
+            })
+            .unwrap();
+        feeds.drain_into(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.is_auth_form_open());
+        app.close_auth_form();
+        app.is_filtering = true;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.overview_modal, OverviewModal::None);
+        app.is_filtering = false;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.overview_modal, OverviewModal::ResetStatsResult);
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("node-a: statistics reset"));
+        assert!(rendered.contains("node-b: reset failed: NOPERM"));
+        app.close_overview_modal();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.overview_modal, OverviewModal::None);
+    }
+
+    #[test]
+    fn help_bindings_include_help_popup_shortcut() {
+        assert!(
+            overview_help_bindings()
+                .iter()
+                .any(|(keys, _)| *keys == "H / F1")
+        );
     }
 
     #[test]
     fn help_bindings_include_hotkeys_stop_or_reset_shortcut() {
-        assert!(help_bindings().iter().any(|(keys, _)| *keys == "X"));
+        let mut app = AppState::new(default_settings(), test_registry());
+        app.active_view = ActiveView::Detail;
+        app.detail_tab = DetailTab::Hotkeys;
+        assert!(
+            super::help_bindings(&app)
+                .iter()
+                .any(|(keys, _)| *keys == "X")
+        );
     }
 
     #[test]
@@ -2457,14 +2817,18 @@ mod tests {
             "K / F9",
             "f or /",
         ] {
-            assert!(help_bindings().iter().any(|(keys, _)| *keys == binding));
+            assert!(
+                overview_help_bindings()
+                    .iter()
+                    .any(|(keys, _)| *keys == binding)
+            );
         }
     }
 
     #[test]
     fn help_bindings_describe_three_view_cycle() {
         assert!(
-            help_bindings()
+            overview_help_bindings()
                 .iter()
                 .any(|(keys, description)| *keys == "t / F5"
                     && description.contains("Tree, Flat, and Primary"))
@@ -2562,14 +2926,12 @@ mod tests {
         let shortcuts = [
             'a', 'A', 'f', 'F', '/', 't', 'T', 's', 'S', 'c', 'C', 'k', 'K', 'm', 'M',
         ];
-        for view in [ActiveView::Detail, ActiveView::Help] {
-            app.active_view = view;
-            for ch in shortcuts {
-                assert!(!handle_overview_shortcut(
-                    &mut app,
-                    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
-                ));
-            }
+        app.active_view = ActiveView::Detail;
+        for ch in shortcuts {
+            assert!(!handle_overview_shortcut(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+            ));
         }
         app.active_view = ActiveView::Overview;
         for modal in [
@@ -3290,7 +3652,7 @@ mod tests {
                 calls: 100 - idx,
                 usec: 10,
                 usec_per_call: 1.0,
-                additional_metrics: Default::default(),
+                additional_metrics: std::collections::BTreeMap::default(),
             })
             .collect();
         app.apply_update(instance);
@@ -3371,7 +3733,7 @@ mod tests {
                 calls,
                 usec,
                 usec_per_call: crate::column::u64_to_f64(usec) / crate::column::u64_to_f64(calls),
-                additional_metrics: Default::default(),
+                additional_metrics: std::collections::BTreeMap::default(),
             }];
             app.apply_update(instance);
         }
@@ -3450,13 +3812,11 @@ mod tests {
                 }
             }
             app.detail_tab = DetailTab::Commandstats;
-            for view in [ActiveView::Overview, ActiveView::Help] {
-                app.active_view = view;
-                assert!(!handle_commandstats_shortcut(
-                    &mut app,
-                    KeyEvent::new(code, KeyModifiers::NONE)
-                ));
-            }
+            app.active_view = ActiveView::Overview;
+            assert!(!handle_commandstats_shortcut(
+                &mut app,
+                KeyEvent::new(code, KeyModifiers::NONE)
+            ));
         }
     }
 

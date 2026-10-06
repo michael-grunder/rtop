@@ -95,7 +95,10 @@ mod tests {
         assert_eq!(get.additional_metrics["label"], "-");
         assert_eq!(totals[1], second[1]);
         assert_eq!(totals[2], first[1]);
-        assert!(aggregate_commandstats([]).is_empty());
+        assert_eq!(
+            aggregate_commandstats([]),
+            Vec::<crate::model::CommandStat>::new()
+        );
 
         let mut huge = first[0].clone();
         huge.calls = u64::MAX;

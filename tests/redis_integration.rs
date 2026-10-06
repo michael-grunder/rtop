@@ -28,6 +28,140 @@ fn runtime_settings() -> RuntimeSettings {
     }
 }
 
+/// Dedicated temporary servers: this test must never reset a user's Redis statistics.
+#[cfg(unix)]
+#[tokio::test]
+async fn reset_stats_attempts_each_selected_node_and_refreshes_commandstats() {
+    use std::process::{Child, Command, Stdio};
+
+    struct Server(Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.0.kill().expect("stop test Redis");
+            self.0.wait().expect("reap test Redis");
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut servers = Vec::new();
+    let mut targets = Vec::new();
+    for index in 0..3 {
+        let path = dir.path().join(format!("redis-{index}.sock"));
+        let mut command = Command::new("redis-server");
+        command
+            .args([
+                "--port",
+                "0",
+                "--save",
+                "",
+                "--appendonly",
+                "no",
+                "--unixsocket",
+            ])
+            .arg(&path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if index == 0 {
+            command.args(["--rename-command", "CONFIG", ""]);
+        }
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                skip_unreachable(
+                    "isolated reset statistics (redis-server not installed)",
+                    &error.to_string(),
+                );
+                return;
+            }
+            Err(error) => panic!("start test Redis: {error}"),
+        };
+        servers.push(Server(child));
+        let target = Target {
+            addr: path.to_string_lossy().into_owned(),
+            protocol: TargetProtocol::Unix,
+            ..standalone_target()
+        };
+        let client = redis::Client::open(format!("redis+unix://{}", target.addr)).unwrap();
+        let mut conn = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(conn) = client.get_multiplexed_async_connection().await {
+                    break conn;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("test Redis ready");
+        redis::cmd("ECHO")
+            .arg("before reset")
+            .query_async::<String>(&mut conn)
+            .await
+            .unwrap();
+        targets.push(target);
+    }
+
+    let (mut updates, requests) = start(targets.clone(), runtime_settings());
+    for _ in &targets {
+        let update = timeout(Duration::from_secs(5), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let PollerUpdate::State(state) = update else {
+            panic!("initial state");
+        };
+        assert!(
+            state
+                .detail
+                .commandstats
+                .iter()
+                .any(|stat| stat.command == "echo")
+        );
+    }
+    requests
+        .send(PollerRequest::ResetStats {
+            keys: targets[..2]
+                .iter()
+                .map(|target| target.addr.clone())
+                .collect(),
+        })
+        .await
+        .unwrap();
+    for (index, target) in targets[..2].iter().enumerate() {
+        let state = recv_state(&mut updates, &target.addr).await;
+        assert_eq!(state.status, rtop::model::Status::Ok);
+        assert_eq!(
+            state
+                .detail
+                .commandstats
+                .iter()
+                .any(|stat| stat.command == "echo"),
+            index == 0
+        );
+    }
+    let update = timeout(Duration::from_secs(5), updates.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let PollerUpdate::ResetStatsComplete { results } = update else {
+        panic!("reset results");
+    };
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0, targets[0].addr);
+    assert!(results[0].1.is_err());
+    assert_eq!(results[1], (targets[1].addr.clone(), Ok(())));
+
+    // The third, unselected node retains its statistics.
+    let client = redis::Client::open(format!("redis+unix://{}", targets[2].addr)).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let info = redis::cmd("INFO")
+        .arg("COMMANDSTATS")
+        .query_async::<String>(&mut conn)
+        .await
+        .unwrap();
+    assert!(info.contains("cmdstat_echo:"));
+    drop(requests);
+}
+
 fn standalone_target() -> Target {
     Target {
         alias: Some("standalone".to_string()),
@@ -64,7 +198,9 @@ async fn recv_state(
             .expect("poller update channel closed unexpectedly");
         match update {
             PollerUpdate::State(state) if state.key == key => return *state,
-            PollerUpdate::State(_) | PollerUpdate::Remove { .. } => {}
+            PollerUpdate::State(_)
+            | PollerUpdate::Remove { .. }
+            | PollerUpdate::ResetStatsComplete { .. } => {}
         }
     }
 }

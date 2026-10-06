@@ -34,6 +34,9 @@ const TASK_ERROR_MAX_CHARS: usize = 120;
 #[derive(Debug, Clone)]
 pub enum PollerRequest {
     RefreshAll,
+    ResetStats {
+        keys: Vec<String>,
+    },
     UpsertTarget(Target),
     RefreshBigkeys {
         key: String,
@@ -61,7 +64,12 @@ pub enum PollerRequest {
 #[derive(Debug, Clone)]
 pub enum PollerUpdate {
     State(Box<InstanceState>),
-    Remove { key: String },
+    Remove {
+        key: String,
+    },
+    ResetStatsComplete {
+        results: Vec<(String, Result<(), String>)>,
+    },
 }
 
 /// Long-running per-instance jobs that must not block regular polling.
@@ -153,6 +161,7 @@ pub fn start(
 impl Poller {
     async fn handle(&mut self, request: PollerRequest) -> Step {
         match request {
+            PollerRequest::ResetStats { keys } => self.reset_stats(&keys).await?,
             PollerRequest::RefreshAll => {
                 let targets = self.targets.values().cloned().collect();
                 for state in self
@@ -197,6 +206,9 @@ impl Poller {
                     match update {
                         PollerUpdate::State(state) => self.publish(*state).await?,
                         PollerUpdate::Remove { key } => self.publish_removal(key).await?,
+                        PollerUpdate::ResetStatsComplete { .. } => {
+                            unreachable!("kill returns a state or removal")
+                        }
                     }
                 }
             }
@@ -223,6 +235,42 @@ impl Poller {
             }
         }
         Ok(())
+    }
+
+    async fn reset_stats(&mut self, keys: &[String]) -> Step {
+        let targets = keys
+            .iter()
+            .filter_map(|key| self.targets.get(key).cloned())
+            .collect();
+        let mut results: Vec<_> = keys
+            .iter()
+            .filter(|key| !self.targets.contains_key(*key))
+            .map(|key| (key.clone(), Err("Node is no longer available".to_string())))
+            .collect();
+        for (state, result) in self
+            .run_concurrently(targets, |target, settings, prior| async move {
+                let result = async {
+                    let mut conn = redis_connection::connect(&target, &settings).await?;
+                    redis::cmd("CONFIG")
+                        .arg("RESETSTAT")
+                        .query_async::<()>(&mut conn)
+                        .await
+                }
+                .await
+                .map_err(|err: redis::RedisError| err.to_string());
+                // Poll even after a failed reset so each node retains its actual health.
+                let state = poll_one(&target, &settings, prior).await;
+                (state, result)
+            })
+            .await
+        {
+            results.push((state.key.clone(), result));
+            self.publish(state).await?;
+        }
+        self.update_tx
+            .send(PollerUpdate::ResetStatsComplete { results })
+            .await
+            .map_err(|_| Disconnected)
     }
 
     /// Known targets among `keys`, with their background tasks cancelled
@@ -1326,6 +1374,31 @@ mod tests {
         }
         let mut batch = vec!["missing target".to_string()];
         batch.extend(keys.clone());
+        requests
+            .send(super::PollerRequest::ResetStats {
+                keys: batch.clone(),
+            })
+            .await
+            .unwrap();
+        for key in &keys {
+            let update = tokio::time::timeout(Duration::from_secs(2), updates.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(update, super::PollerUpdate::State(state) if &state.key == key));
+        }
+        let update = tokio::time::timeout(Duration::from_secs(2), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let super::PollerUpdate::ResetStatsComplete { results } = update else {
+            panic!("reset reports each missing or unreachable target");
+        };
+        assert_eq!(
+            results.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            batch.iter().collect::<Vec<_>>()
+        );
+        assert!(results.iter().all(|(_, result)| result.is_err()));
         requests
             .send(super::PollerRequest::AuthenticateTargets {
                 keys: batch.clone(),

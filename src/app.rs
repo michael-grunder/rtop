@@ -18,7 +18,6 @@ use crate::topology::{TreeGroup, build_tree_groups};
 pub enum ActiveView {
     Overview,
     Detail,
-    Help,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +42,8 @@ pub enum OverviewModal {
     ColumnPicker,
     KillPicker,
     KillConfirmation,
+    ResetStatsConfirmation,
+    ResetStatsResult,
     AuthForm,
 }
 
@@ -334,13 +335,15 @@ pub struct AppState {
     column_picker_target: ColumnPickerTarget,
     pub commandstats_columns: ColumnSet<CommandstatsColumn>,
     pub commandstats_compact: bool,
+    pub reset_stats_targets: Vec<String>,
+    pub reset_stats_result: String,
     pub overview_columns: ColumnSet<String>,
     pub filter: String,
     pub is_filtering: bool,
     pub filter_prompt_mode: FilterPromptMode,
     pub show_help: bool,
+    pub popup_scroll: Scroll,
     pub active_view: ActiveView,
-    pub previous_view: ActiveView,
     pub selected_index: usize,
     /// Rows the overview table showed last frame; drives page-wise movement.
     pub overview_page_len: usize,
@@ -384,6 +387,8 @@ impl AppState {
                 CommandstatsColumn::DEFAULT,
             ),
             commandstats_compact: false,
+            reset_stats_targets: Vec::new(),
+            reset_stats_result: String::new(),
             overview_columns: ColumnSet::new(
                 column_registry.available_overview_columns(),
                 column_registry.visible_overview.clone(),
@@ -393,8 +398,8 @@ impl AppState {
             is_filtering: false,
             filter_prompt_mode: FilterPromptMode::Filter,
             show_help: false,
+            popup_scroll: Scroll::default(),
             active_view: ActiveView::Overview,
-            previous_view: ActiveView::Overview,
             selected_index: 0,
             overview_page_len: 0,
             marked_keys: BTreeSet::new(),
@@ -588,17 +593,6 @@ impl AppState {
 
     pub fn clamp_selection(&mut self) {
         self.move_selection(0);
-    }
-
-    pub fn open_help_view(&mut self) {
-        if self.active_view != ActiveView::Help {
-            self.previous_view = self.active_view;
-        }
-        self.active_view = ActiveView::Help;
-    }
-
-    pub const fn close_help_view(&mut self) {
-        self.active_view = self.previous_view;
     }
 
     pub fn start_filter_input(&mut self, mode: FilterPromptMode, clear_existing: bool) {
@@ -907,7 +901,11 @@ impl AppState {
     }
 
     pub fn close_overview_modal(&mut self) {
+        if self.overview_modal == OverviewModal::ResetStatsResult {
+            self.reset_stats_result.clear();
+        }
         self.kill_target_keys.clear();
+        self.reset_stats_targets.clear();
         self.column_picker_reorder_mode = false;
         self.discard_auth_form();
         self.overview_modal = OverviewModal::None;

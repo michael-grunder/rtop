@@ -265,8 +265,12 @@ fn accepts_navigation(app: &AppState) -> bool {
         || app.is_filtering
         || app.editing_pane().is_some()
         || app.show_help
-        || app.active_view == ActiveView::Help
-        || app.overview_modal == OverviewModal::KillConfirmation)
+        || matches!(
+            app.overview_modal,
+            OverviewModal::KillConfirmation
+                | OverviewModal::ResetStatsConfirmation
+                | OverviewModal::ResetStatsResult
+        ))
 }
 
 fn range_keys(app: &AppState, count: usize, upward: bool) -> Vec<String> {
@@ -399,7 +403,12 @@ mod tests {
                     now + Duration::from_millis(500),
                 );
                 assert_eq!(app.selected_server_count(), initial_count);
-                nav.tick(&mut app, now + FAMILY_HOLD - Duration::from_millis(1));
+                nav.tick(
+                    &mut app,
+                    (now + FAMILY_HOLD)
+                        .checked_sub(Duration::from_millis(1))
+                        .unwrap(),
+                );
                 assert_eq!(app.selected_server_count(), initial_count);
                 // A refresh can reorder the focus without changing the held target.
                 app.sort_direction = SortDirection::Desc;
@@ -702,16 +711,15 @@ mod tests {
 
     #[test]
     fn motion_keys_and_counts_leave_text_fields_and_help_alone() {
-        for context in 0..4 + DetailTab::ALL.len() {
+        for context in 0..3 + DetailTab::ALL.len() {
             let mut app = app();
             match context {
                 0 => app.is_filtering = true,
                 1 => app.open_auth_form(),
                 2 => app.show_help = true,
-                3 => app.active_view = ActiveView::Help,
                 tab => {
                     app.active_view = ActiveView::Detail;
-                    app.detail_tab = DetailTab::ALL[tab - 4];
+                    app.detail_tab = DetailTab::ALL[tab - 3];
                     app.start_active_detail_filter_input(false);
                 }
             }

@@ -80,7 +80,9 @@ table format.
 
 - `q`: quit from the overview, or close the active overlay window
 - `Ctrl+C`: quit immediately
-- `H`: open full help page
+- `H` / `F1` / `?`: open context-specific help in a popup; overview help covers
+  navigation and selection, while detail help lists the active pane's controls.
+  Use `j`/`k`, arrows, `PgUp`/`PgDn`, or `Home`/`End` to scroll; `Esc`/`q` closes it.
 - `f` or `/`: edit the overview filter, keeping existing text
 - `t`: cycle Tree / Flat / Primary (overview)
 - `m` / `M`: show or hide the top activity metrics panel (overview)
@@ -106,7 +108,8 @@ table format.
 - `/`: start filter input in overview, or filter the active detail pane in detail view (`Summary`, `Info Raw`, `Commandstats`, `Bigkeys`, or `Hotkeys`)
 - `C` / `N`: start CPU or NET sampling while the `Hotkeys` tab is open
 - `X`: stop active `Hotkeys` sampling early, or reset the `Hotkeys` pane back to its idle prompt
-- `r` / `R`: refresh now, rerun the on-demand `Bigkeys` scan, or rerun `Hotkeys` sampling for the last selected metric while that tab is open
+- `r` / `R`: refresh now, confirm a statistics reset in `Commandstats`, rerun the
+  `Bigkeys` scan, or rerun `Hotkeys` sampling for the last selected metric
 
 Shortcuts without a motion-key conflict remain case insensitive. Kill and the
 Hotkeys detail tab require `K`. Lowercase
@@ -147,6 +150,14 @@ calls). Missing commands contribute zero; missing extra metrics contribute
 nothing, and non-counter extra values show `-` in combined totals. Totals use
 the latest stored samples from each node, which may have different uptimes or
 counter reset times; they are server execution counts, not unique client requests.
+
+Press `r` / `R` in Commandstats to reset statistics on exactly those nodes,
+including hidden selections (or the focused node when nothing is selected).
+The confirmation lists the target nodes: `Enter` confirms, `Esc`/`q` cancels.
+This sends `CONFIG RESETSTAT`, which resets server-wide statistics including
+command, error, hit/miss, and connection counters, not just the displayed rows.
+Each node is attempted independently using its credentials and configured
+timeouts; results report success or failure per node and stats are refreshed.
 
 Prefix a motion with a positive count: `10j` moves down ten rows, `3k` moves
 up three, and `2l` advances two detail tabs. Counts also work with arrow keys;

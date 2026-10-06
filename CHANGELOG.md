@@ -2,6 +2,11 @@
 
 ### Added
 
+- Add scrollable, context-specific help popups on `H`, `F1`, and `?`, showing
+  overview controls or the active detail pane's keys.
+- Add `r` / `R` in Commandstats to confirm `CONFIG RESETSTAT` on the displayed
+  nodes, including hidden selections, with per-node results and refreshed stats.
+
 - Hold Space to extend selection or deselection from one node to its
   primary/replica family after 700 ms, then its Redis Cluster after 1.5 seconds,
   including hidden nodes. Use release events when supported and repeat timing
