@@ -487,6 +487,53 @@ impl AppState {
         self.marked_keys.contains(key)
     }
 
+    /// Apply the original Space toggle to a family or cluster, including hidden nodes.
+    pub fn expand_server_selection(&mut self, key: &str, cluster: bool, selected: bool) {
+        let Some(node) = self.instances.get(key) else {
+            return;
+        };
+        let keys: Vec<String> = if cluster {
+            if node.cluster_key() == crate::model::STANDALONE_CLUSTER {
+                return;
+            }
+            self.instances
+                .values()
+                .filter(|other| other.cluster_key() == node.cluster_key())
+                .map(|other| other.key.clone())
+                .collect()
+        } else {
+            let mut keys = vec![key.to_string()];
+            for group in build_tree_groups(&self.instances) {
+                let root = group
+                    .children
+                    .iter()
+                    .find(|(_, children)| children.iter().any(|child| child == key))
+                    .map_or(key, |(parent, _)| parent.as_str());
+                keys.push(root.to_string());
+                if let Some(children) = group.children.get(root) {
+                    keys.extend(children.iter().cloned());
+                }
+            }
+            // Siblings still form a family when their primary is not monitored.
+            if let Some(parent) = &node.parent_addr {
+                keys.extend(
+                    self.instances
+                        .values()
+                        .filter(|other| other.parent_addr.as_ref() == Some(parent))
+                        .map(|other| other.key.clone()),
+                );
+            }
+            keys
+        };
+        for key in keys {
+            if selected {
+                self.marked_keys.insert(key);
+            } else {
+                self.marked_keys.remove(&key);
+            }
+        }
+    }
+
     /// Add a captured visible range, preserving existing selections and skipping removed servers.
     pub fn select_server_range(&mut self, keys: &[String]) {
         self.marked_keys.extend(

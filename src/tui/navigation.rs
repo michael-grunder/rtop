@@ -3,11 +3,26 @@ use std::time::{Duration, Instant};
 use super::{ActiveView, AppState, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, OverviewModal};
 
 const RANGE_TIMEOUT: Duration = Duration::from_millis(500);
+const FAMILY_HOLD: Duration = Duration::from_millis(700);
+const CLUSTER_HOLD: Duration = Duration::from_millis(1500);
+const FIRST_REPEAT_TIMEOUT: Duration = Duration::from_millis(1000);
+const REPEAT_TIMEOUT: Duration = Duration::from_millis(200);
+
+struct SpaceHold {
+    started: Instant,
+    last_event: Instant,
+    repeated: bool,
+    // Counted ranges consume repeats but do not expand into a topology selection.
+    target: Option<(String, bool)>,
+    stage: u8,
+}
 
 #[derive(Default)]
 pub(super) struct Navigation {
     count: Option<usize>,
     recent_range: Option<(Instant, Vec<String>)>,
+    space_hold: Option<SpaceHold>,
+    reports_release: bool,
 }
 
 /// Where a navigation key moves the focus or scroll position.
@@ -60,20 +75,125 @@ impl Motion {
 }
 
 impl Navigation {
+    pub(super) fn new(reports_release: bool) -> Self {
+        Self {
+            reports_release,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn cancel_space_hold(&mut self) {
+        self.space_hold = None;
+    }
+
+    pub(super) fn tick(&mut self, app: &mut AppState, now: Instant) {
+        // Without release reporting, advance only when another repeat arrives.
+        if self.reports_release {
+            self.advance_space_hold(app, now);
+        }
+    }
+
+    fn advance_space_hold(&mut self, app: &mut AppState, now: Instant) {
+        if !accepts_navigation(app)
+            || app.active_view != ActiveView::Overview
+            || app.overview_modal != OverviewModal::None
+        {
+            self.cancel_space_hold();
+            return;
+        }
+        let Some(hold) = &mut self.space_hold else {
+            return;
+        };
+        let Some((key, selected)) = &hold.target else {
+            return;
+        };
+        if !app.instances.contains_key(key) {
+            self.cancel_space_hold();
+            return;
+        }
+        let elapsed = now.saturating_duration_since(hold.started);
+        if hold.stage == 0 && elapsed >= FAMILY_HOLD {
+            app.expand_server_selection(key, false, *selected);
+            hold.stage = 1;
+        }
+        if hold.stage == 1 && elapsed >= CLUSTER_HOLD {
+            app.expand_server_selection(key, true, *selected);
+            hold.stage = 2;
+        }
+    }
+
+    fn handle_space(&mut self, app: &mut AppState, key: KeyEvent, now: Instant) -> bool {
+        if let Some(hold) = &mut self.space_hold {
+            let timeout = if hold.repeated {
+                REPEAT_TIMEOUT
+            } else {
+                FIRST_REPEAT_TIMEOUT
+            };
+            // ponytail: legacy terminals cannot distinguish rapid taps from auto-repeat;
+            // release-reporting terminals use exact events instead of this timing heuristic.
+            let repeat = self.reports_release
+                || key.kind == KeyEventKind::Repeat
+                || now.saturating_duration_since(hold.last_event) <= timeout;
+            if repeat {
+                hold.last_event = now;
+                hold.repeated = true;
+                self.advance_space_hold(app, now);
+                return true;
+            }
+            self.cancel_space_hold();
+        }
+        let count = self.count.take();
+        let recent_range = self.recent_range.take();
+        if key.kind != KeyEventKind::Press {
+            return false;
+        }
+        let mut hold = SpaceHold {
+            started: now,
+            last_event: now,
+            repeated: false,
+            target: None,
+            stage: 0,
+        };
+        if let Some(count) = count {
+            app.select_server_range(&range_keys(app, count, false));
+        } else if let Some((at, keys)) = recent_range
+            && now.saturating_duration_since(at) <= RANGE_TIMEOUT
+        {
+            app.select_server_range(&keys);
+        } else {
+            hold.target = app.selected_key().map(|key| {
+                let selected = !app.is_server_selected(&key);
+                (key, selected)
+            });
+            app.toggle_server_selection();
+        }
+        self.space_hold = Some(hold);
+        true
+    }
+
     /// Runs before command dispatch, but leaves text fields and non-navigation overlays alone.
     pub(super) fn handle_key(&mut self, app: &mut AppState, key: KeyEvent, now: Instant) -> bool {
         if !accepts_navigation(app) {
-            *self = Self::default();
+            *self = Self::new(self.reports_release);
             return false;
+        }
+        if key.code == KeyCode::Char(' ') && key.kind == KeyEventKind::Release {
+            self.cancel_space_hold();
         }
         // Releases and standalone modifiers must not break a typed sequence.
         if key.kind == KeyEventKind::Release || matches!(key.code, KeyCode::Modifier(_)) {
             return false;
         }
         if super::has_command_modifier(key) {
-            *self = Self::default();
+            *self = Self::new(self.reports_release);
             return false;
         }
+        let overview =
+            app.active_view == ActiveView::Overview && app.overview_modal == OverviewModal::None;
+        if key.code == KeyCode::Char(' ') && overview {
+            return self.handle_space(app, key, now);
+        }
+        self.cancel_space_hold();
         if let KeyCode::Char(ch @ '0'..='9') = key.code {
             self.recent_range = None;
             let digit = usize::from(ch as u8 - b'0');
@@ -89,24 +209,9 @@ impl Navigation {
             return true;
         }
         let count = self.count.take();
-        let recent_range = self.recent_range.take();
+        self.recent_range = None;
         if key.code == KeyCode::Esc && count.is_some() {
             return true;
-        }
-        let overview =
-            app.active_view == ActiveView::Overview && app.overview_modal == OverviewModal::None;
-        if key.code == KeyCode::Char(' ') && overview && key.kind == KeyEventKind::Press {
-            if let Some(count) = count {
-                app.select_server_range(&range_keys(app, count, false));
-                return true;
-            }
-            if let Some((at, keys)) = recent_range
-                && now.saturating_duration_since(at) <= RANGE_TIMEOUT
-            {
-                app.select_server_range(&keys);
-                return true;
-            }
-            return false;
         }
         let Some(motion) = Motion::from_key(key.code, count) else {
             return false;
@@ -216,6 +321,243 @@ mod tests {
             if !nav.handle_key(app, key, at) {
                 super::super::handle_overview_shortcut(app, key);
             }
+            nav.handle_key(
+                app,
+                KeyEvent::new_with_kind(key.code, key.modifiers, KeyEventKind::Release),
+                at,
+            );
+        }
+    }
+
+    fn cluster_app(focus: &str) -> AppState {
+        let mut app = app();
+        app.instances.clear();
+        for (key, parent, cluster) in [
+            ("p1", None, "cluster-a"),
+            ("r1", Some("p1"), "cluster-a"),
+            ("r2", Some("p1:6379"), "cluster-a"),
+            ("p2", None, "cluster-a"),
+            ("r3", Some("p2"), "cluster-a"),
+            ("other", None, "cluster-b"),
+        ] {
+            let mut node = InstanceState::new(key.into(), format!("{key}:6379"));
+            node.kind = if parent.is_some() {
+                crate::model::InstanceType::Replica
+            } else {
+                crate::model::InstanceType::Primary
+            };
+            node.parent_addr = parent.map(str::to_string);
+            node.cluster_id = Some(cluster.into());
+            app.apply_update(node);
+        }
+        app.selected_index = app
+            .visible_rows()
+            .iter()
+            .position(|row| row.key == focus)
+            .unwrap();
+        app
+    }
+
+    fn space(nav: &mut Navigation, app: &mut AppState, kind: KeyEventKind, at: Instant) {
+        nav.handle_key(
+            app,
+            KeyEvent::new_with_kind(KeyCode::Char(' '), KeyModifiers::NONE, kind),
+            at,
+        );
+    }
+
+    #[test]
+    fn space_hold_steps_through_family_and_cluster_in_both_directions() {
+        for focus in ["p1", "r1", "r2"] {
+            for deselect in [false, true] {
+                let mut app = cluster_app(focus);
+                // Start with a mixed family to ensure expansion sets rather than toggles.
+                app.expand_server_selection("other", true, true);
+                if deselect {
+                    app.expand_server_selection(focus, true, true);
+                } else {
+                    app.select_server_range(&["r2".into()]);
+                    app.selected_index = app
+                        .visible_rows()
+                        .iter()
+                        .position(|row| row.key == focus)
+                        .unwrap();
+                    if focus == "r2" {
+                        app.toggle_server_selection();
+                    }
+                }
+                let mut nav = Navigation::new(true);
+                let now = Instant::now();
+                space(&mut nav, &mut app, KeyEventKind::Press, now);
+                assert_eq!(app.is_server_selected(focus), !deselect);
+                let initial_count = app.selected_server_count();
+                // Windows reports held key-down events as Press until a Release.
+                space(
+                    &mut nav,
+                    &mut app,
+                    KeyEventKind::Press,
+                    now + Duration::from_millis(500),
+                );
+                assert_eq!(app.selected_server_count(), initial_count);
+                nav.tick(&mut app, now + FAMILY_HOLD - Duration::from_millis(1));
+                assert_eq!(app.selected_server_count(), initial_count);
+                // A refresh can reorder the focus without changing the held target.
+                app.sort_direction = SortDirection::Desc;
+                nav.tick(&mut app, now + FAMILY_HOLD);
+                for key in ["p1", "r1", "r2"] {
+                    assert_eq!(app.is_server_selected(key), !deselect, "{focus}: {key}");
+                }
+                assert_eq!(app.is_server_selected("p2"), deselect);
+                assert_eq!(app.is_server_selected("r3"), deselect);
+                nav.tick(&mut app, now + CLUSTER_HOLD);
+                assert_eq!(app.is_server_selected("p2"), !deselect);
+                assert_eq!(app.is_server_selected("r3"), !deselect);
+                assert!(app.is_server_selected("other"));
+                let count = app.selected_server_count();
+                space(
+                    &mut nav,
+                    &mut app,
+                    KeyEventKind::Repeat,
+                    now + CLUSTER_HOLD * 2,
+                );
+                assert_eq!(app.selected_server_count(), count);
+            }
+        }
+    }
+
+    #[test]
+    fn short_taps_and_release_after_family_stop_expansion() {
+        let mut app = cluster_app("r1");
+        let mut nav = Navigation::new(true);
+        let now = Instant::now();
+        for expected in [true, false, true] {
+            space(&mut nav, &mut app, KeyEventKind::Press, now);
+            space(
+                &mut nav,
+                &mut app,
+                KeyEventKind::Release,
+                now + Duration::from_millis(50),
+            );
+            nav.tick(&mut app, now + CLUSTER_HOLD);
+            assert_eq!(app.is_server_selected("r1"), expected);
+            assert_eq!(app.selected_server_count(), usize::from(expected));
+        }
+        app.expand_server_selection("r1", true, true);
+        space(&mut nav, &mut app, KeyEventKind::Press, now);
+        nav.tick(&mut app, now + FAMILY_HOLD);
+        space(&mut nav, &mut app, KeyEventKind::Release, now + FAMILY_HOLD);
+        nav.tick(&mut app, now + CLUSTER_HOLD);
+        assert_eq!(app.action_target_keys(), ["p2", "r3"]);
+    }
+
+    #[test]
+    fn legacy_space_repeats_expand_without_idle_timer_or_repeated_toggles() {
+        let mut app = cluster_app("r1");
+        let mut nav = Navigation::new(false);
+        let now = Instant::now();
+        space(&mut nav, &mut app, KeyEventKind::Press, now);
+        nav.tick(&mut app, now + FAMILY_HOLD);
+        assert_eq!(app.selected_server_count(), 1);
+        for ms in (500..=1500).step_by(100) {
+            space(
+                &mut nav,
+                &mut app,
+                KeyEventKind::Press,
+                now + Duration::from_millis(ms),
+            );
+            assert_eq!(
+                app.selected_server_count(),
+                if ms < 700 {
+                    1
+                } else if ms < 1500 {
+                    3
+                } else {
+                    5
+                }
+            );
+        }
+        space(
+            &mut nav,
+            &mut app,
+            KeyEventKind::Press,
+            now + Duration::from_secs(2),
+        );
+        assert!(!app.is_server_selected("r1"));
+        assert_eq!(app.selected_server_count(), 4);
+        nav.tick(&mut app, now + Duration::from_secs(4));
+        assert_eq!(app.selected_server_count(), 4);
+    }
+
+    #[test]
+    fn space_hold_cancels_on_commands_overlays_focus_loss_and_removed_target() {
+        for scenario in 0..5 {
+            let mut app = cluster_app("r1");
+            let mut nav = Navigation::new(true);
+            let now = Instant::now();
+            space(&mut nav, &mut app, KeyEventKind::Press, now);
+            match scenario {
+                0 => {
+                    type_keys(&mut nav, &mut app, "j", now);
+                }
+                1 => app.open_sort_picker(),
+                2 => app.is_filtering = true,
+                3 => nav.cancel_space_hold(),
+                _ => app.remove_instance("r1"),
+            }
+            nav.tick(&mut app, now + CLUSTER_HOLD);
+            assert!(app.selected_server_count() <= 1);
+            assert!(!app.is_server_selected("p1"));
+        }
+    }
+
+    #[test]
+    fn held_counted_space_does_not_expand_or_toggle_its_range() {
+        for reports_release in [false, true] {
+            let mut app = cluster_app("p1");
+            let mut nav = Navigation::new(reports_release);
+            let now = Instant::now();
+            type_keys(&mut nav, &mut app, "2", now);
+            space(&mut nav, &mut app, KeyEventKind::Press, now);
+            let selected = app.action_target_keys();
+            for ms in (500..=2000).step_by(100) {
+                space(
+                    &mut nav,
+                    &mut app,
+                    if reports_release {
+                        KeyEventKind::Repeat
+                    } else {
+                        KeyEventKind::Press
+                    },
+                    now + Duration::from_millis(ms),
+                );
+                nav.tick(&mut app, now + Duration::from_millis(ms));
+                assert_eq!(app.action_target_keys(), selected);
+            }
+        }
+    }
+
+    #[test]
+    fn topology_selection_includes_hidden_nodes_and_isolates_non_cluster_families() {
+        for cluster_id in [None, Some(crate::model::STANDALONE_CLUSTER.into())] {
+            let mut app = cluster_app("p1");
+            for node in app.instances.values_mut() {
+                node.cluster_id = cluster_id.clone();
+            }
+            app.view_mode = crate::model::ViewMode::Primary;
+            app.filter = "p1".into();
+            app.expand_server_selection("p1", false, true);
+            assert_eq!(app.action_target_keys(), ["p1", "r1", "r2"]);
+            app.expand_server_selection("p1", true, true);
+            assert_eq!(app.action_target_keys(), ["p1", "r1", "r2"]);
+            app.expand_server_selection("r2", false, false);
+            assert_eq!(app.selected_server_count(), 0);
+            app.expand_server_selection("missing", true, true);
+            assert_eq!(app.selected_server_count(), 0);
+            // Unmonitored primaries still have selectable sibling replicas.
+            app.remove_instance("p1");
+            app.instances.get_mut("r1").unwrap().parent_addr = Some("p1:6379".into());
+            app.expand_server_selection("r1", false, true);
+            assert_eq!(app.action_target_keys(), ["r1", "r2"]);
         }
     }
 

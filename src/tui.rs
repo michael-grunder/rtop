@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    ModifierKeyCode, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableFocusChange, EnableFocusChange, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, ModifierKeyCode, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -186,7 +187,10 @@ async fn run_json_stream(launch: LaunchConfig) -> Result<()> {
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, launch: LaunchConfig) -> Result<()> {
     let mut app = new_app(&launch);
     let mut feeds = Feeds::start(launch);
-    let mut navigation = navigation::Navigation::default();
+    // A failed capability query falls back to repeat timing, just like a legacy terminal.
+    let reports_release =
+        cfg!(windows) || crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    let mut navigation = navigation::Navigation::new(reports_release);
 
     loop {
         feeds.drain_into(&mut app);
@@ -200,17 +204,18 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, launch: LaunchCon
 
         if event::poll(Duration::from_millis(100))? {
             let Event::Key(key) = event::read()? else {
+                navigation.cancel_space_hold();
                 continue;
             };
             if is_force_quit_key(key) {
                 app.should_quit = true;
                 continue;
             }
-            if navigation.handle_key(&mut app, key, std::time::Instant::now()) {
-                continue;
+            if !navigation.handle_key(&mut app, key, std::time::Instant::now()) {
+                handle_key(&mut app, key, &feeds)?;
             }
-            handle_key(&mut app, key, &feeds)?;
         }
+        navigation.tick(&mut app, std::time::Instant::now());
     }
 
     Ok(())
@@ -1606,6 +1611,10 @@ const fn help_bindings() -> &'static [(&'static str, &'static str)] {
             "Space",
             "Select server for Commandstats, activity totals and batch actions (none = all activity)",
         ),
+        (
+            "Hold Space",
+            "700 ms: primary + replicas; 1.5 s: cluster; same select/deselect direction",
+        ),
         ("N + motion", "Move N steps with h/j/k/l or arrow keys"),
         (
             "NSpace",
@@ -1939,6 +1948,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     execute!(
         stdout,
         EnterAlternateScreen,
+        EnableFocusChange,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
@@ -1953,6 +1963,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableFocusChange,
         PopKeyboardEnhancementFlags,
         LeaveAlternateScreen
     )?;

@@ -87,7 +87,8 @@ table format.
 - `s`: open Sort By to choose from currently visible overview columns
 - `c`: open the column picker for the overview or the active `Commandstats` pane
 - `p` / `P`: toggle compact layout in `Commandstats`
-- `Space`: toggle selection of the focused overview server
+- `Space`: toggle selection of the focused overview server; hold for its
+  primary/replica family (700 ms), then its whole cluster (1.5 s)
 - `a`: enter one username and password and retry all selected servers
 - `K`: open the kill picker for selected servers; `Enter` chooses the action,
   with an additional confirmation when stopping more than one server
@@ -160,6 +161,20 @@ the last selected row. After 500 ms, Space just toggles the new focused row.
 Ranges include the starting row, stop at the boundary, and add to existing
 selections without deselecting already selected servers. They follow the
 visible sorted/filtered order captured when the motion was entered.
+
+Hold plain `Space` to expand the initial toggle: after 700 ms it applies to
+the primary and all its replicas, even when starting on a replica; after
+1.5 seconds it applies to every monitored node in that Redis Cluster.
+The initial toggle determines the direction for the entire hold: starting on
+a selected node deselects each larger group, while starting on an unselected
+node selects it. Hidden nodes are included; unrelated clusters and standalone
+families are left alone. Non-cluster families stop at the family step.
+Releasing Space or pressing another key stops expansion. Counted range
+selections keep their existing behavior and do not expand while held.
+Terminals with enhanced keyboard reporting use release events and precise
+timers. Other terminals infer holds from auto-repeat (up to 1 second for the
+first repeat, then at most 200 ms between repeats); rapid taps can therefore
+be treated as a hold, and timing depends on the keyboard's repeat settings.
 
 Use plain `Space` to select or deselect servers. The caret gutter shows `●` for a
 selected server, `>` for the focused server, or a bold `▶` when the focused

@@ -2,6 +2,10 @@
 
 ### Added
 
+- Hold Space to extend selection or deselection from one node to its
+  primary/replica family after 700 ms, then its Redis Cluster after 1.5 seconds,
+  including hidden nodes. Use release events when supported and repeat timing
+  on legacy terminals; counted range selection keeps its existing behavior.
 - Add a session-local `p` / `P` compact Commandstats toggle that fits sorted
   command/call pairs across each row, with filtering, scrolling, and resizing.
 - Combine Commandstats for Space-selected nodes, including hidden selections,
