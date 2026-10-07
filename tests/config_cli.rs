@@ -64,6 +64,17 @@ fn overview_shows_defaults_and_creates_nothing() {
 #[test]
 fn global_settings_are_typed_and_persisted_in_the_user_config() {
     let cli = ConfigCli::new();
+    assert_eq!(cli.success(&["--config", "get", "show_activity"]), "true\n");
+    cli.success(&["--config", "set", "show_activity", "false"]);
+    assert_eq!(
+        cli.success(&["--config", "get", "global.show_activity"]),
+        "false\n"
+    );
+    assert!(
+        !cli.run(&["--config", "set", "show_activity", "invalid"])
+            .status
+            .success()
+    );
     cli.success(&["--config", "set", "global.refresh_interval_ms", "2500"]);
     cli.success(&["--config", "set", "remember_auth", "true"]);
     cli.success(&["--config", "set", "view_default", "primary"]);
@@ -90,6 +101,7 @@ fn global_settings_are_typed_and_persisted_in_the_user_config() {
         Some(2500)
     );
     assert_eq!(data["global"]["remember_auth"].as_bool(), Some(true));
+    assert_eq!(data["global"]["show_activity"].as_bool(), Some(false));
     assert!(!cli.path().with_file_name("rtop-auth.toml").exists());
     #[cfg(unix)]
     {

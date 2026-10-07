@@ -370,7 +370,7 @@ impl AppState {
     pub fn new(settings: RuntimeSettings, column_registry: ColumnRegistry) -> Self {
         Self {
             activity: crate::activity::Activity::default(),
-            show_activity: true,
+            show_activity: settings.show_activity,
             view_mode: settings.default_view,
             sort_by: column_registry.default_sort_by.clone(),
             sort_direction: column_registry.default_sort_direction,
@@ -1358,6 +1358,7 @@ mod tests {
             command_timeout: Duration::from_millis(500),
             concurrency_limit: 4,
             leave_killed_servers: false,
+            show_activity: true,
             default_view: ViewMode::Tree,
             default_sort: SortMode::Address,
             ui_theme: UiTheme::default(),

@@ -1,0 +1,136 @@
+# rtop configuration reference. Copy to rtop.toml and customize, or run:
+#   rtop --config-file ./rtop.dist.toml
+# Default monitoring search order (first existing file wins):
+#   $XDG_CONFIG_HOME/rtop.toml, ~/.config/rtop.toml, ./rtop.toml
+# This .dist file is not loaded automatically. All settings are optional.
+# Active global/theme/view values below match the built-in defaults.
+# Target examples are disabled; enable and edit them to monitor fixed servers.
+# Inspect/edit global, theme, and target settings with rtop --config get/set;
+# edit columns and view tables directly in this file.
+
+[global]
+# Polling interval in milliseconds; must be greater than zero.
+# --refresh-rate (also --refresh) overrides this value.
+refresh_interval_ms = 1000
+# Connection and command timeouts in milliseconds.
+connect_timeout_ms = 300
+command_timeout_ms = 500
+# Maximum concurrent polls (at least 1).
+concurrency_limit = 16
+# Initial server layout: "tree", "flat", or "primary" (primaries only).
+view_default = "tree"
+# Legacy sort setting: "alias", "address", "type", "cluster", "memory"/"mem",
+# "ops", "latency"/"lat", "latmax", or "status".
+# The overview column sort table below takes precedence.
+sort_default = "address"
+# Show the top activity metrics panel on startup. Set false to hide the header.
+# m/M still toggles it for the current session; metric history keeps updating.
+show_activity = true
+# Continue background autodiscovery alongside configured targets.
+# Set false for a fixed target list. With no enabled targets, discovery still runs.
+still_autodiscover = true
+# Save/reuse credentials after successful authentication (plaintext, mode 0600
+# on Unix) in the user config directory's generated rtop-auth.toml.
+# This does not rewrite this config; false disables both loading and saving.
+remember_auth = false
+# Keep servers in the overview after a successful kill action.
+leave_killed_servers = false
+
+[theme]
+# Colors: black, red, green, yellow, blue, magenta, cyan, gray/grey, white.
+background_color = "black"
+foreground_color = "white"
+# Selection caret color. "caret_color" is also accepted; carat_color wins
+# if both spellings are present.
+carat_color = "white"
+warning_color = "yellow"
+critical_color = "red"
+
+# Repeat [[targets]] for each fixed endpoint. CLI targets reuse matching
+# configured credentials, but do not include unmatched configured targets.
+[[targets]]
+alias = "local"                 # Optional display name.
+addr = "127.0.0.1:6379"          # Required; ":6379" or "6379" also work.
+protocol = "tcp"                # "tcp" or "unix"; inferred if omitted.
+username = "default"            # Optional ACL username; "user" is an alias.
+password_env = "REDIS_PASSWORD"  # Read password from this environment variable.
+# password = "secret"           # Alternative: never set both password sources.
+# An unset password_env warns and supplies no password.
+tags = ["local", "dev"]         # Optional target labels; default [].
+enabled = false                 # Default true; false skips this target entirely.
+
+[[targets]]
+alias = "socket"
+addr = "/run/redis/redis.sock"
+# A slash in addr implies "unix" when protocol is omitted; otherwise "tcp".
+protocol = "unix"
+enabled = false
+
+# Column definitions merge with built-ins field by field. Use a built-in key
+# to customize a column, or a new key to add one. New columns must be included
+# in view.overview.visible (or selected in the column picker) to be displayed.
+# Built-in keys: alias, addr, pid, role, cluster, slots_total, slots,
+# connected_clients, master_repl_offset, used_mem, maxmem_pct, ops,
+# lat_last, lat_max, status. See src/default_columns.toml for all definitions.
+
+# Example INFO column, using Redis's raw INFO field name.
+[columns.used_mem]
+type = "info"                   # "info" or "calc"; required for new columns.
+header = "Mem"                  # Defaults to the column key for new columns.
+info_key = "used_memory"        # Required for type = "info".
+# Value types: string (default), u64, i64, f64, bytes, percent, bool.
+value_type = "bytes"
+# Formats: raw (default), bytes_human, fixed:N, pct:N, ms:N.
+# N is the number of decimal places (0..255); e.g. fixed:2, pct:1, ms:2.
+format = "bytes_human"
+# Alignment: left, right, center. Defaults depend on the value type/calculation.
+align = "right"
+# Widths are terminal cells. New-column defaults: min 4, ideal 8, no max/fixed.
+min_width = 10
+ideal_width = 12
+max_width = 18
+# fixed_width = 12              # Optional fixed width instead of flexible sizing.
+missing = "-"                  # Placeholder for missing values; default "".
+# emphasis = "max"             # Optional "max" or "min" across visible rows.
+
+# Example calculated column. calc is a built-in name, not an expression.
+[columns.lat_max]
+type = "calc"
+header = "LatMax"
+calc = "latency_max_ms"
+# Available calculations: $addr, $alias, $pid, $role, $cluster, $status,
+# slots_total, slots, latency_last_ms, latency_max_ms, maxmemory_percent,
+# hitrate_percent, clients_total, ops_per_sec.
+format = "ms:2"
+emphasis = "max"
+# All sizing, alignment, missing-value, and emphasis fields above apply here too.
+
+# Per-column styling overrides the overview emphasis style field by field.
+# Uncomment this table and its fields to customize this column's emphasis.
+# [columns.lat_max.emphasis_style]
+# bold = true
+# italic = false
+# underlined = false
+# dim = false
+# reversed = false
+# foreground_color = "red"
+
+[view.overview]
+# Initial visible columns, in display order. Tree mode hides role; addr is
+# automatically hidden when every server has the same host (o/O toggles this).
+visible = ["alias", "addr", "role", "used_mem", "ops", "lat_last", "lat_max", "status"]
+
+[view.overview.sort]
+# Column key (including custom columns), rather than a global sort mode name.
+by = "addr"
+dir = "asc"                    # "asc" or "desc".
+
+[view.overview.emphasis_style]
+# Applied to columns with emphasis = "max" or "min"; per-column overrides win.
+# Foreground colors use the same names as [theme].
+bold = false
+italic = false
+underlined = false
+dim = false
+reversed = false
+foreground_color = "yellow"

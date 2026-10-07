@@ -519,6 +519,32 @@ mod tests {
     use crate::model::{InstanceState, InstanceType, SlotRange, SortMode, UiColor};
 
     #[test]
+    fn distribution_config_loads_settings_and_columns() {
+        let content = include_str!("../rtop.dist.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rtop.toml");
+        fs::write(&path, content).unwrap();
+        let loaded = crate::config::load_config(Some(&path), false).unwrap();
+        let settings =
+            crate::config::apply_overrides(crate::config::default_settings(), &loaded.overrides);
+        assert!(settings.show_activity);
+        assert!(
+            loaded.targets.is_empty(),
+            "example targets should be disabled"
+        );
+        let mut registry = ColumnRegistry::load(None, true, settings.default_sort);
+        registry
+            .apply_layer(content)
+            .expect("valid example columns and view");
+        for key in &registry.visible_overview {
+            assert!(
+                registry.column(key).is_some(),
+                "unknown visible column: {key}"
+            );
+        }
+    }
+
+    #[test]
     fn loads_builtin_columns() {
         let registry = ColumnRegistry::load(None, true, SortMode::Address);
         assert!(registry.column("alias").is_some());

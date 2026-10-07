@@ -150,6 +150,7 @@ pub struct RuntimeSettings {
     pub command_timeout: Duration,
     pub concurrency_limit: usize,
     pub leave_killed_servers: bool,
+    pub show_activity: bool,
     pub default_view: ViewMode,
     pub default_sort: SortMode,
     pub ui_theme: UiTheme,

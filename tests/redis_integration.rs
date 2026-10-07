@@ -22,6 +22,7 @@ fn runtime_settings() -> RuntimeSettings {
         command_timeout: Duration::from_secs(2),
         concurrency_limit: 2,
         leave_killed_servers: false,
+        show_activity: true,
         default_view: ViewMode::Flat,
         default_sort: SortMode::Address,
         ui_theme: UiTheme::default(),

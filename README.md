@@ -38,8 +38,8 @@
 
 Press `m` / `M` in the main overview to hide or show the top activity metrics
 panel, giving the server table more room when hidden. It is visible by default;
-the toggle lasts for the current session. Metrics and history continue updating
-while hidden.
+set `[global].show_activity = false` to start with it hidden. The toggle lasts
+for the current session. Metrics and history continue updating while hidden.
 
 The top of the main overview shows activity for all monitored servers. Use
 `j`/`k` or `Up`/`Down` to move focus in the main server table,
@@ -429,6 +429,11 @@ early and the rest of the suite still runs.
 
 ## Config
 
+See [`rtop.dist.toml`](rtop.dist.toml) for a commented reference covering global
+settings, targets, colors, columns, and overview styling. Copy it to `rtop.toml`
+or select it with `rtop --config-file ./rtop.dist.toml`; the `.dist` file is not
+loaded automatically. Its example targets are disabled until you enable them.
+
 Monitoring config search order when no explicit file is provided:
 
 1. `$XDG_CONFIG_HOME/rtop.toml`
@@ -453,6 +458,7 @@ rtop --config                                      # grouped overview
 rtop --config get global.refresh_interval_ms        # single value
 rtop --config set global.refresh_interval_ms 2000
 rtop --config set remember_auth true                # global. is optional
+rtop --config set show_activity false               # hide the header on startup
 rtop --config set theme.foreground_color cyan
 rtop --config --target local                        # one saved target
 rtop --config get addr --target local
@@ -501,6 +507,7 @@ command_timeout_ms = 500
 concurrency_limit = 16
 view_default = "tree"
 sort_default = "address"
+show_activity = true
 still_autodiscover = true
 remember_auth = false
 
@@ -554,6 +561,10 @@ visible = ["alias", "addr", "role", "slots_total", "used_mem", "ops", "lat_last"
 by = "ops"
 dir = "desc"
 ```
+
+`[global].show_activity` defaults to `true`. Set it to `false` to start with the
+top activity metrics panel (header) hidden. `m` / `M` still toggles the panel
+for the current session without changing the config; history keeps updating.
 
 `[global].remember_auth` defaults to `false`. Set it to `true` to save credentials
 only after Redis accepts `AUTH` (including credentials entered in the auth form,

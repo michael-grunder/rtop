@@ -84,6 +84,7 @@ fn global_defaults() -> Result<Value> {
         still_autodiscover = true
         remember_auth = false
         leave_killed_servers = (defaults.leave_killed_servers)
+        show_activity = (defaults.show_activity)
     }
     .into())
 }
@@ -178,7 +179,9 @@ fn setting_kind(target: bool, key: &str) -> Result<Kind> {
             | "connect_timeout_ms"
             | "command_timeout_ms"
             | "concurrency_limit" => Kind::PositiveInteger,
-            "still_autodiscover" | "remember_auth" | "leave_killed_servers" => Kind::Boolean,
+            "still_autodiscover" | "remember_auth" | "leave_killed_servers" | "show_activity" => {
+                Kind::Boolean
+            }
             "view_default" | "sort_default" => Kind::String,
             _ => bail!("unknown global setting; inspect --config or consult the README"),
         }

@@ -2,6 +2,10 @@
 
 ### Added
 
+- Add `rtop.dist.toml` as a commented configuration reference, and
+  `[global].show_activity` (default `true`) to control startup header visibility,
+  including `--config get/set` support. `m` / `M` still toggles it during a session.
+
 - Add scrollable, context-specific help popups on `H`, `F1`, and `?`, showing
   overview controls or the active detail pane's keys.
 - Add `r` / `R` in Commandstats to confirm `CONFIG RESETSTAT` on the displayed

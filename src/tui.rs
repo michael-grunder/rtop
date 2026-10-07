@@ -2279,6 +2279,42 @@ mod tests {
     }
 
     #[test]
+    fn configured_activity_visibility_can_be_toggled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rtop.toml");
+        for (config, visible) in [
+            ("", true),
+            ("show_activity = true", true),
+            ("show_activity = false", false),
+        ] {
+            std::fs::write(&path, format!("[global]\n{config}\n")).unwrap();
+            let loaded = crate::config::load_config(Some(&path), false).unwrap();
+            let settings = crate::config::apply_overrides(default_settings(), &loaded.overrides);
+            let mut app = AppState::new(settings, test_registry());
+            let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+            assert_eq!(app.show_activity, visible);
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            assert_eq!(
+                buffer_lines(terminal.backend().buffer())[0].contains("Activity |"),
+                visible
+            );
+            for (key, expected) in [('m', !visible), ('M', visible)] {
+                assert!(handle_overview_shortcut(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
+                ));
+                assert_eq!(app.show_activity, expected);
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                assert_eq!(
+                    buffer_lines(terminal.backend().buffer())[0].contains("Activity |"),
+                    app.show_activity
+                );
+            }
+            assert_eq!(app.show_activity, visible);
+        }
+    }
+
+    #[test]
     fn metrics_toggle_reclaims_table_space_and_restores_panel() {
         for (height, panel_height) in [(24, 6), (12, 4), (10, 0)] {
             let mut app = app_with_selected_servers();
