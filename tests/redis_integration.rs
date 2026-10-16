@@ -329,6 +329,11 @@ async fn standalone_hotkeys_sampling_works_against_live_redis() {
         return;
     }
 
+    if state.detail.hotkeys_supported == Some(false) {
+        skip_unreachable("standalone hotkeys", "server does not provide HOTKEYS");
+        return;
+    }
+
     for metric in [HotkeysMetric::Cpu, HotkeysMetric::Net] {
         request_tx
             .send(PollerRequest::StartHotkeys {
@@ -384,6 +389,11 @@ async fn standalone_hotkeys_sampling_can_stop_early() {
             "standalone redis",
             state.last_error.as_deref().unwrap_or("poll failed"),
         );
+        return;
+    }
+
+    if state.detail.hotkeys_supported == Some(false) {
+        skip_unreachable("standalone hotkeys stop", "server does not provide HOTKEYS");
         return;
     }
 

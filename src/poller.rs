@@ -11,7 +11,9 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 
 use crate::discovery::{local_process_id_for_tcp_port, local_process_id_for_unix_socket};
-use crate::hotkeys::{HotkeysMetric, HotkeysMetrics, HotkeysStatus, parse_hotkeys_get};
+use crate::hotkeys::{
+    HotkeysMetric, HotkeysMetrics, HotkeysStatus, parse_hotkeys_get, parse_hotkeys_support,
+};
 use crate::model::{
     BigkeyEntry, BigkeysMetrics, BigkeysScanStatus, ErrorDetails, InstanceState, InstanceType,
     KillAction, RuntimeSettings, Status, Target, TargetProtocol,
@@ -345,7 +347,9 @@ impl Poller {
         let Some(target) = self.targets.get(&key).cloned() else {
             return Ok(());
         };
-        if !force && prior.detail.hotkeys.status == HotkeysStatus::Running {
+        if prior.detail.hotkeys_supported == Some(false)
+            || (!force && prior.detail.hotkeys.status == HotkeysStatus::Running)
+        {
             return Ok(());
         }
 
@@ -543,6 +547,15 @@ async fn poll_one(
         .ok();
 
     apply_info_to_state(&mut state, &info, commandstats_info.as_deref());
+    // Introspection failures (e.g. ACL restrictions) do not prove HOTKEYS is absent.
+    state.detail.hotkeys_supported = redis::cmd("COMMAND")
+        .arg("INFO")
+        .arg("HOTKEYS")
+        .query_async::<Value>(&mut conn)
+        .await
+        .ok()
+        .as_ref()
+        .and_then(parse_hotkeys_support);
     if state.detail.process_id.is_none() {
         state.detail.process_id = resolve_local_process_id(target, &mut conn).await;
     }
@@ -1277,6 +1290,44 @@ mod tests {
         match update {
             Some(super::PollerUpdate::State(state)) => *state,
             _ => panic!("expected a published state"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_hotkeys_requests_do_not_start_tasks_even_when_forced() {
+        let (mut poller, mut updates, _) = idle_poller();
+        let key = "127.0.0.1:6379".to_string();
+        poller.targets.insert(
+            key.clone(),
+            Target {
+                alias: None,
+                addr: key.clone(),
+                protocol: TargetProtocol::Tcp,
+                username: None,
+                password: None,
+                tags: Vec::new(),
+                process_id: None,
+            },
+        );
+        let mut state = InstanceState::new(key.clone(), key.clone());
+        state.detail.hotkeys_supported = Some(false);
+        poller.known_states.insert(key.clone(), state);
+
+        for force in [false, true] {
+            for metric in [super::HotkeysMetric::Cpu, super::HotkeysMetric::Net] {
+                assert!(
+                    poller
+                        .start_hotkeys(key.clone(), metric, force)
+                        .await
+                        .is_ok()
+                );
+                assert!(poller.tasks.is_empty());
+                assert!(updates.try_recv().is_err());
+                assert_eq!(
+                    poller.known_states[&key].detail.hotkeys.status,
+                    super::HotkeysStatus::Idle
+                );
+            }
         }
     }
 

@@ -356,6 +356,8 @@ pub struct DetailMetrics {
     pub commandstats: Vec<CommandStat>,
     pub bigkeys: BigkeysMetrics,
     pub hotkeys: HotkeysMetrics,
+    /// None when command introspection is unavailable or has not run yet.
+    pub hotkeys_supported: Option<bool>,
     pub raw_info: Option<String>,
 }
 

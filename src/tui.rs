@@ -528,7 +528,15 @@ fn mark_bigkeys_running(app: &mut AppState, key: &str) {
     }
 }
 
+fn hotkeys_unavailable(app: &AppState) -> bool {
+    app.selected_instance()
+        .is_some_and(|instance| instance.detail.hotkeys_supported == Some(false))
+}
+
 fn start_hotkeys_sampling(app: &mut AppState, feeds: &Feeds, metric: HotkeysMetric) {
+    if hotkeys_unavailable(app) {
+        return;
+    }
     let Some(key) = app.selected_key() else {
         return;
     };
@@ -548,6 +556,9 @@ fn start_hotkeys_sampling(app: &mut AppState, feeds: &Feeds, metric: HotkeysMetr
 }
 
 fn handle_hotkeys_stop_or_reset(app: &mut AppState, feeds: &Feeds) {
+    if hotkeys_unavailable(app) {
+        return;
+    }
     let Some(key) = app.selected_key() else {
         return;
     };
@@ -1316,6 +1327,18 @@ fn draw_hotkeys(
     scroll: &mut Scroll,
     hotkeys: &HotkeysMetrics,
 ) {
+    if hotkeys_unavailable(pane.app) {
+        pane.aligned_message(
+            frame,
+            pane.block("Hotkeys".into()),
+            "HOTKEYS is unavailable on this server.\n\n\
+             This server does not provide the HOTKEYS command.\n\
+             CPU and NET sampling are disabled."
+                .into(),
+            Alignment::Center,
+        );
+        return;
+    }
     let visible = pane.app.visible_hotkeys(&hotkeys.entries);
     let range = scroll.viewport(visible.len(), pane.page_len(1));
 
@@ -1754,6 +1777,7 @@ fn help_bindings(app: &AppState) -> Vec<(&'static str, &'static str)> {
             ("r / R", "Reset statistics (asks for confirmation)"),
         ][..],
         DetailTab::Bigkeys => &[("r / R", "Rerun the Bigkeys scan")][..],
+        DetailTab::Hotkeys if hotkeys_unavailable(app) => &[],
         DetailTab::Hotkeys => &[
             ("C / N", "Start CPU / NET hotkeys sampling"),
             ("X", "Stop sampling, or reset this panel when idle"),
@@ -4475,6 +4499,81 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("No keys match the current filter"))
         );
+    }
+
+    #[test]
+    fn unsupported_hotkeys_shows_message_and_ignores_sampling_keys() {
+        let mut app = AppState::new(default_settings(), test_registry());
+        app.active_view = ActiveView::Detail;
+        app.detail_tab = DetailTab::Hotkeys;
+        let mut instance = InstanceState::new("a".into(), "127.0.0.1:6379".into());
+        instance.detail.hotkeys_supported = Some(false);
+        app.apply_update(instance.clone());
+        let (feeds, mut requests) = test_feeds();
+
+        for key in ['c', 'C', 'n', 'N', 'r', 'R', 'x', 'X'] {
+            assert!(super::handle_detail_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                &feeds,
+            ));
+            assert!(requests.try_recv().is_err());
+            assert_eq!(app.instances["a"].detail.hotkeys, instance.detail.hotkeys);
+        }
+        app.reset_hotkeys_locally("a");
+        app.apply_update(instance);
+        assert!(super::hotkeys_unavailable(&app));
+        assert!(
+            !super::help_bindings(&app)
+                .iter()
+                .any(|(key, _)| matches!(*key, "C / N" | "r / R" | "X"))
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let screen = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(screen.contains("HOTKEYS is unavailable on this server."));
+        assert!(screen.contains("CPU and NET sampling are disabled."));
+        assert!(!screen.contains("Start sampling"));
+        assert!(!screen.contains("[C] CPU [N] NET"));
+
+        // Moving to another server must use that server's capability.
+        let mut supported = InstanceState::new("b".into(), "127.0.0.1:6380".into());
+        supported.detail.hotkeys_supported = Some(true);
+        app.apply_update(supported);
+        app.move_selection(1);
+        assert!(!super::hotkeys_unavailable(&app));
+    }
+
+    #[test]
+    fn supported_or_unknown_hotkeys_keeps_sampling_shortcuts() {
+        for supported in [Some(true), None] {
+            for (key, metric) in [
+                ('C', super::HotkeysMetric::Cpu),
+                ('N', super::HotkeysMetric::Net),
+                ('R', super::HotkeysMetric::Cpu),
+            ] {
+                let mut app = AppState::new(default_settings(), test_registry());
+                app.active_view = ActiveView::Detail;
+                app.detail_tab = DetailTab::Hotkeys;
+                let mut instance = InstanceState::new("a".into(), "127.0.0.1:6379".into());
+                instance.detail.hotkeys_supported = supported;
+                app.apply_update(instance);
+                let (feeds, mut requests) = test_feeds();
+                assert!(super::handle_detail_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                    &feeds,
+                ));
+                assert!(
+                    matches!(requests.try_recv().unwrap(), PollerRequest::StartHotkeys { metric: actual, .. } if actual == metric)
+                );
+                assert_eq!(
+                    app.instances["a"].detail.hotkeys.status,
+                    super::HotkeysStatus::Running
+                );
+            }
+        }
     }
 
     #[test]

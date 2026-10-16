@@ -197,6 +197,9 @@
 
 ### Fixed
 
+- Detect servers without `HOTKEYS` before sampling, show a clear unavailable
+  message in the detail pane, and disable its sampling shortcuts and help hints.
+
 - Keep idle activity graphs low using per-server baseline scales and retained
   peaks for the current server group. Scrolling old load out of history or
   resizing the terminal no longer stretches idle traffic to full-height bars.

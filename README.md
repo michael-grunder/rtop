@@ -240,6 +240,11 @@ scrollable table with per-key share percentages. After completion, `C`/`N` can
 start a fresh run, `R` reruns the last metric, and `X` resets the pane back to
 its idle prompt.
 
+rtop checks `COMMAND INFO HOTKEYS` during polling. If the server does not provide
+`HOTKEYS` (including older Redis versions and forks without it), the pane shows
+an unavailable message and disables `C`/`N`, `R`, and `X`. If command introspection
+is blocked, sampling remains available and reports any errors normally.
+
 ## CLI
 
 Examples:

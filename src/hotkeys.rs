@@ -1,5 +1,16 @@
 use redis::Value;
 
+pub(crate) const fn parse_hotkeys_support(reply: &Value) -> Option<bool> {
+    let Value::Array(commands) = reply else {
+        return None;
+    };
+    match commands.as_slice() {
+        [Value::Nil] => Some(false),
+        [Value::Array(info)] if !info.is_empty() => Some(true),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HotkeysMetric {
     Cpu,
@@ -219,7 +230,33 @@ fn value_u64(value: &Value) -> Option<u64> {
 mod tests {
     use redis::Value;
 
-    use super::{HotkeyEntry, HotkeysMetric, HotkeysStatus, parse_hotkeys_get};
+    use super::{
+        HotkeyEntry, HotkeysMetric, HotkeysStatus, parse_hotkeys_get, parse_hotkeys_support,
+    };
+
+    #[test]
+    fn command_info_distinguishes_missing_present_and_unrecognized_replies() {
+        assert_eq!(
+            parse_hotkeys_support(&Value::Array(vec![Value::Nil])),
+            Some(false)
+        );
+        assert_eq!(
+            parse_hotkeys_support(&Value::Array(vec![Value::Array(vec![
+                Value::BulkString(b"hotkeys".to_vec()),
+                Value::Int(-2),
+            ])])),
+            Some(true)
+        );
+        for reply in [
+            Value::Nil,
+            Value::Okay,
+            Value::Array(vec![]),
+            Value::Array(vec![Value::Array(vec![])]),
+            Value::Array(vec![Value::Nil, Value::Nil]),
+        ] {
+            assert_eq!(parse_hotkeys_support(&reply), None);
+        }
+    }
 
     #[test]
     fn parse_hotkeys_get_extracts_cpu_results() {
