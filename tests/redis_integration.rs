@@ -29,19 +29,22 @@ fn runtime_settings() -> RuntimeSettings {
     }
 }
 
+#[cfg(unix)]
+struct Server(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.0.kill().expect("stop test Redis");
+        self.0.wait().expect("reap test Redis");
+    }
+}
+
 /// Dedicated temporary servers: this test must never reset a user's Redis statistics.
 #[cfg(unix)]
 #[tokio::test]
 async fn reset_stats_attempts_each_selected_node_and_refreshes_commandstats() {
-    use std::process::{Child, Command, Stdio};
-
-    struct Server(Child);
-    impl Drop for Server {
-        fn drop(&mut self) {
-            self.0.kill().expect("stop test Redis");
-            self.0.wait().expect("reap test Redis");
-        }
-    }
+    use std::process::{Command, Stdio};
 
     let dir = tempfile::tempdir().unwrap();
     let mut servers = Vec::new();
@@ -192,8 +195,16 @@ async fn recv_state(
     update_rx: &mut mpsc::Receiver<PollerUpdate>,
     key: &str,
 ) -> rtop::model::InstanceState {
+    recv_state_with_timeout(update_rx, key, Duration::from_secs(5)).await
+}
+
+async fn recv_state_with_timeout(
+    update_rx: &mut mpsc::Receiver<PollerUpdate>,
+    key: &str,
+    wait: Duration,
+) -> rtop::model::InstanceState {
     loop {
-        let update = timeout(Duration::from_secs(5), update_rx.recv())
+        let update = timeout(wait, update_rx.recv())
             .await
             .expect("timed out waiting for poller update")
             .expect("poller update channel closed unexpectedly");
@@ -201,7 +212,9 @@ async fn recv_state(
             PollerUpdate::State(state) if state.key == key => return *state,
             PollerUpdate::State(_)
             | PollerUpdate::Remove { .. }
-            | PollerUpdate::ResetStatsComplete { .. } => {}
+            | PollerUpdate::ResetStatsComplete { .. }
+            | PollerUpdate::Clients { .. }
+            | PollerUpdate::ClientsKilled { .. } => {}
         }
     }
 }
@@ -314,8 +327,12 @@ async fn cluster_discovery_and_bigkeys_scan_work_against_live_cluster() {
     assert!(scanned.detail.bigkeys.last_error.is_none());
 }
 
+// Redis permits only one tracking session per server, even across connections.
+static HOTKEYS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn standalone_hotkeys_sampling_works_against_live_redis() {
+    let _guard = HOTKEYS_TEST_LOCK.lock().await;
     let target = standalone_target();
     let settings = runtime_settings();
     let (mut update_rx, request_tx) = start(vec![target.clone()], settings);
@@ -353,7 +370,18 @@ async fn standalone_hotkeys_sampling_works_against_live_redis() {
             return;
         }
 
-        let sampled = recv_state(&mut update_rx, &target.addr).await;
+        let wait = rtop::poller::HOTKEYS_DURATION + Duration::from_secs(10);
+        let sampled = timeout(wait, async {
+            loop {
+                let state = recv_state_with_timeout(&mut update_rx, &target.addr, wait).await;
+                // Regular polling can publish an intermediate Running state at the same tick.
+                if state.detail.hotkeys.status != HotkeysStatus::Running {
+                    break state;
+                }
+            }
+        })
+        .await
+        .expect("hotkeys sampling completes");
         if sampled.detail.hotkeys.status == HotkeysStatus::Failed {
             let error = sampled
                 .detail
@@ -379,6 +407,7 @@ async fn standalone_hotkeys_sampling_works_against_live_redis() {
 
 #[tokio::test]
 async fn standalone_hotkeys_sampling_can_stop_early() {
+    let _guard = HOTKEYS_TEST_LOCK.lock().await;
     let target = standalone_target();
     let settings = runtime_settings();
     let (mut update_rx, request_tx) = start(vec![target.clone()], settings);
@@ -496,4 +525,193 @@ async fn cluster_seed_discovery_expands_to_every_cluster_node() {
             "cluster seed discovery missed {identity}; verified {verified:?}"
         );
     }
+}
+
+/// All destructive commands in this test target a private, password-protected server.
+#[cfg(unix)]
+#[tokio::test]
+async fn client_kills_and_lazy_reconnect_preserve_authentication() {
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("clients.sock");
+    let child = match Command::new("redis-server")
+        .args([
+            "--port",
+            "0",
+            "--save",
+            "",
+            "--appendonly",
+            "no",
+            "--requirepass",
+            "test-secret",
+            "--unixsocket",
+        ])
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            skip_unreachable(
+                "isolated client tests (redis-server not installed)",
+                &error.to_string(),
+            );
+            return;
+        }
+        Err(error) => panic!("start test Redis: {error}"),
+    };
+    let _server = Server(child);
+    let target = Target {
+        addr: path.to_string_lossy().into_owned(),
+        protocol: TargetProtocol::Unix,
+        password: Some("test-secret".into()),
+        username: Some("default".into()),
+        ..standalone_target()
+    };
+    let client =
+        redis::Client::open(format!("redis+unix://{}?pass=test-secret", target.addr)).unwrap();
+    let mut admin = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(conn) = client.get_multiplexed_async_connection().await {
+                break conn;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("private Redis ready");
+    let mut victims = Vec::new();
+    let mut victim_ids = Vec::new();
+    for _ in 0..2 {
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        victim_ids.push(
+            redis::cmd("CLIENT")
+                .arg("ID")
+                .query_async::<u64>(&mut conn)
+                .await
+                .unwrap(),
+        );
+        victims.push(conn);
+    }
+    let (mut updates, requests) = start(vec![target.clone()], runtime_settings());
+    recv_state(&mut updates, &target.addr).await;
+    requests
+        .send(PollerRequest::WatchClients {
+            key: Some(target.addr.clone()),
+        })
+        .await
+        .unwrap();
+    let first = recv_clients(&mut updates).await.unwrap();
+    for id in &victim_ids {
+        assert!(first.rows.iter().any(|row| row.id == *id));
+    }
+    assert!(first.rows.iter().any(|row| row.id == first.own_id));
+
+    // Include self first in the request to exercise sorting our own kill last.
+    let mut ids = vec![first.own_id];
+    ids.extend(&victim_ids);
+    requests
+        .send(PollerRequest::KillClients {
+            key: target.addr.clone(),
+            ids,
+        })
+        .await
+        .unwrap();
+    let results = recv_client_kills(&mut updates).await;
+    assert_eq!(results.len(), 3);
+    assert!(
+        results.iter().all(|(_, result)| result == &Ok(1)),
+        "{results:?}"
+    );
+    assert_eq!(results.last().unwrap().0, first.own_id);
+    let second = recv_clients(&mut updates).await.unwrap();
+    assert_ne!(first.own_id, second.own_id);
+    assert!(second.rows.iter().all(|row| !victim_ids.contains(&row.id)));
+    assert_eq!(
+        redis::cmd("PING")
+            .query_async::<String>(&mut admin)
+            .await
+            .unwrap(),
+        "PONG"
+    );
+
+    // An external kill is first discovered by a read pipeline. The next refresh reconnects.
+    redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("ID")
+        .arg(second.own_id)
+        .query_async::<u64>(&mut admin)
+        .await
+        .unwrap();
+    requests.send(PollerRequest::RefreshAll).await.unwrap();
+    assert!(recv_clients(&mut updates).await.is_err());
+    requests.send(PollerRequest::RefreshAll).await.unwrap();
+    let third = recv_clients(&mut updates).await.unwrap();
+    assert_ne!(second.own_id, third.own_id);
+
+    // A single command discovering a dead socket must not replay a destructive action.
+    redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("ID")
+        .arg(third.own_id)
+        .query_async::<u64>(&mut admin)
+        .await
+        .unwrap();
+    let admin_id = redis::cmd("CLIENT")
+        .arg("ID")
+        .query_async::<u64>(&mut admin)
+        .await
+        .unwrap();
+    requests
+        .send(PollerRequest::KillClients {
+            key: target.addr.clone(),
+            ids: vec![admin_id],
+        })
+        .await
+        .unwrap();
+    assert!(recv_client_kills(&mut updates).await[0].1.is_err());
+    let fourth = recv_clients(&mut updates).await.unwrap();
+    assert_ne!(third.own_id, fourth.own_id);
+    assert_eq!(
+        redis::cmd("PING")
+            .query_async::<String>(&mut admin)
+            .await
+            .unwrap(),
+        "PONG"
+    );
+    requests
+        .send(PollerRequest::WatchClients { key: None })
+        .await
+        .unwrap();
+}
+
+#[cfg(unix)]
+async fn recv_clients(
+    updates: &mut tokio::sync::mpsc::Receiver<PollerUpdate>,
+) -> Result<rtop::clients::ClientSnapshot, String> {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let PollerUpdate::Clients { snapshot, .. } = updates.recv().await.unwrap() {
+                return snapshot;
+            }
+        }
+    })
+    .await
+    .expect("client snapshot")
+}
+
+#[cfg(unix)]
+async fn recv_client_kills(
+    updates: &mut tokio::sync::mpsc::Receiver<PollerUpdate>,
+) -> Vec<(u64, Result<u64, String>)> {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let PollerUpdate::ClientsKilled { results, .. } = updates.recv().await.unwrap() {
+                return results;
+            }
+        }
+    })
+    .await
+    .expect("kill results")
 }

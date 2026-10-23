@@ -2,6 +2,11 @@
 
 ### Added
 
+- Add a Clients detail pane backed by `CLIENT LIST`, with configurable discovered
+  columns, all-field filtering, stable cursor and selection gutters, and Space
+  hold selection that skips self. Confirm ID-based single/batch kills, allow
+  explicit self-kills, and show per-client results.
+
 - Add `rtop.dist.toml` as a commented configuration reference, and
   `[global].show_activity` (default `true`) to control startup header visibility,
   including `--config get/set` support. `m` / `M` still toggles it during a session.
@@ -107,6 +112,12 @@
 
 ### Changed
 
+- Share the overview's compact selection gutter with Clients: `>`, `●`, and
+  bold `▶` indicate focus, selection, or both, replacing client checkboxes.
+
+- Use fuzzy terms in shared filters; prefix a term with a quote for exact
+  substring matching.
+
 - Show `CONFIG RESETSTAT` results only when at least one node fails; close
   the confirmation immediately and let successful resets finish silently.
 
@@ -196,6 +207,11 @@
   autodiscovery for matching endpoints.
 
 ### Fixed
+
+- Lazily reconnect shared Redis connections after transport errors and timeouts,
+  preserving authentication without replaying failed commands.
+- Coordinate live HOTKEYS integration tests and allow the configured sampling
+  duration before timing out.
 
 - Detect servers without `HOTKEYS` before sampling, show a clear unavailable
   message in the detail pane, and disable its sampling shortcuts and help hints.

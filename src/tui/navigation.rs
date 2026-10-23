@@ -15,6 +15,7 @@ struct SpaceHold {
     // Counted ranges consume repeats but do not expand into a topology selection.
     target: Option<(String, bool)>,
     stage: u8,
+    client: Option<(String, u64, bool)>,
 }
 
 #[derive(Default)]
@@ -95,7 +96,8 @@ impl Navigation {
 
     fn advance_space_hold(&mut self, app: &mut AppState, now: Instant) {
         if !accepts_navigation(app)
-            || app.active_view != ActiveView::Overview
+            || !(app.active_view == ActiveView::Overview
+                || app.is_detail_tab(super::DetailTab::Clients))
             || app.overview_modal != OverviewModal::None
         {
             self.cancel_space_hold();
@@ -104,6 +106,20 @@ impl Navigation {
         let Some(hold) = &mut self.space_hold else {
             return;
         };
+        if let Some((target, id, selected)) = &hold.client {
+            if !app.is_detail_tab(super::DetailTab::Clients)
+                || app.clients.target.as_ref() != Some(target)
+                || !app.clients.rows.iter().any(|row| row.id == *id)
+            {
+                self.cancel_space_hold();
+                return;
+            }
+            if hold.stage == 0 && now.saturating_duration_since(hold.started) >= FAMILY_HOLD {
+                app.clients.select_all(*selected);
+                hold.stage = 1;
+            }
+            return;
+        }
         let Some((key, selected)) = &hold.target else {
             return;
         };
@@ -153,8 +169,17 @@ impl Navigation {
             repeated: false,
             target: None,
             stage: 0,
+            client: None,
         };
-        if let Some(count) = count {
+        if app.is_detail_tab(super::DetailTab::Clients) {
+            let filter = app.pane(super::DetailTab::Clients).filter.clone();
+            if let Some(target) = app.clients.target.clone() {
+                hold.client = app
+                    .clients
+                    .toggle(&filter)
+                    .map(|(id, selected)| (target, id, selected));
+            }
+        } else if let Some(count) = count {
             app.select_server_range(&range_keys(app, count, false));
         } else if let Some((at, keys)) = recent_range
             && now.saturating_duration_since(at) <= RANGE_TIMEOUT
@@ -190,7 +215,11 @@ impl Navigation {
         }
         let overview =
             app.active_view == ActiveView::Overview && app.overview_modal == OverviewModal::None;
-        if key.code == KeyCode::Char(' ') && overview {
+        if key.code == KeyCode::Char(' ')
+            && (overview
+                || (app.is_detail_tab(super::DetailTab::Clients)
+                    && app.overview_modal == OverviewModal::None))
+        {
             return self.handle_space(app, key, now);
         }
         self.cancel_space_hold();
@@ -253,6 +282,16 @@ impl Navigation {
                 }
                 app.move_selection(delta);
             }
+            OverviewModal::None if app.is_detail_tab(super::DetailTab::Clients) => {
+                let filter = app.pane(super::DetailTab::Clients).filter.clone();
+                let rows = app.clients.visible(&filter);
+                let index = rows
+                    .iter()
+                    .position(|row| Some(row.id) == app.clients.focus)
+                    .unwrap_or(0);
+                let delta = motion.row_delta(index, rows.len(), app.clients.page_len);
+                app.clients.move_focus(&filter, delta);
+            }
             OverviewModal::None => scroll_detail(app, motion),
             _ => {}
         }
@@ -268,6 +307,8 @@ fn accepts_navigation(app: &AppState) -> bool {
         || matches!(
             app.overview_modal,
             OverviewModal::KillConfirmation
+                | OverviewModal::ClientKillConfirmation
+                | OverviewModal::ClientKillResult
                 | OverviewModal::ResetStatsConfirmation
                 | OverviewModal::ResetStatsResult
         ))
@@ -658,7 +699,7 @@ mod tests {
     #[test]
     fn range_uses_captured_visible_order_and_skips_removed_servers() {
         let mut app = app();
-        app.filter = "638".into();
+        app.filter = "'638".into();
         app.sort_direction = SortDirection::Desc;
         let mut nav = Navigation::default();
         let now = Instant::now();
@@ -778,6 +819,38 @@ mod tests {
     }
 
     #[test]
+    fn client_space_hold_selects_all_skips_self_and_cancels_in_modals() {
+        for releases in [true, false] {
+            let mut app = app();
+            app.active_view = ActiveView::Detail;
+            app.detail_tab = DetailTab::Clients;
+            app.clients.set_target(Some("server".into()));
+            app.clients.apply(
+                Ok(crate::clients::ClientSnapshot {
+                    rows: crate::clients::parse_list("id=1\nid=2\nid=3").unwrap(),
+                    own_id: 3,
+                }),
+                "",
+            );
+            let mut nav = Navigation::new(releases);
+            let now = Instant::now();
+            space(&mut nav, &mut app, KeyEventKind::Press, now);
+            assert_eq!(app.clients.marked.len(), 1);
+            if releases {
+                nav.tick(&mut app, now + FAMILY_HOLD);
+            } else {
+                space(&mut nav, &mut app, KeyEventKind::Repeat, now + FAMILY_HOLD);
+            }
+            assert_eq!(app.clients.marked, std::collections::BTreeSet::from([1, 2]));
+            space(&mut nav, &mut app, KeyEventKind::Release, now + FAMILY_HOLD);
+            space(&mut nav, &mut app, KeyEventKind::Press, now + CLUSTER_HOLD);
+            app.overview_modal = OverviewModal::ClientKillConfirmation;
+            nav.tick(&mut app, now + CLUSTER_HOLD + FAMILY_HOLD);
+            assert_eq!(app.clients.marked, std::collections::BTreeSet::from([2]));
+        }
+    }
+
+    #[test]
     fn detail_tabs_and_scrolling_accept_counts() {
         let mut app = app();
         app.active_view = ActiveView::Detail;
@@ -792,7 +865,7 @@ mod tests {
         type_keys(&mut nav, &mut app, "2l", now);
         assert_eq!(app.detail_tab, DetailTab::Commandstats);
         type_keys(&mut nav, &mut app, "3h", now);
-        assert_eq!(app.detail_tab, DetailTab::Hotkeys);
+        assert_eq!(app.detail_tab, DetailTab::Clients);
         type_keys(&mut nav, &mut app, "l", now);
         assert_eq!(app.detail_tab, DetailTab::Summary);
     }

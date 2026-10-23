@@ -45,6 +45,8 @@ pub enum OverviewModal {
     ResetStatsConfirmation,
     ResetStatsResult,
     AuthForm,
+    ClientKillConfirmation,
+    ClientKillResult,
 }
 
 /// The panels of the detail view, in tab order.
@@ -55,15 +57,17 @@ pub enum DetailTab {
     Commandstats,
     Bigkeys,
     Hotkeys,
+    Clients,
 }
 
 impl DetailTab {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Summary,
         Self::InfoRaw,
         Self::Commandstats,
         Self::Bigkeys,
         Self::Hotkeys,
+        Self::Clients,
     ];
 
     pub const fn title(self) -> &'static str {
@@ -73,6 +77,7 @@ impl DetailTab {
             Self::Commandstats => "Commandstats",
             Self::Bigkeys => "Bigkeys",
             Self::Hotkeys => "Hotkeys",
+            Self::Clients => "Clients",
         }
     }
 
@@ -84,6 +89,7 @@ impl DetailTab {
             Self::Commandstats => 'c',
             Self::Bigkeys => 'b',
             Self::Hotkeys => 'k',
+            Self::Clients => 'l',
         }
     }
 
@@ -196,7 +202,7 @@ impl Scroll {
     }
 }
 
-/// Case-insensitive substring matcher shared by every filter prompt.
+/// Case-insensitive fuzzy terms; a leading quote makes a term an exact substring.
 pub struct Matcher {
     needle: String,
 }
@@ -209,7 +215,17 @@ impl Matcher {
     }
 
     pub fn matches(&self, text: &str) -> bool {
-        self.needle.is_empty() || text.to_ascii_lowercase().contains(&self.needle)
+        if self.needle.is_empty() {
+            return true;
+        }
+        let text = text.to_ascii_lowercase();
+        self.needle.split_whitespace().all(|term| {
+            if let Some(exact) = term.strip_prefix('\'') {
+                return text.contains(exact);
+            }
+            let mut chars = text.chars();
+            term.chars().all(|wanted| chars.any(|ch| ch == wanted))
+        })
     }
 }
 
@@ -293,6 +309,7 @@ impl<T: PartialEq + Clone> ColumnSet<T> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ColumnPickerTarget {
+    Clients,
     Overview,
     Commandstats,
 }
@@ -335,6 +352,7 @@ pub struct AppState {
     column_picker_target: ColumnPickerTarget,
     pub commandstats_columns: ColumnSet<CommandstatsColumn>,
     pub commandstats_compact: bool,
+    pub clients: crate::clients::ClientPane,
     pub reset_stats_targets: Vec<String>,
     pub reset_stats_result: String,
     pub overview_columns: ColumnSet<String>,
@@ -387,6 +405,7 @@ impl AppState {
                 CommandstatsColumn::DEFAULT,
             ),
             commandstats_compact: false,
+            clients: crate::clients::ClientPane::default(),
             reset_stats_targets: Vec::new(),
             reset_stats_result: String::new(),
             overview_columns: ColumnSet::new(
@@ -772,7 +791,9 @@ impl AppState {
     }
 
     pub fn open_column_picker(&mut self) {
-        self.column_picker_target = if self.is_detail_tab(DetailTab::Commandstats) {
+        self.column_picker_target = if self.is_detail_tab(DetailTab::Clients) {
+            ColumnPickerTarget::Clients
+        } else if self.is_detail_tab(DetailTab::Commandstats) {
             ColumnPickerTarget::Commandstats
         } else {
             ColumnPickerTarget::Overview
@@ -795,6 +816,17 @@ impl AppState {
 
     pub fn column_picker_entries(&self) -> Vec<ColumnPickerEntry> {
         match self.column_picker_target {
+            ColumnPickerTarget::Clients => self
+                .clients
+                .columns
+                .order
+                .iter()
+                .map(|key| ColumnPickerEntry {
+                    label: key.clone(),
+                    visible: self.clients.columns.is_visible(key),
+                    suffix: "",
+                })
+                .collect(),
             ColumnPickerTarget::Commandstats => self
                 .commandstats_columns
                 .order
@@ -901,6 +933,12 @@ impl AppState {
     }
 
     pub fn close_overview_modal(&mut self) {
+        if self.overview_modal == OverviewModal::ClientKillConfirmation {
+            self.clients.confirmation = None;
+        }
+        if self.overview_modal == OverviewModal::ClientKillResult {
+            self.clients.result.clear();
+        }
         if self.overview_modal == OverviewModal::ResetStatsResult {
             self.reset_stats_result.clear();
         }
@@ -948,6 +986,7 @@ impl AppState {
     pub fn move_selected_column(&mut self, delta: isize) {
         let index = self.column_picker_index;
         self.column_picker_index = match self.column_picker_target {
+            ColumnPickerTarget::Clients => self.clients.columns.move_entry(index, delta),
             ColumnPickerTarget::Commandstats => self.commandstats_columns.move_entry(index, delta),
             ColumnPickerTarget::Overview => {
                 let Some(order_index) = self.picked_overview_column().and_then(|key| {
@@ -965,6 +1004,19 @@ impl AppState {
 
     pub fn toggle_selected_column_visibility(&mut self) {
         match self.column_picker_target {
+            ColumnPickerTarget::Clients => {
+                if let Some(key) = self
+                    .clients
+                    .columns
+                    .order
+                    .get(self.column_picker_index)
+                    .cloned()
+                {
+                    self.clients
+                        .columns
+                        .toggle(&key, |set| set.visible.len() > 1);
+                }
+            }
             ColumnPickerTarget::Commandstats => {
                 let Some(column) = self
                     .commandstats_columns
@@ -2263,6 +2315,15 @@ mod tests {
     }
 
     #[test]
+    fn filters_use_fuzzy_terms_and_quoted_exact_terms() {
+        assert!(super::Matcher::new("rd cl").matches("Redis client"));
+        assert!(!super::Matcher::new("'rd").matches("Redis client"));
+        assert!(super::Matcher::new("'redis 'client").matches("REDIS client"));
+        assert!(!super::Matcher::new("dr").matches("Redis"));
+        assert!(super::Matcher::new("").matches(""));
+    }
+
+    #[test]
     fn scroll_is_clamped_to_the_rendered_viewport() {
         let mut scroll = Scroll::default();
         assert_eq!(scroll.viewport(4, 3), 0..3);
@@ -2294,11 +2355,11 @@ mod tests {
 
     #[test]
     fn detail_tabs_rotate_and_map_shortcuts() {
-        assert_eq!(DetailTab::Summary.rotate(-1), DetailTab::Hotkeys);
-        assert_eq!(DetailTab::Hotkeys.rotate(1), DetailTab::Summary);
+        assert_eq!(DetailTab::Summary.rotate(-1), DetailTab::Clients);
+        assert_eq!(DetailTab::Clients.rotate(1), DetailTab::Summary);
         assert_eq!(DetailTab::Summary.rotate(1), DetailTab::InfoRaw);
         assert_eq!(DetailTab::InfoRaw.rotate(-1), DetailTab::Summary);
-        assert_eq!(DetailTab::Summary.rotate(11), DetailTab::InfoRaw);
+        assert_eq!(DetailTab::Summary.rotate(13), DetailTab::InfoRaw);
         assert_eq!(DetailTab::from_shortcut('K'), Some(DetailTab::Hotkeys));
         assert_eq!(DetailTab::from_shortcut('k'), None);
     }

@@ -36,6 +36,13 @@ const TASK_ERROR_MAX_CHARS: usize = 120;
 #[derive(Debug, Clone)]
 pub enum PollerRequest {
     RefreshAll,
+    WatchClients {
+        key: Option<String>,
+    },
+    KillClients {
+        key: String,
+        ids: Vec<u64>,
+    },
     ResetStats {
         keys: Vec<String>,
     },
@@ -65,6 +72,14 @@ pub enum PollerRequest {
 
 #[derive(Debug, Clone)]
 pub enum PollerUpdate {
+    Clients {
+        key: String,
+        snapshot: Result<crate::clients::ClientSnapshot, String>,
+    },
+    ClientsKilled {
+        key: String,
+        results: Vec<(u64, Result<u64, String>)>,
+    },
     State(Box<InstanceState>),
     Remove {
         key: String,
@@ -105,6 +120,7 @@ struct Disconnected;
 type Step = Result<(), Disconnected>;
 
 struct Poller {
+    clients: Option<(String, redis_connection::Connection)>,
     settings: RuntimeSettings,
     semaphore: Arc<Semaphore>,
     targets: HashMap<String, Target>,
@@ -128,6 +144,7 @@ pub fn start(
         // A slow refresh must not trigger a burst of catch-up refreshes.
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut poller = Poller {
+            clients: None,
             semaphore: Arc::new(Semaphore::new(settings.concurrency_limit.max(1))),
             settings,
             targets: targets
@@ -163,6 +180,11 @@ pub fn start(
 impl Poller {
     async fn handle(&mut self, request: PollerRequest) -> Step {
         match request {
+            PollerRequest::WatchClients { key } => {
+                self.watch_clients(key);
+                self.refresh_clients().await?;
+            }
+            PollerRequest::KillClients { key, ids } => self.kill_clients(key, ids).await?,
             PollerRequest::ResetStats { keys } => self.reset_stats(&keys).await?,
             PollerRequest::RefreshAll => {
                 let targets = self.targets.values().cloned().collect();
@@ -174,6 +196,7 @@ impl Poller {
                 {
                     self.publish(state).await?;
                 }
+                self.refresh_clients().await?;
             }
             PollerRequest::UpsertTarget(target) => {
                 if self.targets.contains_key(&target.addr) {
@@ -208,7 +231,9 @@ impl Poller {
                     match update {
                         PollerUpdate::State(state) => self.publish(*state).await?,
                         PollerUpdate::Remove { key } => self.publish_removal(key).await?,
-                        PollerUpdate::ResetStatsComplete { .. } => {
+                        PollerUpdate::ResetStatsComplete { .. }
+                        | PollerUpdate::Clients { .. }
+                        | PollerUpdate::ClientsKilled { .. } => {
                             unreachable!("kill returns a state or removal")
                         }
                     }
@@ -223,6 +248,19 @@ impl Poller {
                     if let Some(target) = self.targets.get_mut(key) {
                         target.username.clone_from(&username);
                         target.password = Some(password.clone());
+                        if self
+                            .clients
+                            .as_ref()
+                            .is_some_and(|(watched, _)| watched == key)
+                        {
+                            self.clients = Some((
+                                key.clone(),
+                                redis_connection::Connection::lazy(
+                                    target.clone(),
+                                    self.settings.clone(),
+                                ),
+                            ));
+                        }
                     }
                 }
                 let targets = self.claim_targets(&keys);
@@ -237,6 +275,93 @@ impl Poller {
             }
         }
         Ok(())
+    }
+
+    fn watch_clients(&mut self, key: Option<String>) {
+        self.clients = key.and_then(|key| {
+            self.targets.get(&key).map(|target| {
+                (
+                    key,
+                    redis_connection::Connection::lazy(target.clone(), self.settings.clone()),
+                )
+            })
+        });
+    }
+
+    async fn refresh_clients(&mut self) -> Step {
+        let Some((key, conn)) = &mut self.clients else {
+            return Ok(());
+        };
+        let response: redis::RedisResult<(u64, String)> = redis::pipe()
+            .cmd("CLIENT")
+            .arg("ID")
+            .cmd("CLIENT")
+            .arg("LIST")
+            .query_async(conn)
+            .await;
+        let snapshot = response
+            .map_err(|error| error.to_string())
+            .and_then(|(own_id, text)| {
+                crate::clients::parse_list(&text)
+                    .map(|rows| crate::clients::ClientSnapshot { rows, own_id })
+            });
+        self.update_tx
+            .send(PollerUpdate::Clients {
+                key: key.clone(),
+                snapshot,
+            })
+            .await
+            .map_err(|_| Disconnected)
+    }
+
+    async fn kill_clients(&mut self, key: String, mut ids: Vec<u64>) -> Step {
+        let mut results = Vec::new();
+        if let Some((_, conn)) = self.clients.as_mut().filter(|(watched, _)| *watched == key) {
+            // Execute our own kill last so earlier results are not lost on disconnect.
+            let own_id = redis::cmd("CLIENT")
+                .arg("ID")
+                .query_async::<u64>(conn)
+                .await;
+            match own_id {
+                Ok(own_id) => {
+                    ids.sort_unstable();
+                    ids.dedup();
+                    ids.sort_by_key(|id| *id == own_id);
+                    for id in ids {
+                        let result = redis::cmd("CLIENT")
+                            .arg("KILL")
+                            .arg("ID")
+                            .arg(id)
+                            .arg("SKIPME")
+                            .arg("NO")
+                            .query_async::<u64>(conn)
+                            .await
+                            .map_err(|error| {
+                                format!("{error}; outcome may be unknown, refresh before retrying")
+                            });
+                        if id == own_id {
+                            conn.disconnect();
+                        }
+                        results.push((id, result));
+                    }
+                }
+                Err(error) => {
+                    results.extend(ids.into_iter().map(|id| (id, Err(error.to_string()))));
+                }
+            }
+        } else {
+            results.extend(ids.into_iter().map(|id| {
+                (
+                    id,
+                    Err("Client pane is no longer connected to this server".into()),
+                )
+            }));
+        }
+        self.update_tx
+            .send(PollerUpdate::ClientsKilled { key, results })
+            .await
+            .map_err(|_| Disconnected)?;
+        self.refresh_clients().await
     }
 
     async fn reset_stats(&mut self, keys: &[String]) -> Step {
@@ -1274,6 +1399,7 @@ mod tests {
         let (update_tx, update_rx) = tokio::sync::mpsc::channel(16);
         let (task_tx, task_rx) = tokio::sync::mpsc::channel(16);
         let poller = super::Poller {
+            clients: None,
             semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             settings,
             targets: std::collections::HashMap::new(),

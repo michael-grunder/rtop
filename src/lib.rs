@@ -9,6 +9,7 @@
 mod activity;
 pub mod app;
 pub mod cli;
+pub mod clients;
 pub mod cluster;
 pub mod column;
 pub mod columns;

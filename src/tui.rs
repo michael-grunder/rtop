@@ -1,4 +1,5 @@
 mod activity;
+mod clients;
 mod navigation;
 
 use std::fmt::Write as _;
@@ -99,6 +100,26 @@ impl Feeds {
     fn drain_into(&mut self, app: &mut AppState) {
         while let Ok(update) = self.updates_rx.try_recv() {
             match update {
+                PollerUpdate::Clients { key, snapshot } => {
+                    if app.clients.target.as_ref() == Some(&key) {
+                        let filter = app.pane(DetailTab::Clients).filter.clone();
+                        app.clients.apply(snapshot, &filter);
+                    }
+                }
+                PollerUpdate::ClientsKilled { key, results } => {
+                    app.clients.result = format!(
+                        "Server: {key}\n{}",
+                        results
+                            .into_iter()
+                            .map(|(id, result)| match result {
+                                Ok(0) => format!("Client {id}: already disconnected"),
+                                Ok(_) => format!("Client {id}: killed"),
+                                Err(error) => format!("Client {id}: failed: {error}"),
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    );
+                }
                 PollerUpdate::State(state) => app.apply_update(*state),
                 PollerUpdate::Remove { key } => app.remove_instance(&key),
                 PollerUpdate::ResetStatsComplete { results } => {
@@ -211,6 +232,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, launch: LaunchCon
     loop {
         feeds.drain_into(&mut app);
         maybe_request_bigkeys_scan(&mut app, &feeds);
+        clients::sync_target(&mut app, &feeds)?;
 
         terminal.draw(|frame| draw(frame, &mut app))?;
 
@@ -268,6 +290,9 @@ fn handle_key(app: &mut AppState, key: KeyEvent, feeds: &Feeds) -> Result<()> {
         return Ok(());
     }
     if app.is_column_picker_open() && handle_column_picker_key(app, key) {
+        return Ok(());
+    }
+    if clients::handle_key(app, key, feeds)? {
         return Ok(());
     }
     if handle_kill_key(app, key, feeds)? {
@@ -692,6 +717,15 @@ const fn is_shift_modifier(modifier: ModifierKeyCode) -> bool {
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &mut AppState) {
     if app.overview_modal == OverviewModal::None
+        && !app.clients.result.is_empty()
+        && !app.show_help
+        && !app.is_filtering
+        && app.editing_pane().is_none()
+    {
+        app.overview_modal = OverviewModal::ClientKillResult;
+        app.popup_scroll.to_start();
+    }
+    if app.overview_modal == OverviewModal::None
         && !app.reset_stats_result.is_empty()
         && !app.show_help
         && !app.is_filtering
@@ -733,6 +767,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &mut AppState) {
             draw_reset_stats_popup(frame, area, app);
         }
         OverviewModal::AuthForm => draw_auth_form(frame, area, app),
+        OverviewModal::ClientKillConfirmation | OverviewModal::ClientKillResult => {
+            clients::draw_popup(frame, app, area);
+        }
     }
 
     if app.show_help {
@@ -761,6 +798,21 @@ const fn tone_color(app: &AppState, tone: Tone) -> Color {
         Tone::Warning => theme.warning.to_ratatui_color(),
         Tone::Critical => theme.critical.to_ratatui_color(),
     }
+}
+
+fn selection_gutter_cell(app: &AppState, focused: bool, selected: bool) -> Cell<'static> {
+    let marker = match (focused, selected) {
+        (true, true) => "▶",
+        (true, false) => ">",
+        (false, true) => "●",
+        (false, false) => " ",
+    };
+    let style = if focused {
+        highlight_style(app)
+    } else {
+        base_style(app)
+    };
+    Cell::from(Span::styled(marker, style))
 }
 
 fn overview_cluster_gutter_cell(
@@ -818,20 +870,11 @@ fn draw_overview(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect)
         .iter()
         .map(|row| {
             let mut cells = Vec::with_capacity(overview.columns.len() + 2);
-            let marker = match (row.selected, app.is_server_selected(&row.key)) {
-                (true, true) => "▶",
-                (true, false) => ">",
-                (false, true) => "●",
-                (false, false) => " ",
-            };
-            let marker_style = if row.selected {
-                base_style(app)
-                    .fg(carat_color(app))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                base_style(app)
-            };
-            cells.push(Cell::from(Span::styled(marker, marker_style)));
+            cells.push(selection_gutter_cell(
+                app,
+                row.selected,
+                app.is_server_selected(&row.key),
+            ));
             cells.push(overview_cluster_gutter_cell(row.cluster_gutter.as_ref()));
             cells.extend(row.cells.iter().zip(&overview.columns).zip(&widths).map(
                 |((cell, column), width)| {
@@ -1016,6 +1059,11 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) {
         header_area,
     );
 
+    if app.detail_tab == DetailTab::Clients {
+        clients::draw(frame, app, body_area);
+        return;
+    }
+
     // Panes render from a copy of the scroll state and report back the
     // viewport they used, so input handling can clamp against it.
     let tab = app.detail_tab;
@@ -1026,6 +1074,7 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) {
         area: body_area,
     };
     match tab {
+        DetailTab::Clients => unreachable!("clients rendered above"),
         DetailTab::Summary | DetailTab::InfoRaw => {
             draw_detail_text(frame, &pane, &mut scroll, &detail_text_body(instance, tab));
         }
@@ -1504,7 +1553,9 @@ fn detail_text_body(instance: &InstanceState, tab: DetailTab) -> String {
             .raw_info
             .clone()
             .unwrap_or_else(|| "INFO not available".to_string()),
-        DetailTab::Commandstats | DetailTab::Bigkeys | DetailTab::Hotkeys => String::new(),
+        DetailTab::Commandstats | DetailTab::Bigkeys | DetailTab::Hotkeys | DetailTab::Clients => {
+            String::new()
+        }
     }
 }
 
@@ -1639,6 +1690,9 @@ fn status_bar_actions(app: &AppState) -> Line<'static> {
 }
 
 fn detail_footer_actions(app: &AppState) -> Line<'static> {
+    if app.detail_tab == DetailTab::Clients {
+        return Line::from("[F7]Columns  [Space]Select  [X]Kill  /Filter  [Tab]Pane  [H]elp");
+    }
     let mut spans = Vec::new();
     for tab in DetailTab::ALL {
         if !spans.is_empty() {
@@ -1771,6 +1825,26 @@ fn help_bindings(app: &AppState) -> Vec<(&'static str, &'static str)> {
         ("/", "Edit this panel's filter"),
     ];
     bindings.extend_from_slice(match app.detail_tab {
+        DetailTab::Clients => &[
+            ("c / v / F7", "Choose and reorder client columns"),
+            (
+                "Space",
+                "Select/unselect focused client; hold 700 ms for all (except self)",
+            ),
+            (
+                "x / K / F9",
+                "Kill selected clients or focused row (always confirms)",
+            ),
+            (
+                "j / k / Up / Down",
+                "Move focus; PgUp/PgDn and Home/End also work",
+            ),
+            (
+                "/text /'text",
+                "Fuzzy / exact substring search across all fields",
+            ),
+            ("r / R", "Refresh now; italic row is this pane's connection"),
+        ][..],
         DetailTab::Commandstats => &[
             ("c / C / v / V / F7", "Choose columns"),
             ("p / P", "Toggle compact command/calls layout"),
@@ -2660,7 +2734,7 @@ mod tests {
                 let bindings = super::help_bindings(&app);
                 assert_eq!(
                     bindings.iter().any(|(keys, _)| *keys == "Space"),
-                    view == ActiveView::Overview
+                    view == ActiveView::Overview || tab == DetailTab::Clients
                 );
                 assert_eq!(
                     bindings.iter().any(|(keys, _)| *keys == "X"),
@@ -2740,7 +2814,7 @@ mod tests {
             let rendered = lines.join("\n");
             assert!(rendered.contains("Tab: Next detail panel"));
             assert!(rendered.contains("/: Edit this panel's filter"));
-            for global in ["Ctrl+C", "Up/Down", "PgUp", "motion", "Home", "arrow"] {
+            for global in ["Ctrl+C", "Up/Down", "motion", "arrow"] {
                 assert!(!rendered.contains(global), "{tab:?}: {global}");
             }
             assert_eq!(app.popup_scroll.offset(), 0);
@@ -2805,7 +2879,7 @@ mod tests {
             matches!(requests.try_recv().unwrap(), PollerRequest::ResetStats { keys } if keys == expected)
         );
         assert_eq!(app.overview_modal, OverviewModal::None);
-        assert!(app.reset_stats_result.is_empty());
+        assert_eq!(app.reset_stats_result, "");
         assert!(requests.try_recv().is_err());
         super::handle_key(&mut app, press(KeyCode::Char('R')), &feeds).unwrap();
         assert_eq!(app.reset_stats_targets, ["127.0.0.1:6381"]);
@@ -2876,7 +2950,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(app.overview_modal, OverviewModal::None);
-        assert!(app.reset_stats_result.is_empty());
+        assert_eq!(app.reset_stats_result, "");
     }
 
     #[test]
@@ -3139,7 +3213,7 @@ mod tests {
     fn detail_tab_shortcuts_reserve_lowercase_motion_keys() {
         for (ch, expected) in [
             ('s', Some(DetailTab::Summary)),
-            ('L', None),
+            ('L', Some(DetailTab::Clients)),
             ('i', Some(DetailTab::InfoRaw)),
             ('C', Some(DetailTab::Commandstats)),
             ('b', Some(DetailTab::Bigkeys)),
@@ -3830,7 +3904,7 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("cmd30"))
         );
-        app.active_pane_mut().filter = "cmd0".into();
+        app.active_pane_mut().filter = "'cmd0".into();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(app.active_pane().scroll.offset(), 0);
         let lines = buffer_lines(terminal.backend().buffer());

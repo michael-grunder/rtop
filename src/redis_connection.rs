@@ -11,6 +11,86 @@ use crate::model::{RuntimeSettings, Target, TargetProtocol};
 pub async fn connect(
     target: &Target,
     settings: &RuntimeSettings,
+) -> redis::RedisResult<Connection> {
+    Ok(Connection {
+        target: target.clone(),
+        settings: settings.clone(),
+        inner: Some(open(target, settings).await?),
+    })
+}
+
+/// Reopen on the next request after a transport failure. Never replay a command:
+/// the server may have executed it before the response was lost.
+pub struct Connection {
+    target: Target,
+    settings: RuntimeSettings,
+    inner: Option<redis::aio::MultiplexedConnection>,
+}
+
+impl Connection {
+    pub const fn lazy(target: Target, settings: RuntimeSettings) -> Self {
+        Self {
+            target,
+            settings,
+            inner: None,
+        }
+    }
+
+    pub fn disconnect(&mut self) {
+        self.inner = None;
+    }
+
+    async fn ready(&mut self) -> redis::RedisResult<&mut redis::aio::MultiplexedConnection> {
+        if self.inner.is_none() {
+            self.inner = Some(open(&self.target, &self.settings).await?);
+        }
+        Ok(self.inner.as_mut().expect("opened connection"))
+    }
+
+    fn check<T>(&mut self, result: &redis::RedisResult<T>) {
+        if result.as_ref().is_err_and(redis::RedisError::is_io_error) {
+            self.inner = None;
+        }
+    }
+}
+
+impl redis::aio::ConnectionLike for Connection {
+    fn req_packed_command<'a>(
+        &'a mut self,
+        cmd: &'a redis::Cmd,
+    ) -> redis::RedisFuture<'a, redis::Value> {
+        Box::pin(async move {
+            let result = self.ready().await?.req_packed_command(cmd).await;
+            self.check(&result);
+            result
+        })
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        pipe: &'a redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisFuture<'a, Vec<redis::Value>> {
+        Box::pin(async move {
+            let result = self
+                .ready()
+                .await?
+                .req_packed_commands(pipe, offset, count)
+                .await;
+            self.check(&result);
+            result
+        })
+    }
+
+    fn get_db(&self) -> i64 {
+        0
+    }
+}
+
+async fn open(
+    target: &Target,
+    settings: &RuntimeSettings,
 ) -> redis::RedisResult<redis::aio::MultiplexedConnection> {
     let mut target = target.clone();
     if let Some(store) = &settings.credential_store {

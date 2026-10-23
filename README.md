@@ -18,10 +18,10 @@
     cluster primaries; replicas and non-cluster instances leave them blank
 - Detail screen with summary (including last, maximum, and average latency in
   milliseconds plus sample count), raw `INFO`, `INFO COMMANDSTATS`, an on-demand `bigkeys`
-  view, and a timed `hotkeys` view for CPU/NET sampling, including full
+  view, a selectable `CLIENT LIST` view, and a timed `hotkeys` view for CPU/NET sampling, including full
   server-reported error details when polling fails
 - Tree, flat, and primary-only overview modes
-- Sorting by currently visible column keys and substring filtering
+- Sorting by currently visible column keys and fuzzy filtering
 - Kill picker on `K` with Redis `SHUTDOWN` and local signal options
 - Credential form on `a` for authenticating the selected server without
   restarting `rtop`
@@ -33,6 +33,49 @@
 - Config loading from TOML + CLI target merge
 - Handles per-instance failures without crashing UI
 - Surfaces richer instance states such as `PROTECTED`, `AUTH`, `LOADING`, and `DOWN`
+
+## Clients detail pane
+
+Open a server's detail view with Enter, then press `L` or use Tab to reach
+**Clients**. The pane refreshes `CLIENT LIST` at the normal polling interval;
+`r` refreshes immediately. It displays the focused server, independently of
+server selections in the overview.
+
+Default columns are ID, address, name, user, database, flags, age, idle time,
+last command, and total memory. `c`, `v`, or `F7` opens the existing column picker:
+Enter/Space toggles columns and Shift+Up/Down reorders them. Every field returned
+by the server is available, including future fields; missing values show `-`.
+Column choices and order last for this session.
+
+All `/` filters accept case-insensitive fuzzy terms (`/rds` matches `Redis`).
+Prefix a term with `'` for exact substring matching (`/'redis`), following the
+[fzf fuzzy/quoted-term convention](https://github.com/junegunn/fzf#search-syntax).
+Space-separated terms must all match. The client filter searches all fields,
+including hidden columns. It does not change the client selection.
+
+Use arrows or `j`/`k`, PgUp/PgDn, and Home/End to move the cursor. Tap Space to
+toggle the focused client's selection. The same one-column gutter as the server
+overview shows `>` for focus, `●` for selection, bold `▶` for both, and a blank
+otherwise. Hold Space for 700 ms to apply
+that selection/deselection to **all clients, including filtered-out rows**.
+Bulk selection skips this pane's connection (shown in italics, with its ID in
+`self=`). You can explicitly select that row afterward. Legacy terminals use
+auto-repeat timing for holds, just like the overview.
+
+Press `x`, `K`, or `F9` to kill every selected client, including hidden selections,
+or the focused row if none are selected. The dialog asks `Kill client <id>?`
+or `Kill <n> selected clients?`; **y** confirms, while Enter/n/Esc cancels.
+The target server and IDs are captured when the dialog opens. Results show
+success, already-disconnected clients, and individual errors. Redis permissions
+must allow `CLIENT ID`, `CLIENT LIST`, and, for killing, `CLIENT KILL`.
+[Kills use client IDs and allow explicitly selecting self](https://redis.io/docs/latest/commands/client-kill/).
+
+Connections reopen lazily after transport failures and timeouts, with the same
+authentication and timeout settings. The app remains usable after killing its
+own client or an external disconnect; the next refresh recovers. Failed commands
+are not replayed automatically because their outcome may be unknown. Interrupted
+on-demand jobs can be rerun with their existing controls. Client rows are cleared
+on refresh errors so stale data cannot be selected for a new action.
 
 ## Activity panel
 
@@ -88,7 +131,7 @@ table format.
 - `t`: cycle Tree / Flat / Primary (overview)
 - `m` / `M`: show or hide the top activity metrics panel (overview)
 - `s`: open Sort By to choose from currently visible overview columns
-- `c`: open the column picker for the overview or the active `Commandstats` pane
+- `c`: open the column picker for the overview or the active `Commandstats` or `Clients` pane
 - `p` / `P`: toggle compact layout in `Commandstats`
 - `Space`: toggle selection of the focused overview server; hold for its
   primary/replica family (700 ms), then its whole cluster (1.5 s)
@@ -103,10 +146,10 @@ table format.
 - `Esc`: clear server selections in the overview, or quit if none are selected;
   close the active overlay window, go back from detail/help, or stop filter editing
 - `h` / `l` or `Left` / `Right`: cycle detail tabs (`Tab` advances, `Shift+Tab` goes back)
-- `S` / `I` / `C` / `B` / `K`: jump to `Summary` / `Info Raw` / `Commandstats` / `Bigkeys` / `Hotkeys` in detail view
+- `S` / `I` / `C` / `B` / `K` / `L`: jump to `Summary` / `Info Raw` / `Commandstats` / `Bigkeys` / `Hotkeys` / `Clients` in detail view (use Tab from panes where the key is an action)
 - `Shift+Up/Down`: reorder columns inside the column picker
 - `o` / `O`: toggle host rendering (default auto-hides host when all targets share one host)
-- `/`: start filter input in overview, or filter the active detail pane in detail view (`Summary`, `Info Raw`, `Commandstats`, `Bigkeys`, or `Hotkeys`)
+- `/`: start filter input in overview, or filter the active detail pane in detail view (`Summary`, `Info Raw`, `Commandstats`, `Bigkeys`, `Hotkeys`, or `Clients`)
 - `C` / `N`: start CPU or NET sampling while the `Hotkeys` tab is open
 - `X`: stop active `Hotkeys` sampling early, or reset the `Hotkeys` pane back to its idle prompt
 - `r` / `R`: refresh now, confirm a statistics reset in `Commandstats`, rerun the
