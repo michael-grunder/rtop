@@ -38,8 +38,17 @@
 
 Open a server's detail view with Enter, then press `L` or use Tab to reach
 **Clients**. The pane refreshes `CLIENT LIST` at the normal polling interval;
-`r` refreshes immediately. It displays the focused server, independently of
-server selections in the overview.
+`r` refreshes immediately. Like Commandstats, it combines the Space-selected
+servers from the overview, including hidden selections, or uses the focused
+server when none are selected. With multiple servers in scope, the header
+reports the server count and an extra **Alias** column identifies each client's
+server. Labels match the overview (for example, just the port for same-host
+servers without an explicit alias). The Alias column is always shown for
+combined results and is also searchable with `/`.
+
+Client IDs are scoped to their server, so equal IDs on different servers remain
+independently selectable. Refresh failures identify the affected server and
+clear only its client rows; healthy servers' rows and selections remain usable.
 
 Default columns are ID, address, name, user, database, flags, age, idle time,
 last command, and total memory. `c`, `v`, or `F7` opens the existing column picker:
@@ -56,17 +65,20 @@ including hidden columns. It does not change the client selection.
 Use arrows or `j`/`k`, PgUp/PgDn, and Home/End to move the cursor. Tap Space to
 toggle the focused client's selection. The same one-column gutter as the server
 overview shows `>` for focus, `●` for selection, bold `▶` for both, and a blank
-otherwise. Hold Space for 700 ms to apply
-that selection/deselection to **all clients, including filtered-out rows**.
-Bulk selection skips this pane's connection (shown in italics, with its ID in
-`self=`). You can explicitly select that row afterward. Legacy terminals use
-auto-repeat timing for holds, just like the overview.
+otherwise. Hold Space for 700 ms to apply that selection/deselection to
+**all clients, including filtered-out rows**.
+Bulk selection skips this pane's connection on every server (shown in italics;
+`self=` shows its ID for a single server). You can explicitly select that row
+afterward. Legacy terminals use auto-repeat timing for holds, just like the overview.
 
 Press `x`, `K`, or `F9` to kill every selected client, including hidden selections,
 or the focused row if none are selected. The dialog asks `Kill client <id>?`
-or `Kill <n> selected clients?`; **y** confirms, while Enter/n/Esc cancels.
-The target server and IDs are captured when the dialog opens. Results show
-success, already-disconnected clients, and individual errors. Redis permissions
+or `Kill <n> selected clients?`, adding the server count for multi-server kills;
+**y** confirms, while Enter/n/Esc cancels. The target servers and IDs are captured
+when the dialog opens and listed together in the confirmation. Kills are routed
+to each client's originating server, and a failure on one server does not stop
+attempts on the others. Results show success, already-disconnected clients, and
+individual errors. Redis permissions
 must allow `CLIENT ID`, `CLIENT LIST`, and, for killing, `CLIENT KILL`.
 [Kills use client IDs and allow explicitly selecting self](https://redis.io/docs/latest/commands/client-kill/).
 
@@ -74,8 +86,8 @@ Connections reopen lazily after transport failures and timeouts, with the same
 authentication and timeout settings. The app remains usable after killing its
 own client or an external disconnect; the next refresh recovers. Failed commands
 are not replayed automatically because their outcome may be unknown. Interrupted
-on-demand jobs can be rerun with their existing controls. Client rows are cleared
-on refresh errors so stale data cannot be selected for a new action.
+on-demand jobs can be rerun with their existing controls. Affected client rows
+are cleared on refresh errors so stale data cannot be selected for a new action.
 
 ## Activity panel
 

@@ -1108,6 +1108,18 @@ impl AppState {
         Some(column.render_cell(&self.row_ctx().cell(node, &row.tree_prefix)))
     }
 
+    pub fn server_label(&self, key: &str) -> String {
+        self.render_cell(
+            &DisplayRow {
+                key: key.to_owned(),
+                tree_prefix: String::new(),
+                stale: false,
+            },
+            "alias",
+        )
+        .unwrap_or_else(|| key.to_owned())
+    }
+
     /// Winning row key per emphasized column, including transient records
     /// reached since the last call.
     pub(crate) fn take_emphasized_rows_by_column(

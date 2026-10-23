@@ -101,14 +101,18 @@ impl Feeds {
         while let Ok(update) = self.updates_rx.try_recv() {
             match update {
                 PollerUpdate::Clients { key, snapshot } => {
-                    if app.clients.target.as_ref() == Some(&key) {
+                    if app.clients.targets.contains_key(&key) {
                         let filter = app.pane(DetailTab::Clients).filter.clone();
-                        app.clients.apply(snapshot, &filter);
+                        app.clients.apply(&key, snapshot, &filter);
                     }
                 }
                 PollerUpdate::ClientsKilled { key, results } => {
-                    app.clients.result = format!(
-                        "Server: {key}\n{}",
+                    if !app.clients.result.is_empty() {
+                        app.clients.result.push_str("\n\n");
+                    }
+                    let label = app.server_label(&key);
+                    let result = format!(
+                        "Server: {label} ({key})\n{}",
                         results
                             .into_iter()
                             .map(|(id, result)| match result {
@@ -119,6 +123,7 @@ impl Feeds {
                             .collect::<Vec<_>>()
                             .join("\n")
                     );
+                    app.clients.result.push_str(&result);
                 }
                 PollerUpdate::State(state) => app.apply_update(*state),
                 PollerUpdate::Remove { key } => app.remove_instance(&key),
@@ -1011,15 +1016,16 @@ fn shrink_widths_to_fit(widths: &mut [u16], target: u16) {
 }
 
 fn draw_detail(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) {
-    let commandstats_nodes: Vec<_> = if app.detail_tab == DetailTab::Commandstats {
-        app.action_target_keys()
-            .iter()
-            .filter_map(|key| app.instances.get(key))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let Some(instance) = commandstats_nodes
+    let scope_nodes: Vec<_> =
+        if matches!(app.detail_tab, DetailTab::Commandstats | DetailTab::Clients) {
+            app.action_target_keys()
+                .iter()
+                .filter_map(|key| app.instances.get(key))
+                .collect()
+        } else {
+            Vec::new()
+        };
+    let Some(instance) = scope_nodes
         .first()
         .copied()
         .or_else(|| app.selected_instance())
@@ -1036,10 +1042,20 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) {
     let [header_area, body_area] =
         Layout::vertical([Constraint::Length(3), Constraint::Min(5)]).areas(area);
 
-    let title = if commandstats_nodes.len() > 1 {
+    let title = if scope_nodes.len() > 1 {
         format!(
-            "Commandstats totals for {} selected nodes",
-            commandstats_nodes.len()
+            "{} {} selected {}",
+            if app.detail_tab == DetailTab::Clients {
+                "Clients across"
+            } else {
+                "Commandstats totals for"
+            },
+            scope_nodes.len(),
+            if app.detail_tab == DetailTab::Clients {
+                "servers"
+            } else {
+                "nodes"
+            }
         )
     } else {
         format!(
@@ -1079,16 +1095,16 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) {
             draw_detail_text(frame, &pane, &mut scroll, &detail_text_body(instance, tab));
         }
         DetailTab::Commandstats => {
-            let stats = if commandstats_nodes.len() > 1 {
+            let stats = if scope_nodes.len() > 1 {
                 std::borrow::Cow::Owned(aggregate_commandstats(
-                    commandstats_nodes
+                    scope_nodes
                         .iter()
                         .flat_map(|node| &node.detail.commandstats),
                 ))
             } else {
                 std::borrow::Cow::Borrowed(instance.detail.commandstats.as_slice())
             };
-            draw_commandstats(frame, &pane, &mut scroll, &stats, commandstats_nodes.len());
+            draw_commandstats(frame, &pane, &mut scroll, &stats, scope_nodes.len());
         }
         DetailTab::Bigkeys => draw_bigkeys(frame, &pane, &mut scroll, &instance.detail.bigkeys),
         DetailTab::Hotkeys => draw_hotkeys(frame, &pane, &mut scroll, &instance.detail.hotkeys),

@@ -15,7 +15,7 @@ struct SpaceHold {
     // Counted ranges consume repeats but do not expand into a topology selection.
     target: Option<(String, bool)>,
     stage: u8,
-    client: Option<(String, u64, bool)>,
+    client: Option<(crate::clients::ClientKey, bool)>,
 }
 
 #[derive(Default)]
@@ -106,10 +106,9 @@ impl Navigation {
         let Some(hold) = &mut self.space_hold else {
             return;
         };
-        if let Some((target, id, selected)) = &hold.client {
+        if let Some((key, selected)) = &hold.client {
             if !app.is_detail_tab(super::DetailTab::Clients)
-                || app.clients.target.as_ref() != Some(target)
-                || !app.clients.rows.iter().any(|row| row.id == *id)
+                || !app.clients.rows.iter().any(|row| row.key() == *key)
             {
                 self.cancel_space_hold();
                 return;
@@ -173,12 +172,7 @@ impl Navigation {
         };
         if app.is_detail_tab(super::DetailTab::Clients) {
             let filter = app.pane(super::DetailTab::Clients).filter.clone();
-            if let Some(target) = app.clients.target.clone() {
-                hold.client = app
-                    .clients
-                    .toggle(&filter)
-                    .map(|(id, selected)| (target, id, selected));
-            }
+            hold.client = app.clients.toggle(&filter);
         } else if let Some(count) = count {
             app.select_server_range(&range_keys(app, count, false));
         } else if let Some((at, keys)) = recent_range
@@ -287,7 +281,7 @@ impl Navigation {
                 let rows = app.clients.visible(&filter);
                 let index = rows
                     .iter()
-                    .position(|row| Some(row.id) == app.clients.focus)
+                    .position(|row| app.clients.focus.as_ref() == Some(&row.key()))
                     .unwrap_or(0);
                 let delta = motion.row_delta(index, rows.len(), app.clients.page_len);
                 app.clients.move_focus(&filter, delta);
@@ -824,10 +818,14 @@ mod tests {
             let mut app = app();
             app.active_view = ActiveView::Detail;
             app.detail_tab = DetailTab::Clients;
-            app.clients.set_target(Some("server".into()));
+            app.clients.set_targets(std::collections::BTreeMap::from([(
+                "server".into(),
+                "server".into(),
+            )]));
             app.clients.apply(
+                "server",
                 Ok(crate::clients::ClientSnapshot {
-                    rows: crate::clients::parse_list("id=1\nid=2\nid=3").unwrap(),
+                    rows: crate::clients::parse_list("server", "id=1\nid=2\nid=3").unwrap(),
                     own_id: 3,
                 }),
                 "",
@@ -841,12 +839,27 @@ mod tests {
             } else {
                 space(&mut nav, &mut app, KeyEventKind::Repeat, now + FAMILY_HOLD);
             }
-            assert_eq!(app.clients.marked, std::collections::BTreeSet::from([1, 2]));
+            assert_eq!(
+                app.clients.marked,
+                [1, 2]
+                    .map(|id| crate::clients::ClientKey {
+                        server: "server".into(),
+                        id
+                    })
+                    .into()
+            );
             space(&mut nav, &mut app, KeyEventKind::Release, now + FAMILY_HOLD);
             space(&mut nav, &mut app, KeyEventKind::Press, now + CLUSTER_HOLD);
             app.overview_modal = OverviewModal::ClientKillConfirmation;
             nav.tick(&mut app, now + CLUSTER_HOLD + FAMILY_HOLD);
-            assert_eq!(app.clients.marked, std::collections::BTreeSet::from([2]));
+            assert_eq!(
+                app.clients.marked,
+                [2].map(|id| crate::clients::ClientKey {
+                    server: "server".into(),
+                    id
+                })
+                .into()
+            );
         }
     }
 

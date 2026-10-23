@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::future::Future;
 use std::process::Command;
@@ -37,11 +37,10 @@ const TASK_ERROR_MAX_CHARS: usize = 120;
 pub enum PollerRequest {
     RefreshAll,
     WatchClients {
-        key: Option<String>,
+        keys: Vec<String>,
     },
     KillClients {
-        key: String,
-        ids: Vec<u64>,
+        targets: BTreeMap<String, Vec<u64>>,
     },
     ResetStats {
         keys: Vec<String>,
@@ -120,7 +119,7 @@ struct Disconnected;
 type Step = Result<(), Disconnected>;
 
 struct Poller {
-    clients: Option<(String, redis_connection::Connection)>,
+    clients: HashMap<String, redis_connection::Connection>,
     settings: RuntimeSettings,
     semaphore: Arc<Semaphore>,
     targets: HashMap<String, Target>,
@@ -144,7 +143,7 @@ pub fn start(
         // A slow refresh must not trigger a burst of catch-up refreshes.
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut poller = Poller {
-            clients: None,
+            clients: HashMap::new(),
             semaphore: Arc::new(Semaphore::new(settings.concurrency_limit.max(1))),
             settings,
             targets: targets
@@ -180,11 +179,16 @@ pub fn start(
 impl Poller {
     async fn handle(&mut self, request: PollerRequest) -> Step {
         match request {
-            PollerRequest::WatchClients { key } => {
-                self.watch_clients(key);
+            PollerRequest::WatchClients { keys } => {
+                self.watch_clients(&keys);
                 self.refresh_clients().await?;
             }
-            PollerRequest::KillClients { key, ids } => self.kill_clients(key, ids).await?,
+            PollerRequest::KillClients { targets } => {
+                for (key, ids) in targets {
+                    self.kill_clients(key, ids).await?;
+                }
+                self.refresh_clients().await?;
+            }
             PollerRequest::ResetStats { keys } => self.reset_stats(&keys).await?,
             PollerRequest::RefreshAll => {
                 let targets = self.targets.values().cloned().collect();
@@ -248,18 +252,11 @@ impl Poller {
                     if let Some(target) = self.targets.get_mut(key) {
                         target.username.clone_from(&username);
                         target.password = Some(password.clone());
-                        if self
-                            .clients
-                            .as_ref()
-                            .is_some_and(|(watched, _)| watched == key)
-                        {
-                            self.clients = Some((
-                                key.clone(),
-                                redis_connection::Connection::lazy(
-                                    target.clone(),
-                                    self.settings.clone(),
-                                ),
-                            ));
+                        if let Some(conn) = self.clients.get_mut(key) {
+                            *conn = redis_connection::Connection::lazy(
+                                target.clone(),
+                                self.settings.clone(),
+                            );
                         }
                     }
                 }
@@ -277,46 +274,51 @@ impl Poller {
         Ok(())
     }
 
-    fn watch_clients(&mut self, key: Option<String>) {
-        self.clients = key.and_then(|key| {
-            self.targets.get(&key).map(|target| {
-                (
-                    key,
-                    redis_connection::Connection::lazy(target.clone(), self.settings.clone()),
-                )
-            })
-        });
+    fn watch_clients(&mut self, keys: &[String]) {
+        self.clients.retain(|key, _| keys.contains(key));
+        for key in keys {
+            if let Some(target) = self.targets.get(key) {
+                self.clients.entry(key.clone()).or_insert_with(|| {
+                    redis_connection::Connection::lazy(target.clone(), self.settings.clone())
+                });
+            }
+        }
     }
 
     async fn refresh_clients(&mut self) -> Step {
-        let Some((key, conn)) = &mut self.clients else {
-            return Ok(());
-        };
-        let response: redis::RedisResult<(u64, String)> = redis::pipe()
-            .cmd("CLIENT")
-            .arg("ID")
-            .cmd("CLIENT")
-            .arg("LIST")
-            .query_async(conn)
-            .await;
-        let snapshot = response
-            .map_err(|error| error.to_string())
-            .and_then(|(own_id, text)| {
-                crate::clients::parse_list(&text)
-                    .map(|rows| crate::clients::ClientSnapshot { rows, own_id })
-            });
-        self.update_tx
-            .send(PollerUpdate::Clients {
-                key: key.clone(),
-                snapshot,
-            })
-            .await
-            .map_err(|_| Disconnected)
+        let jobs =
+            std::mem::take(&mut self.clients)
+                .into_iter()
+                .map(|(key, mut conn)| async move {
+                    let response: redis::RedisResult<(u64, String)> = redis::pipe()
+                        .cmd("CLIENT")
+                        .arg("ID")
+                        .cmd("CLIENT")
+                        .arg("LIST")
+                        .query_async(&mut conn)
+                        .await;
+                    let snapshot =
+                        response
+                            .map_err(|error| error.to_string())
+                            .and_then(|(own_id, text)| {
+                                crate::clients::parse_list(&key, &text)
+                                    .map(|rows| crate::clients::ClientSnapshot { rows, own_id })
+                            });
+                    (key, conn, snapshot)
+                });
+        for (key, conn, snapshot) in run_limited(jobs, &self.semaphore).await {
+            self.clients.insert(key.clone(), conn);
+            self.update_tx
+                .send(PollerUpdate::Clients { key, snapshot })
+                .await
+                .map_err(|_| Disconnected)?;
+        }
+        Ok(())
     }
 
     async fn kill_clients(&mut self, key: String, mut ids: Vec<u64>) -> Step {
         let mut results = Vec::new();
-        if let Some((_, conn)) = self.clients.as_mut().filter(|(watched, _)| *watched == key) {
+        if let Some(conn) = self.clients.get_mut(&key) {
             // Execute our own kill last so earlier results are not lost on disconnect.
             let own_id = redis::cmd("CLIENT")
                 .arg("ID")
@@ -361,7 +363,7 @@ impl Poller {
             .send(PollerUpdate::ClientsKilled { key, results })
             .await
             .map_err(|_| Disconnected)?;
-        self.refresh_clients().await
+        Ok(())
     }
 
     async fn reset_stats(&mut self, keys: &[String]) -> Step {
@@ -1399,7 +1401,7 @@ mod tests {
         let (update_tx, update_rx) = tokio::sync::mpsc::channel(16);
         let (task_tx, task_rx) = tokio::sync::mpsc::channel(16);
         let poller = super::Poller {
-            clients: None,
+            clients: std::collections::HashMap::new(),
             semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             settings,
             targets: std::collections::HashMap::new(),

@@ -527,13 +527,16 @@ async fn cluster_seed_discovery_expands_to_every_cluster_node() {
     }
 }
 
-/// All destructive commands in this test target a private, password-protected server.
 #[cfg(unix)]
-#[tokio::test]
-async fn client_kills_and_lazy_reconnect_preserve_authentication() {
+async fn client_test_server(
+    path: &std::path::Path,
+) -> Option<(
+    Server,
+    Target,
+    redis::Client,
+    redis::aio::MultiplexedConnection,
+)> {
     use std::process::{Command, Stdio};
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("clients.sock");
     let child = match Command::new("redis-server")
         .args([
             "--port",
@@ -546,7 +549,7 @@ async fn client_kills_and_lazy_reconnect_preserve_authentication() {
             "test-secret",
             "--unixsocket",
         ])
-        .arg(&path)
+        .arg(path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -557,11 +560,11 @@ async fn client_kills_and_lazy_reconnect_preserve_authentication() {
                 "isolated client tests (redis-server not installed)",
                 &error.to_string(),
             );
-            return;
+            return None;
         }
         Err(error) => panic!("start test Redis: {error}"),
     };
-    let _server = Server(child);
+    let server = Server(child);
     let target = Target {
         addr: path.to_string_lossy().into_owned(),
         protocol: TargetProtocol::Unix,
@@ -571,7 +574,7 @@ async fn client_kills_and_lazy_reconnect_preserve_authentication() {
     };
     let client =
         redis::Client::open(format!("redis+unix://{}?pass=test-secret", target.addr)).unwrap();
-    let mut admin = timeout(Duration::from_secs(5), async {
+    let admin = timeout(Duration::from_secs(5), async {
         loop {
             if let Ok(conn) = client.get_multiplexed_async_connection().await {
                 break conn;
@@ -581,6 +584,18 @@ async fn client_kills_and_lazy_reconnect_preserve_authentication() {
     })
     .await
     .expect("private Redis ready");
+    Some((server, target, client, admin))
+}
+
+/// All destructive commands in this test target a private, password-protected server.
+#[cfg(unix)]
+#[tokio::test]
+async fn client_kills_and_lazy_reconnect_preserve_authentication() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("clients.sock");
+    let Some((_server, target, client, mut admin)) = client_test_server(&path).await else {
+        return;
+    };
     let mut victims = Vec::new();
     let mut victim_ids = Vec::new();
     for _ in 0..2 {
@@ -598,7 +613,7 @@ async fn client_kills_and_lazy_reconnect_preserve_authentication() {
     recv_state(&mut updates, &target.addr).await;
     requests
         .send(PollerRequest::WatchClients {
-            key: Some(target.addr.clone()),
+            keys: vec![target.addr.clone()],
         })
         .await
         .unwrap();
@@ -613,8 +628,7 @@ async fn client_kills_and_lazy_reconnect_preserve_authentication() {
     ids.extend(&victim_ids);
     requests
         .send(PollerRequest::KillClients {
-            key: target.addr.clone(),
-            ids,
+            targets: std::collections::BTreeMap::from([(target.addr.clone(), ids)]),
         })
         .await
         .unwrap();
@@ -665,8 +679,7 @@ async fn client_kills_and_lazy_reconnect_preserve_authentication() {
         .unwrap();
     requests
         .send(PollerRequest::KillClients {
-            key: target.addr.clone(),
-            ids: vec![admin_id],
+            targets: std::collections::BTreeMap::from([(target.addr.clone(), vec![admin_id])]),
         })
         .await
         .unwrap();
@@ -681,9 +694,131 @@ async fn client_kills_and_lazy_reconnect_preserve_authentication() {
         "PONG"
     );
     requests
-        .send(PollerRequest::WatchClients { key: None })
+        .send(PollerRequest::WatchClients { keys: vec![] })
         .await
         .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn aggregate_client_kills_route_colliding_ids_and_continue_after_errors() {
+    use std::collections::BTreeMap;
+    let dir = tempfile::tempdir().unwrap();
+    let Some((_a, a, client_a, mut admin_a)) = client_test_server(&dir.path().join("a.sock")).await
+    else {
+        return;
+    };
+    let Some((_b, b, client_b, mut admin_b)) = client_test_server(&dir.path().join("b.sock")).await
+    else {
+        return;
+    };
+    let mut victim_a = client_a.get_multiplexed_async_connection().await.unwrap();
+    let mut victim_b = client_b.get_multiplexed_async_connection().await.unwrap();
+    let id_a = redis::cmd("CLIENT")
+        .arg("ID")
+        .query_async::<u64>(&mut victim_a)
+        .await
+        .unwrap();
+    let id_b = redis::cmd("CLIENT")
+        .arg("ID")
+        .query_async::<u64>(&mut victim_b)
+        .await
+        .unwrap();
+    assert_eq!(
+        id_a, id_b,
+        "private servers deliberately have colliding client IDs"
+    );
+    let admin_a_id = redis::cmd("CLIENT")
+        .arg("ID")
+        .query_async::<u64>(&mut admin_a)
+        .await
+        .unwrap();
+    let (mut updates, requests) = start(vec![a.clone(), b.clone()], runtime_settings());
+    // The initial overview states may arrive in either order.
+    for _ in 0..2 {
+        assert!(matches!(
+            timeout(Duration::from_secs(5), updates.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            PollerUpdate::State(_)
+        ));
+    }
+    requests
+        .send(PollerRequest::WatchClients {
+            keys: vec![a.addr.clone(), b.addr.clone()],
+        })
+        .await
+        .unwrap();
+    let mut snapshots = BTreeMap::new();
+    for _ in 0..2 {
+        let snapshot = recv_clients(&mut updates).await.unwrap();
+        let server = snapshot.rows[0].server.clone();
+        assert!(snapshot.rows.iter().all(|row| row.server == server));
+        snapshots.insert(server, snapshot);
+    }
+    assert_eq!(snapshots.len(), 2);
+    requests
+        .send(PollerRequest::KillClients {
+            targets: BTreeMap::from([(a.addr.clone(), vec![id_a])]),
+        })
+        .await
+        .unwrap();
+    assert_eq!(recv_client_kills(&mut updates).await, vec![(id_a, Ok(1))]);
+    assert!(
+        redis::cmd("PING")
+            .query_async::<String>(&mut victim_a)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        redis::cmd("PING")
+            .query_async::<String>(&mut victim_b)
+            .await
+            .unwrap(),
+        "PONG"
+    );
+    for _ in 0..2 {
+        recv_clients(&mut updates).await.unwrap();
+    }
+    requests
+        .send(PollerRequest::KillClients {
+            targets: BTreeMap::from([
+                ("!missing".into(), vec![id_a]),
+                (a.addr.clone(), vec![admin_a_id]),
+                (b.addr.clone(), vec![id_b]),
+            ]),
+        })
+        .await
+        .unwrap();
+    assert!(recv_client_kills(&mut updates).await[0].1.is_err());
+    assert_eq!(
+        recv_client_kills(&mut updates).await,
+        vec![(admin_a_id, Ok(1))]
+    );
+    assert_eq!(recv_client_kills(&mut updates).await, vec![(id_b, Ok(1))]);
+    assert!(
+        redis::cmd("PING")
+            .query_async::<String>(&mut admin_a)
+            .await
+            .is_err()
+    );
+    assert!(
+        redis::cmd("PING")
+            .query_async::<String>(&mut victim_b)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        redis::cmd("PING")
+            .query_async::<String>(&mut admin_b)
+            .await
+            .unwrap(),
+        "PONG"
+    );
+    for _ in 0..2 {
+        recv_clients(&mut updates).await.unwrap();
+    }
 }
 
 #[cfg(unix)]

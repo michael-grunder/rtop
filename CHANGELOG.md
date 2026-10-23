@@ -2,6 +2,11 @@
 
 ### Added
 
+- Aggregate Clients across overview-selected servers, including hidden selections,
+  with a server-count header and an Alias column using overview labels. Scope
+  focus, selection, self-exclusion, and confirmed kills by server and client ID;
+  retain healthy servers' results when another server fails.
+
 - Add a Clients detail pane backed by `CLIENT LIST`, with configurable discovered
   columns, all-field filtering, stable cursor and selection gutters, and Space
   hold selection that skips self. Confirm ID-based single/batch kills, allow
