@@ -17,6 +17,7 @@ use tokio::time::timeout;
 fn runtime_settings() -> RuntimeSettings {
     RuntimeSettings {
         credential_store: None,
+        insecure_tls: Default::default(),
         refresh_interval: Duration::from_secs(60),
         connect_timeout: Duration::from_millis(300),
         command_timeout: Duration::from_secs(2),

@@ -3,6 +3,31 @@ use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
+#[test]
+fn insecure_tls_can_be_inspected_and_safely_updated() {
+    let cli = ConfigCli::new();
+    assert_eq!(cli.success(&["--config", "get", "insecure_tls"]), "false\n");
+    for value in [
+        "local",
+        "true",
+        "false",
+        "[\"localhost\", \"127.0.0.1\", \"::1\"]",
+    ] {
+        cli.success(&["--config", "set", "insecure_tls", value]);
+        let config: toml::Value = toml::from_str(&fs::read_to_string(cli.path()).unwrap()).unwrap();
+        assert!(config["global"].get("insecure_tls").is_some());
+    }
+    let before = fs::read(cli.path()).unwrap();
+    for invalid in ["all", "123", "[true]", "[\"*\"]", "[\"localhost:6379\"]"] {
+        assert!(
+            !cli.run(&["--config", "set", "insecure_tls", invalid])
+                .status
+                .success()
+        );
+        assert_eq!(fs::read(cli.path()).unwrap(), before);
+    }
+}
+
 struct ConfigCli {
     directory: TempDir,
 }

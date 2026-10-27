@@ -25,6 +25,7 @@ pub struct DiscoveryTarget {
 
 #[derive(Debug, Clone, Default)]
 struct CandidateCredentials {
+    tls: bool,
     username: Option<String>,
     password: Option<String>,
 }
@@ -38,6 +39,7 @@ struct LocalProcessInventory {
 
 impl CandidateCredentials {
     fn merge_from_target(&mut self, target: &Target) {
+        self.tls |= target.protocol == TargetProtocol::Tls;
         if self.username.is_none() {
             self.username.clone_from(&target.username);
         }
@@ -47,6 +49,9 @@ impl CandidateCredentials {
     }
 
     fn apply_to_candidate(&self, candidate: &mut CandidateEndpoint) {
+        if self.tls {
+            candidate.protocol = TargetProtocol::Tls;
+        }
         if candidate.username.is_none() {
             candidate.username.clone_from(&self.username);
         }
@@ -97,6 +102,7 @@ impl CandidateSource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CandidateEndpoint {
+    pub protocol: TargetProtocol,
     pub host: String,
     pub port: u16,
     pub source: CandidateSource,
@@ -122,7 +128,7 @@ impl CandidateEndpoint {
         Target {
             alias: None,
             addr: self.addr(),
-            protocol: TargetProtocol::Tcp,
+            protocol: self.protocol,
             username: self.username,
             password: self.password,
             tags: vec![DISCOVERY_TAG.to_string()],
@@ -131,6 +137,9 @@ impl CandidateEndpoint {
     }
 
     fn merge_from(&mut self, other: &Self) {
+        if other.protocol == TargetProtocol::Tls {
+            self.protocol = TargetProtocol::Tls;
+        }
         if self.username.is_none() {
             self.username.clone_from(&other.username);
         }
@@ -359,7 +368,7 @@ pub fn start(
     tokio::spawn(async move {
         let seed_candidates = discovery_seed_targets
             .into_iter()
-            .filter(|target| target.protocol == TargetProtocol::Tcp)
+            .filter(|target| target.protocol != TargetProtocol::Unix)
             .filter_map(candidate_from_target)
             .collect::<Vec<_>>();
 
@@ -463,6 +472,7 @@ async fn generate_candidates(target: DiscoveryTarget) -> Vec<CandidateEndpoint> 
     let mut candidates = curated_ports()
         .into_iter()
         .map(|port| CandidateEndpoint {
+            protocol: TargetProtocol::Tcp,
             host: target.host.clone(),
             port,
             source: CandidateSource::CuratedPorts,
@@ -484,6 +494,7 @@ async fn generate_candidates(target: DiscoveryTarget) -> Vec<CandidateEndpoint> 
             .flatten()
             .unwrap_or_default();
         candidates.extend(listening.into_iter().map(|port| CandidateEndpoint {
+            protocol: TargetProtocol::Tcp,
             host: target.host.clone(),
             port,
             source: CandidateSource::LocalListeningSockets,
@@ -492,6 +503,7 @@ async fn generate_candidates(target: DiscoveryTarget) -> Vec<CandidateEndpoint> 
             process_id: processes.port_to_pid.get(&port).copied(),
         }));
         candidates.extend(processes.ports.into_iter().map(|port| CandidateEndpoint {
+            protocol: TargetProtocol::Tcp,
             host: target.host.clone(),
             port,
             source: CandidateSource::LocalProcesses,
@@ -506,10 +518,10 @@ async fn generate_candidates(target: DiscoveryTarget) -> Vec<CandidateEndpoint> 
 
 #[allow(clippy::too_many_lines)]
 async fn verify_candidate(
-    candidate: CandidateEndpoint,
+    mut candidate: CandidateEndpoint,
     settings: &RuntimeSettings,
 ) -> VerificationResult {
-    let target = candidate.clone().into_target();
+    let mut target = candidate.clone().into_target();
     let mut state = InstanceState::new(target.addr.clone(), target.addr.clone());
     state.addr = target.addr.clone();
     state.tags = target.tags.clone();
@@ -536,6 +548,8 @@ async fn verify_candidate(
             };
         }
     };
+    target.protocol = conn.protocol();
+    candidate.protocol = conn.protocol();
     let latency_ms = connect_start.elapsed().as_secs_f64() * 1000.0;
 
     let mut auth_required = false;
@@ -630,7 +644,7 @@ async fn verify_candidate(
         {
             apply_cluster_shards_to_state(&mut state, &target, &shards);
             expanded_candidates.extend(
-                collect_cluster_shard_addresses(&shards)
+                collect_cluster_shard_addresses(&shards, conn.protocol() == TargetProtocol::Tls)
                     .into_iter()
                     .filter_map(|addr| {
                         candidate_from_addr(&addr, CandidateSource::ClusterPeers, &candidate)
@@ -709,6 +723,7 @@ fn candidate_from_sentinel_map(
             map.get("port")
                 .and_then(|port| port.parse::<u16>().ok())
                 .map(|port| CandidateEndpoint {
+                    protocol: seed.protocol,
                     host: host.clone(),
                     port,
                     source,
@@ -734,6 +749,7 @@ fn replication_candidates(info: &ParsedInfo, seed: &CandidateEndpoint) -> Vec<Ca
             .and_then(|port| port.parse::<u16>().ok()),
     ) {
         out.push(CandidateEndpoint {
+            protocol: seed.protocol,
             host: host.clone(),
             port,
             source: CandidateSource::ReplicationPeers,
@@ -756,6 +772,7 @@ fn replication_candidates(info: &ParsedInfo, seed: &CandidateEndpoint) -> Vec<Ca
                 }
             }
             Some(CandidateEndpoint {
+                protocol: seed.protocol,
                 host: host?,
                 port: port?,
                 source: CandidateSource::ReplicationPeers,
@@ -771,6 +788,7 @@ fn replication_candidates(info: &ParsedInfo, seed: &CandidateEndpoint) -> Vec<Ca
 
 fn candidate_from_target(target: Target) -> Option<CandidateEndpoint> {
     Some(CandidateEndpoint {
+        protocol: target.protocol,
         host: tcp_host(&target.addr)?,
         port: strip_host(&target.addr)?.parse::<u16>().ok()?,
         source: CandidateSource::SeedTarget,
@@ -786,6 +804,7 @@ fn candidate_from_addr(
     seed: &CandidateEndpoint,
 ) -> Option<CandidateEndpoint> {
     Some(CandidateEndpoint {
+        protocol: seed.protocol,
         host: tcp_host(addr)?,
         port: strip_host(addr)?.parse::<u16>().ok()?,
         source,
@@ -804,6 +823,7 @@ fn credential_map(targets: &[Target]) -> HashMap<String, CandidateCredentials> {
         out.entry(key)
             .and_modify(|existing: &mut CandidateCredentials| existing.merge_from_target(target))
             .or_insert_with(|| CandidateCredentials {
+                tls: target.protocol == TargetProtocol::Tls,
                 username: target.username.clone(),
                 password: target.password.clone(),
             });
@@ -812,7 +832,7 @@ fn credential_map(targets: &[Target]) -> HashMap<String, CandidateCredentials> {
 }
 
 fn tcp_target_key(target: &Target) -> Option<String> {
-    if target.protocol != TargetProtocol::Tcp {
+    if target.protocol == TargetProtocol::Unix {
         return None;
     }
 
@@ -1037,9 +1057,39 @@ mod tests {
     }
 
     #[test]
+    fn discovery_preserves_required_tls_for_seeds_and_peers() {
+        let target = Target {
+            alias: None,
+            addr: "localhost:18000".to_owned(),
+            protocol: TargetProtocol::Tls,
+            username: None,
+            password: None,
+            tags: Vec::new(),
+            process_id: None,
+        };
+        let seed = super::candidate_from_target(target.clone()).unwrap();
+        assert_eq!(seed.protocol, TargetProtocol::Tls);
+        let peer =
+            super::candidate_from_addr("127.0.0.1:18001", CandidateSource::ClusterPeers, &seed)
+                .unwrap();
+        assert_eq!(peer.into_target().protocol, TargetProtocol::Tls);
+        let mut plain = seed.clone();
+        plain.protocol = TargetProtocol::Tcp;
+        let mapped = credential_map(&[target]);
+        mapped[&plain.dedupe_key()].apply_to_candidate(&mut plain);
+        assert_eq!(plain.protocol, TargetProtocol::Tls);
+        plain.protocol = TargetProtocol::Tcp;
+        assert_eq!(
+            dedupe_candidates(vec![plain, seed])[0].protocol,
+            TargetProtocol::Tls
+        );
+    }
+
+    #[test]
     fn dedupe_merges_credentials_for_same_endpoint() {
         let deduped = dedupe_candidates(vec![
             CandidateEndpoint {
+                protocol: TargetProtocol::Tcp,
                 host: "127.0.0.1".to_string(),
                 port: 6379,
                 source: CandidateSource::CuratedPorts,
@@ -1048,6 +1098,7 @@ mod tests {
                 process_id: None,
             },
             CandidateEndpoint {
+                protocol: TargetProtocol::Tcp,
                 host: "127.0.0.1".to_string(),
                 port: 6379,
                 source: CandidateSource::SeedTarget,
@@ -1102,6 +1153,7 @@ mod tests {
             "# Replication\nrole:master\nslave0:ip=10.0.0.2,port=6380,state=online\nmaster_host:10.0.0.1\nmaster_port:6379\n",
         );
         let seed = CandidateEndpoint {
+            protocol: TargetProtocol::Tcp,
             host: "10.0.0.1".to_string(),
             port: 6379,
             source: CandidateSource::SeedTarget,
@@ -1117,6 +1169,7 @@ mod tests {
     #[test]
     fn discovery_status_tracks_progress() {
         let candidate = CandidateEndpoint {
+            protocol: TargetProtocol::Tcp,
             host: "127.0.0.1".to_string(),
             port: 6379,
             source: CandidateSource::CuratedPorts,

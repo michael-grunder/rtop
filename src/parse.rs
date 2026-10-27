@@ -150,14 +150,18 @@ impl ClusterShardNode {
 }
 
 pub fn parse_cluster_shards(value: &Value) -> Vec<ClusterShard> {
+    parse_cluster_shards_with_tls(value, false)
+}
+
+pub fn parse_cluster_shards_with_tls(value: &Value, tls: bool) -> Vec<ClusterShard> {
     let mut shards = Vec::new();
-    collect_cluster_shards(value, &mut shards);
+    collect_cluster_shards(value, &mut shards, tls);
     shards
 }
 
-pub fn collect_cluster_shard_addresses(value: &Value) -> BTreeSet<String> {
+pub fn collect_cluster_shard_addresses(value: &Value, tls: bool) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    for shard in parse_cluster_shards(value) {
+    for shard in parse_cluster_shards_with_tls(value, tls) {
         for node in shard.nodes {
             out.insert(node.addr);
         }
@@ -165,38 +169,38 @@ pub fn collect_cluster_shard_addresses(value: &Value) -> BTreeSet<String> {
     out
 }
 
-fn collect_cluster_shards(value: &Value, out: &mut Vec<ClusterShard>) {
-    if let Some(shard) = extract_cluster_shard(value) {
+fn collect_cluster_shards(value: &Value, out: &mut Vec<ClusterShard>, tls: bool) {
+    if let Some(shard) = extract_cluster_shard(value, tls) {
         out.push(shard);
     }
 
     match value {
         Value::Array(items) | Value::Set(items) => {
             for item in items {
-                collect_cluster_shards(item, out);
+                collect_cluster_shards(item, out, tls);
             }
         }
         Value::Map(entries) => {
             for (_, value) in entries {
-                collect_cluster_shards(value, out);
+                collect_cluster_shards(value, out, tls);
             }
         }
         Value::Attribute { data, attributes } => {
-            collect_cluster_shards(data, out);
+            collect_cluster_shards(data, out, tls);
             for (_, value) in attributes {
-                collect_cluster_shards(value, out);
+                collect_cluster_shards(value, out, tls);
             }
         }
         Value::Push { data, .. } => {
             for value in data {
-                collect_cluster_shards(value, out);
+                collect_cluster_shards(value, out, tls);
             }
         }
         _ => {}
     }
 }
 
-fn extract_cluster_shard(value: &Value) -> Option<ClusterShard> {
+fn extract_cluster_shard(value: &Value, tls: bool) -> Option<ClusterShard> {
     let mut slots = Vec::new();
     let mut nodes_value = None;
 
@@ -212,7 +216,7 @@ fn extract_cluster_shard(value: &Value) -> Option<ClusterShard> {
     }
 
     let mut nodes = Vec::new();
-    collect_cluster_shard_nodes(nodes_value?, &mut nodes);
+    collect_cluster_shard_nodes(nodes_value?, &mut nodes, tls);
     if nodes.is_empty() {
         return None;
     }
@@ -241,37 +245,37 @@ fn parse_slot_ranges(value: &Value) -> Vec<SlotRange> {
         .collect()
 }
 
-fn collect_cluster_shard_nodes(value: &Value, out: &mut Vec<ClusterShardNode>) {
-    if let Some(node) = extract_cluster_shard_node(value) {
+fn collect_cluster_shard_nodes(value: &Value, out: &mut Vec<ClusterShardNode>, tls: bool) {
+    if let Some(node) = extract_cluster_shard_node(value, tls) {
         out.push(node);
     }
     match value {
         Value::Array(items) | Value::Set(items) => {
             for item in items {
-                collect_cluster_shard_nodes(item, out);
+                collect_cluster_shard_nodes(item, out, tls);
             }
         }
         Value::Map(entries) => {
             for (_, item) in entries {
-                collect_cluster_shard_nodes(item, out);
+                collect_cluster_shard_nodes(item, out, tls);
             }
         }
         Value::Attribute { data, attributes } => {
-            collect_cluster_shard_nodes(data, out);
+            collect_cluster_shard_nodes(data, out, tls);
             for (_, item) in attributes {
-                collect_cluster_shard_nodes(item, out);
+                collect_cluster_shard_nodes(item, out, tls);
             }
         }
         Value::Push { data, .. } => {
             for item in data {
-                collect_cluster_shard_nodes(item, out);
+                collect_cluster_shard_nodes(item, out, tls);
             }
         }
         _ => {}
     }
 }
 
-fn extract_cluster_shard_node(value: &Value) -> Option<ClusterShardNode> {
+fn extract_cluster_shard_node(value: &Value, tls: bool) -> Option<ClusterShardNode> {
     let kv = kv_pairs(value)?;
     let mut node_id = None;
     let mut endpoint = None;
@@ -279,6 +283,7 @@ fn extract_cluster_shard_node(value: &Value) -> Option<ClusterShardNode> {
     let mut ip = None;
     let mut host = None;
     let mut port = None;
+    let mut tls_port = None;
     let mut role = None;
 
     for (k, v) in kv {
@@ -289,7 +294,8 @@ fn extract_cluster_shard_node(value: &Value) -> Option<ClusterShardNode> {
             "hostname" => hostname = value_to_string(v),
             "ip" => ip = value_to_string(v),
             "host" => host = value_to_string(v),
-            "port" => port = value_to_u16(v),
+            "port" => port = value_to_u16(v).filter(|port| *port != 0),
+            "tls-port" => tls_port = value_to_u16(v).filter(|port| *port != 0),
             "role" => role = value_to_string(v),
             _ => {}
         }
@@ -299,7 +305,11 @@ fn extract_cluster_shard_node(value: &Value) -> Option<ClusterShardNode> {
         .into_iter()
         .flatten()
         .find(|value| !value.is_empty() && value != "?" && value != "-")?;
-    let port = port?;
+    let port = if tls {
+        tls_port.or(port)
+    } else {
+        port.or(tls_port)
+    }?;
 
     Some(ClusterShardNode {
         node_id,
@@ -390,6 +400,35 @@ mod tests {
         collect_cluster_shard_addresses, parse_cluster_shards, parse_commandstats, parse_info,
     };
     use crate::model::SlotRange;
+
+    #[test]
+    fn cluster_nodes_use_tls_ports_when_needed() {
+        for (plain_port, tls, expected) in [
+            (None, false, 18000),
+            (Some(0), false, 18000),
+            (Some(7000), false, 7000),
+            (Some(7000), true, 18000),
+        ] {
+            let mut node = vec![
+                (
+                    Value::BulkString(b"ip".to_vec()),
+                    Value::BulkString(b"127.0.0.1".to_vec()),
+                ),
+                (Value::BulkString(b"tls-port".to_vec()), Value::Int(18000)),
+            ];
+            if let Some(port) = plain_port {
+                node.push((Value::BulkString(b"port".to_vec()), Value::Int(port)));
+            }
+            let response = Value::Array(vec![Value::Map(vec![(
+                Value::BulkString(b"nodes".to_vec()),
+                Value::Array(vec![Value::Map(node)]),
+            )])]);
+            assert_eq!(
+                collect_cluster_shard_addresses(&response, tls),
+                BTreeSet::from([format!("127.0.0.1:{expected}")])
+            );
+        }
+    }
 
     #[test]
     fn parses_info_sections_and_values() {
@@ -667,7 +706,7 @@ mod tests {
         )])]);
 
         assert_eq!(
-            collect_cluster_shard_addresses(&response)
+            collect_cluster_shard_addresses(&response, false)
                 .into_iter()
                 .collect::<Vec<_>>(),
             vec!["10.0.0.30:7005".to_string()]

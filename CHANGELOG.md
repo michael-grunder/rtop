@@ -2,6 +2,13 @@
 
 ### Added
 
+- Add automatic plaintext-to-TLS fallback for TCP connections and discovery,
+  explicit `tls://` / `rediss://` targets and TLS cluster seeds, and support for
+  cluster nodes advertising `tls-port`. Explicit TLS never falls back to plaintext.
+- Add opt-in `--insecure` and `[global].insecure_tls` (`false`, `true`, `"local"`,
+  or an exact host/IP allowlist), including config get/set support. TLS verifies
+  certificates and hostnames by default; exceptions are checked for each peer.
+
 - Aggregate Clients across overview-selected servers, including hidden selections,
   with a server-count header and an Alias column using overview labels. Scope
   focus, selection, self-exclusion, and confirmed kills by server and client ID;

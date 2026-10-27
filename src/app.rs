@@ -1417,6 +1417,7 @@ mod tests {
     fn settings() -> RuntimeSettings {
         RuntimeSettings {
             credential_store: None,
+            insecure_tls: crate::config::InsecureTls::default(),
             refresh_interval: Duration::from_secs(1),
             connect_timeout: Duration::from_millis(300),
             command_timeout: Duration::from_millis(500),

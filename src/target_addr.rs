@@ -2,6 +2,23 @@ use std::net::IpAddr;
 
 use anyhow::{Context, Result};
 
+pub fn parse_tcp_target(raw: &str) -> Result<(crate::model::TargetProtocol, String)> {
+    use crate::model::TargetProtocol;
+    let raw = raw.trim();
+    let (protocol, addr) = raw
+        .strip_prefix("tls://")
+        .or_else(|| raw.strip_prefix("rediss://"))
+        .map_or((TargetProtocol::Tcp, raw), |addr| {
+            (TargetProtocol::Tls, addr.trim_end_matches('/'))
+        });
+    let addr = normalize_tcp_addr(addr)?;
+    anyhow::ensure!(
+        !addr.is_empty() && !addr.contains(['/', '@', '?', '#']),
+        "expected HOST:PORT (optionally tls:// or rediss://); pass credentials with --user/--auth"
+    );
+    Ok((protocol, addr))
+}
+
 pub fn normalize_tcp_addr(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
     if let Some(port) = parse_port_only(trimmed)? {
@@ -134,6 +151,28 @@ fn extract_host(addr: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{canonical_host, normalize_tcp_addr, strip_host, tcp_endpoint_identity, tcp_port};
+
+    #[test]
+    fn tls_addresses_preserve_ipv6_and_cannot_embed_credentials_or_policy() {
+        use crate::model::TargetProtocol;
+        assert_eq!(
+            super::parse_tcp_target("rediss://[::1]:16379/").unwrap(),
+            (TargetProtocol::Tls, "[::1]:16379".to_owned())
+        );
+        assert_eq!(
+            super::parse_tcp_target("16379").unwrap(),
+            (TargetProtocol::Tcp, "127.0.0.1:16379".to_owned())
+        );
+        for raw in [
+            "tls://",
+            "tls://user:secret@localhost:16379",
+            "tls://localhost:16379/#insecure",
+            "tls://localhost:16379/1",
+            "tls://localhost:16379?insecure=true",
+        ] {
+            assert!(super::parse_tcp_target(raw).is_err());
+        }
+    }
 
     #[test]
     fn normalizes_port_only_targets() {

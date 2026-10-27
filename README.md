@@ -333,6 +333,47 @@ rtop --config set enabled false --target local
 For TCP targets, you can pass just a port (for example `6379`), and it is treated as
 `127.0.0.1:6379`.
 
+Bare TCP addresses try plaintext first and fall back to TLS on transport failure,
+including during autodiscovery and cluster expansion. Each attempt uses the
+configured connection timeout. Authentication errors do not trigger TLS retries.
+Use `tls://HOST:PORT` (or `rediss://HOST:PORT`) to require TLS immediately, with no
+plaintext downgrade; these work positionally and with `--tcp` or `--cluster`:
+
+```bash
+rtop tls://localhost:16379 --insecure
+rtop --cluster tls://localhost:18000 --insecure
+```
+
+TLS verifies the server certificate and hostname against system trust roots by
+default. `--insecure` disables those checks for the current session. To allow
+self-signed or mismatched certificates only on your local machine, configure:
+
+```toml
+[global]
+insecure_tls = "local"
+```
+
+`"local"` matches `localhost` (case insensitive) and loopback IP literals, including
+`127.0.0.1` and `::1`. Alternatively, use an exact host/IP allowlist:
+
+```toml
+[global]
+insecure_tls = ["localhost", "127.0.0.1", "::1", "192.168.1.10"]
+```
+
+Entries contain no ports, schemes, or wildcards; hostnames match case
+insensitively, IPs by address. Matching uses the requested host, without resolving
+DNS aliases. Each discovered peer is checked separately: allowing `localhost`
+alone does not allow a peer advertised as `127.0.0.1`; use `"local"` for both.
+`false` is the default; `true` permits insecure TLS for every host. These settings
+also apply to configured targets, which can require TLS with `protocol = "tls"`.
+For example, `rtop --config set insecure_tls local` persists the local policy.
+
+With that policy, `rtop 16379` and `rtop --cluster 18000` can automatically connect
+to local TLS servers. Insecure TLS still encrypts traffic but does not authenticate
+the server. Use an explicit TLS scheme when plaintext probing is inappropriate;
+bare addresses can authenticate over plaintext if the server accepts it.
+
 Host-only positional values such as `192.168.0.148` are treated as autodiscovery
 hosts, not fixed monitored instances. Exact TCP targets such as `6379` or
 `192.168.0.148:6380` disable autodiscovery by default and only connect to the
@@ -373,6 +414,7 @@ Important options:
 - `--no-config`
 - `-a, --auth <PASSWORD>`
 - `--user <USERNAME>`
+- `--insecure` (skip TLS certificate and hostname checks for this session)
 - `-v, --verbose`
 
 Polling defaults to **1 second**. Use `-r` / `--refresh-rate` with an explicit unit,
@@ -457,6 +499,9 @@ Run the full test suite with:
 ```bash
 cargo test
 ```
+
+The TLS transport test starts an isolated Redis server and generates a temporary
+certificate with `openssl`; it skips if either executable is unavailable.
 
 ## Git Hooks
 
@@ -570,6 +615,7 @@ sort_default = "address"
 show_activity = true
 still_autodiscover = true
 remember_auth = false
+insecure_tls = false
 
 [theme]
 background_color = "black"

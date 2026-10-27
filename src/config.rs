@@ -8,9 +8,74 @@ use serde::Deserialize;
 
 use crate::credentials::{self, CredentialStore};
 use crate::model::{RuntimeSettings, SortMode, Target, TargetProtocol, UiColor, UiTheme, ViewMode};
-use crate::target_addr::normalize_tcp_addr;
 
 pub mod command;
+
+/// Certificate verification exceptions, matched against the requested host, never DNS results.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum InsecureTls {
+    Enabled(bool),
+    Local(LocalTls),
+    Hosts(Vec<String>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LocalTls {
+    Local,
+}
+
+impl Default for InsecureTls {
+    fn default() -> Self {
+        Self::Enabled(false)
+    }
+}
+
+impl InsecureTls {
+    pub fn allows(&self, addr: &str) -> bool {
+        let Some(host) = crate::target_addr::tcp_host(addr) else {
+            return false;
+        };
+        match self {
+            Self::Enabled(enabled) => *enabled,
+            Self::Local(_) => crate::target_addr::is_loopback_host(&host),
+            Self::Hosts(hosts) => hosts.iter().any(|allowed| {
+                match (
+                    host.parse::<std::net::IpAddr>(),
+                    allowed.parse::<std::net::IpAddr>(),
+                ) {
+                    (Ok(host), Ok(allowed)) => host == allowed,
+                    _ => host.eq_ignore_ascii_case(allowed),
+                }
+            }),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let Self::Hosts(hosts) = self {
+            for host in hosts {
+                let valid = host.parse::<std::net::IpAddr>().is_ok()
+                    || (host.len() <= 253
+                        && host.split('.').all(|label| {
+                            !label.is_empty()
+                                && label.len() <= 63
+                                && !label.starts_with('-')
+                                && !label.ends_with('-')
+                                && label
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                        }));
+                if !valid {
+                    bail!(
+                        "insecure_tls entries must be hostnames or IP literals without ports, wildcards, or URL schemes"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Deserialize, Default)]
 struct FileConfig {
@@ -21,6 +86,7 @@ struct FileConfig {
 
 #[derive(Debug, Deserialize, Default)]
 struct GlobalConfig {
+    insecure_tls: Option<InsecureTls>,
     refresh_interval_ms: Option<u64>,
     connect_timeout_ms: Option<u64>,
     command_timeout_ms: Option<u64>,
@@ -59,6 +125,7 @@ struct ThemeConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeOverrides {
+    pub insecure_tls: Option<InsecureTls>,
     pub credential_store: Option<Arc<CredentialStore>>,
     pub refresh_interval_ms: Option<u64>,
     pub connect_timeout_ms: Option<u64>,
@@ -80,6 +147,7 @@ pub struct LoadedConfig {
 
 pub fn default_settings() -> RuntimeSettings {
     RuntimeSettings {
+        insecure_tls: InsecureTls::default(),
         credential_store: None,
         refresh_interval: std::time::Duration::from_secs(1),
         connect_timeout: std::time::Duration::from_millis(300),
@@ -139,7 +207,9 @@ pub fn load_config(path: Option<&Path>, no_default_config: bool) -> Result<Loade
 
             let protocol = parse_protocol(entry.protocol.as_deref(), &addr)?;
             let addr = match protocol {
-                TargetProtocol::Tcp => normalize_tcp_addr(&addr)?,
+                TargetProtocol::Tcp | TargetProtocol::Tls => {
+                    crate::target_addr::parse_tcp_target(&addr)?.1
+                }
                 TargetProtocol::Unix => addr,
             };
             let target = Target {
@@ -159,6 +229,9 @@ pub fn load_config(path: Option<&Path>, no_default_config: bool) -> Result<Loade
     }
 
     let global = parsed.global.unwrap_or_default();
+    if let Some(policy) = &global.insecure_tls {
+        policy.validate()?;
+    }
     let credential_store = if global.remember_auth.unwrap_or(false) {
         Some(Arc::new(CredentialStore::load(
             credentials::default_path()?,
@@ -169,6 +242,7 @@ pub fn load_config(path: Option<&Path>, no_default_config: bool) -> Result<Loade
     };
     Ok(LoadedConfig {
         overrides: RuntimeOverrides {
+            insecure_tls: global.insecure_tls,
             credential_store,
             refresh_interval_ms: global.refresh_interval_ms,
             connect_timeout_ms: global.connect_timeout_ms,
@@ -186,6 +260,9 @@ pub fn load_config(path: Option<&Path>, no_default_config: bool) -> Result<Loade
 }
 
 pub fn apply_overrides(mut base: RuntimeSettings, overrides: &RuntimeOverrides) -> RuntimeSettings {
+    if let Some(policy) = &overrides.insecure_tls {
+        base.insecure_tls = policy.clone();
+    }
     base.credential_store
         .clone_from(&overrides.credential_store);
     if let Some(ms) = overrides.refresh_interval_ms {
@@ -274,10 +351,24 @@ fn resolve_password(entry: &ConfigTarget, path: &Path) -> Result<Option<String>>
 }
 
 fn parse_protocol(raw: Option<&str>, addr: &str) -> Result<TargetProtocol> {
-    let proto = raw.unwrap_or_else(|| if addr.contains('/') { "unix" } else { "tcp" });
+    if (addr.starts_with("tls://") || addr.starts_with("rediss://"))
+        && raw.is_some_and(|protocol| protocol != "tls")
+    {
+        bail!("TLS address conflicts with target protocol; use protocol = \"tls\" or omit it");
+    }
+    let proto = raw.unwrap_or_else(|| {
+        if addr.starts_with("tls://") || addr.starts_with("rediss://") {
+            "tls"
+        } else if addr.contains('/') {
+            "unix"
+        } else {
+            "tcp"
+        }
+    });
 
     match proto {
         "tcp" => Ok(TargetProtocol::Tcp),
+        "tls" => Ok(TargetProtocol::Tls),
         "unix" => Ok(TargetProtocol::Unix),
         other => bail!("unsupported target protocol: {other}"),
     }
@@ -353,9 +444,88 @@ mod tests {
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
+    fn insecure_tls_policy_is_opt_in_and_scoped() {
+        use super::{FileConfig, InsecureTls};
+        assert!(!default_settings().insecure_tls.allows("localhost:16379"));
+        for (value, allowed, denied) in [
+            ("false", vec![], vec!["localhost:16379", "10.0.0.1:6379"]),
+            ("true", vec!["localhost:16379", "10.0.0.1:6379"], vec![]),
+            (
+                "\"local\"",
+                vec!["LOCALHOST:16379", "127.0.0.2:6379", "[::1]:6379"],
+                vec!["localhost.example:6379", "10.0.0.1:6379"],
+            ),
+            (
+                "[\"localhost\", \"10.0.0.1\", \"::1\"]",
+                vec!["LOCALHOST:6379", "10.0.0.1:18000", "[0:0:0:0:0:0:0:1]:6379"],
+                vec!["127.0.0.1:6379", "10.0.0.10:6379", "localhost.example:6379"],
+            ),
+        ] {
+            let parsed: FileConfig =
+                toml::from_str(&format!("[global]\ninsecure_tls = {value}")).unwrap();
+            let policy = parsed.global.unwrap().insecure_tls.unwrap();
+            policy.validate().unwrap();
+            let settings = apply_overrides(
+                default_settings(),
+                &super::RuntimeOverrides {
+                    insecure_tls: Some(policy),
+                    ..Default::default()
+                },
+            );
+            for addr in allowed {
+                assert!(settings.insecure_tls.allows(addr), "{value}: {addr}");
+            }
+            for addr in denied {
+                assert!(!settings.insecure_tls.allows(addr), "{value}: {addr}");
+            }
+        }
+        for value in ["\"all\"", "123", "[true]"] {
+            assert!(
+                toml::from_str::<FileConfig>(&format!("[global]\ninsecure_tls = {value}")).is_err()
+            );
+        }
+        for host in [
+            "",
+            "*.example.com",
+            "localhost:6379",
+            "tls://localhost",
+            "[::1]",
+            " local",
+        ] {
+            assert!(
+                InsecureTls::Hosts(vec![host.to_owned()])
+                    .validate()
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn default_settings_include_default_theme() {
         let settings = default_settings();
         assert_eq!(settings.ui_theme, UiTheme::default());
+    }
+
+    #[test]
+    fn configured_tls_targets_normalize_addresses_and_reject_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rtop.toml");
+        for (addr, protocol) in [
+            ("tls://localhost:16379", ""),
+            ("rediss://localhost:16379/", ""),
+            ("localhost:16379", "protocol = \"tls\""),
+        ] {
+            std::fs::write(&path, format!("[[targets]]\naddr = {addr:?}\n{protocol}\n")).unwrap();
+            let loaded = load_config(Some(&path), false).unwrap();
+            assert_eq!(loaded.targets[0].addr, "localhost:16379");
+            assert_eq!(loaded.targets[0].protocol, TargetProtocol::Tls);
+        }
+        std::fs::write(
+            &path,
+            "[[targets]]\naddr = \"tls://localhost:16379\"\nprotocol = \"tcp\"\n",
+        )
+        .unwrap();
+        assert!(load_config(Some(&path), false).is_err());
     }
 
     #[test]

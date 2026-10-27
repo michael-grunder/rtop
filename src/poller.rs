@@ -18,7 +18,7 @@ use crate::model::{
     BigkeyEntry, BigkeysMetrics, BigkeysScanStatus, ErrorDetails, InstanceState, InstanceType,
     KillAction, RuntimeSettings, Status, Target, TargetProtocol,
 };
-use crate::parse::{ClusterShard, parse_cluster_shards, parse_commandstats, parse_info};
+use crate::parse::{ClusterShard, parse_commandstats, parse_info};
 use crate::redis_connection;
 use crate::target_addr::{
     canonical_host, is_local_addr, is_loopback_host, strip_host, tcp_host, tcp_port,
@@ -693,7 +693,9 @@ async fn poll_one(
             .query_async::<Value>(&mut conn)
             .await
     {
-        apply_cluster_shards_to_state(&mut state, target, &shards);
+        let mut connected_target = target.clone();
+        connected_target.protocol = conn.protocol();
+        apply_cluster_shards_to_state(&mut state, &connected_target, &shards);
     }
 
     record_latency_sample(&mut state, latency_ms);
@@ -902,7 +904,7 @@ fn send_signal(
 fn target_supports_local_signal(target: &Target) -> bool {
     match target.protocol {
         TargetProtocol::Unix => true,
-        TargetProtocol::Tcp => is_local_addr(&target.addr),
+        TargetProtocol::Tcp | TargetProtocol::Tls => is_local_addr(&target.addr),
     }
 }
 
@@ -912,7 +914,7 @@ async fn resolve_local_process_id(
 ) -> Option<u32> {
     match target.protocol {
         TargetProtocol::Unix => local_process_id_for_unix_socket(&target.addr),
-        TargetProtocol::Tcp => {
+        TargetProtocol::Tcp | TargetProtocol::Tls => {
             if !is_local_addr(&target.addr) {
                 return None;
             }
@@ -932,7 +934,7 @@ async fn resolve_local_process_id(
 }
 
 fn should_try_pidfile_lookup(target: &Target) -> bool {
-    target.protocol == TargetProtocol::Tcp
+    target.protocol != TargetProtocol::Unix
         && tcp_host(&target.addr).is_some_and(|host| is_loopback_host(&host))
 }
 
@@ -1307,7 +1309,8 @@ pub(crate) fn apply_cluster_shards_to_state(
     target: &Target,
     value: &Value,
 ) {
-    let shards = parse_cluster_shards(value);
+    let shards =
+        crate::parse::parse_cluster_shards_with_tls(value, target.protocol == TargetProtocol::Tls);
     if shards.is_empty() {
         return;
     }

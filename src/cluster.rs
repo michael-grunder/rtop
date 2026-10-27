@@ -20,7 +20,7 @@ pub async fn discover_cluster_targets(
 
     for seed in seeds {
         match discover_from_seed(seed, settings).await {
-            Ok(nodes) => {
+            Ok((nodes, protocol)) => {
                 if nodes.is_empty() {
                     errors.push(format!(
                         "{}: CLUSTER SHARDS returned no node addresses",
@@ -31,7 +31,7 @@ pub async fn discover_cluster_targets(
                 discovered.extend(nodes.into_iter().map(|addr| Target {
                     alias: None,
                     addr,
-                    protocol: TargetProtocol::Tcp,
+                    protocol,
                     username: seed.username.clone(),
                     password: seed.password.clone(),
                     tags: Vec::new(),
@@ -52,8 +52,11 @@ pub async fn discover_cluster_targets(
     Ok(discovered)
 }
 
-async fn discover_from_seed(seed: &Target, settings: &RuntimeSettings) -> Result<Vec<String>> {
-    if seed.protocol != TargetProtocol::Tcp {
+async fn discover_from_seed(
+    seed: &Target,
+    settings: &RuntimeSettings,
+) -> Result<(Vec<String>, TargetProtocol)> {
+    if seed.protocol == TargetProtocol::Unix {
         bail!("cluster discovery only supports TCP seeds");
     }
 
@@ -67,6 +70,7 @@ async fn discover_from_seed(seed: &Target, settings: &RuntimeSettings) -> Result
         .await
         .with_context(|| format!("CLUSTER SHARDS failed on {}", seed.addr))?;
 
-    let out: BTreeSet<String> = collect_cluster_shard_addresses(&shards);
-    Ok(out.into_iter().collect())
+    let out: BTreeSet<String> =
+        collect_cluster_shard_addresses(&shards, conn.protocol() == TargetProtocol::Tls);
+    Ok((out.into_iter().collect(), conn.protocol()))
 }

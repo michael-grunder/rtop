@@ -12,7 +12,7 @@ use toml_edit::{DocumentMut, Item};
 use super::{
     FileConfig, GlobalConfig, default_settings, parse_protocol, parse_sort, parse_theme, parse_view,
 };
-use crate::target_addr::{normalize_tcp_addr, tcp_endpoint_identity};
+use crate::target_addr::{parse_tcp_target, tcp_endpoint_identity};
 
 const REDACTED: &str = "[redacted]";
 
@@ -83,6 +83,7 @@ fn global_defaults() -> Result<Value> {
         sort_default = "address"
         still_autodiscover = true
         remember_auth = false
+        insecure_tls = false
         leave_killed_servers = (defaults.leave_killed_servers)
         show_activity = (defaults.show_activity)
     }
@@ -94,9 +95,9 @@ fn target_index(saved: &Value, selector: &str) -> Result<usize> {
         .get("targets")
         .and_then(Value::as_array)
         .context("no targets configured")?;
-    let identity = normalize_tcp_addr(selector)
+    let identity = parse_tcp_target(selector)
         .ok()
-        .and_then(|addr| tcp_endpoint_identity(&addr));
+        .and_then(|(_, addr)| tcp_endpoint_identity(&addr));
     let matches: Vec<_> = targets
         .iter()
         .enumerate()
@@ -109,9 +110,9 @@ fn target_index(saved: &Value, selector: &str) -> Result<usize> {
                         addr == selector
                             || (entry.get("protocol").and_then(Value::as_str) != Some("unix")
                                 && identity.is_some()
-                                && normalize_tcp_addr(addr)
+                                && parse_tcp_target(addr)
                                     .ok()
-                                    .and_then(|addr| tcp_endpoint_identity(&addr))
+                                    .and_then(|(_, addr)| tcp_endpoint_identity(&addr))
                                     == identity)
                     })
         })
@@ -151,6 +152,7 @@ fn get(saved: &Value, target: Option<&str>, key: &str) -> Result<Value> {
 
 #[derive(Clone, Copy)]
 enum Kind {
+    InsecureTls,
     String,
     Boolean,
     PositiveInteger,
@@ -175,6 +177,7 @@ fn setting_kind(target: bool, key: &str) -> Result<Kind> {
         }
     } else {
         match key.strip_prefix("global.").unwrap_or(key) {
+            "insecure_tls" => Kind::InsecureTls,
             "refresh_interval_ms"
             | "connect_timeout_ms"
             | "command_timeout_ms"
@@ -191,6 +194,14 @@ fn setting_kind(target: bool, key: &str) -> Result<Kind> {
 
 fn parse_value(kind: Kind, raw: &str) -> Result<toml_edit::Value> {
     match kind {
+        Kind::InsecureTls => {
+            if raw == "local" {
+                Ok(raw.into())
+            } else {
+                raw.parse()
+                    .map_err(|_| anyhow!("expected false, true, local, or a TOML array of hosts"))
+            }
+        }
         Kind::String => Ok(raw.into()),
         Kind::Boolean => raw
             .parse::<bool>()
@@ -322,6 +333,9 @@ fn set(path: &Path, target: Option<&str>, key: &str, raw: &str) -> Result<()> {
 fn validate(document: &DocumentMut) -> Result<()> {
     let parsed: FileConfig = toml::from_str(&document.to_string())?;
     let global: GlobalConfig = parsed.global.unwrap_or_default();
+    if let Some(policy) = global.insecure_tls {
+        policy.validate()?;
+    }
     parse_view(global.view_default.as_deref())?;
     parse_sort(global.sort_default.as_deref())?;
     parse_theme(parsed.theme)?;
@@ -333,8 +347,8 @@ fn validate(document: &DocumentMut) -> Result<()> {
         if addr.trim().is_empty() {
             bail!("target requires a nonempty addr");
         }
-        if parse_protocol(target.protocol.as_deref(), addr)? == crate::model::TargetProtocol::Tcp {
-            normalize_tcp_addr(addr)?;
+        if parse_protocol(target.protocol.as_deref(), addr)? != crate::model::TargetProtocol::Unix {
+            parse_tcp_target(addr)?;
         }
     }
     Ok(())

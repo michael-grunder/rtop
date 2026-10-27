@@ -8,7 +8,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 use crate::config;
 use crate::discovery::DiscoveryTarget;
 use crate::model::{RuntimeSettings, SortMode, Target, TargetProtocol, ViewMode};
-use crate::target_addr::{normalize_tcp_addr, tcp_endpoint_identity, tcp_port};
+use crate::target_addr::{parse_tcp_target, tcp_endpoint_identity, tcp_port};
 
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -39,12 +39,14 @@ pub enum OutputMode {
 }
 
 #[derive(Debug, Parser)]
+#[allow(clippy::struct_excessive_bools)] // Independent command-line switches.
 #[command(
     name = "rtop",
     version = VERSION,
     about = "htop-like TUI for Redis/Valkey"
 )]
 struct Cli {
+    /// HOST:PORT, PORT, tls://HOST:PORT, a Unix path, or a host to discover.
     #[arg(value_name = "TARGETS")]
     targets: Vec<String>,
 
@@ -122,6 +124,10 @@ struct Cli {
     #[arg(long = "user", value_name = "USERNAME")]
     user: Option<String>,
 
+    /// Skip TLS certificate and hostname verification for this session.
+    #[arg(long)]
+    insecure: bool,
+
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
 }
@@ -158,6 +164,7 @@ pub fn launch_or_config() -> Result<Option<LaunchConfig>> {
     let args = Cli::parse();
     if let Some(action @ ("list" | "get" | "set")) = args.config_command.as_deref() {
         if args.no_config
+            || args.insecure
             || args.once
             || args.verbose
             || args.auth.is_some()
@@ -203,6 +210,9 @@ fn build_launch_config_from(mut args: Cli) -> Result<LaunchConfig> {
     let config_target_count = loaded_config.targets.len();
 
     let mut settings = config::apply_overrides(base_settings, &loaded_config.overrides);
+    if args.insecure {
+        settings.insecure_tls = config::InsecureTls::Enabled(true);
+    }
 
     if let Some(refresh) = args.refresh.as_deref() {
         settings.refresh_interval = humantime::parse_duration(refresh)?;
@@ -263,11 +273,11 @@ fn build_launch_config_from(mut args: Cli) -> Result<LaunchConfig> {
         args.tcp_targets
             .into_iter()
             .map(|raw| {
-                let addr = normalize_tcp_addr(&raw)?;
+                let (protocol, addr) = parse_tcp_target(&raw)?;
                 Ok(Target {
                     alias: None,
                     addr,
-                    protocol: TargetProtocol::Tcp,
+                    protocol,
                     username: args.user.clone(),
                     password: args.auth.clone(),
                     tags: Vec::new(),
@@ -280,11 +290,11 @@ fn build_launch_config_from(mut args: Cli) -> Result<LaunchConfig> {
         .cluster_targets
         .into_iter()
         .map(|raw| {
-            let addr = normalize_tcp_addr(&raw)?;
+            let (protocol, addr) = parse_tcp_target(&raw)?;
             Ok(Target {
                 alias: None,
                 addr,
-                protocol: TargetProtocol::Tcp,
+                protocol,
                 username: args.user.clone(),
                 password: args.auth.clone(),
                 tags: Vec::new(),
@@ -311,8 +321,6 @@ fn build_launch_config_from(mut args: Cli) -> Result<LaunchConfig> {
         }
     }
 
-    let discovery_seed_targets = dedupe_targets(parsed_cluster_seeds.clone());
-
     for mut parsed in cli_targets {
         if parsed.username.is_none() {
             parsed.username.clone_from(&args.user);
@@ -338,6 +346,7 @@ fn build_launch_config_from(mut args: Cli) -> Result<LaunchConfig> {
         }
     }
 
+    let discovery_seed_targets = dedupe_targets(parsed_cluster_seeds.clone());
     merged_targets.extend(parsed_cluster_seeds);
 
     merged_targets = dedupe_targets(merged_targets);
@@ -376,12 +385,14 @@ fn build_launch_config_from(mut args: Cli) -> Result<LaunchConfig> {
 }
 
 fn parse_target_string(raw: &str) -> Result<Target> {
-    let (protocol, addr) = if let Some(path) = raw.strip_prefix("unix:") {
+    let (protocol, addr) = if raw.starts_with("tls://") || raw.starts_with("rediss://") {
+        parse_tcp_target(raw)?
+    } else if let Some(path) = raw.strip_prefix("unix:") {
         (TargetProtocol::Unix, path.to_string())
     } else if raw.contains('/') {
         (TargetProtocol::Unix, raw.to_string())
     } else {
-        (TargetProtocol::Tcp, normalize_tcp_addr(raw)?)
+        parse_tcp_target(raw)?
     };
 
     Ok(Target {
@@ -452,10 +463,10 @@ fn parse_discovery_host(raw: &str) -> Result<Option<String>> {
 }
 
 fn dedupe_targets(input: Vec<Target>) -> Vec<Target> {
-    let mut by_key: HashMap<(String, TargetProtocol), Target> = HashMap::new();
+    let mut by_key: HashMap<(String, bool), Target> = HashMap::new();
     for target in input {
         by_key
-            .entry((target.addr.clone(), target.protocol))
+            .entry((target.addr.clone(), target.protocol == TargetProtocol::Unix))
             .and_modify(|existing| merge_target_context(existing, &target))
             .or_insert(target);
     }
@@ -471,19 +482,22 @@ fn find_matching_target<'a>(targets: &'a [Target], candidate: &Target) -> Option
 }
 
 fn same_target_endpoint(left: &Target, right: &Target) -> bool {
-    if left.protocol != right.protocol {
+    if (left.protocol == TargetProtocol::Unix) != (right.protocol == TargetProtocol::Unix) {
         return false;
     }
 
     match left.protocol {
         TargetProtocol::Unix => left.addr == right.addr,
-        TargetProtocol::Tcp => {
+        TargetProtocol::Tcp | TargetProtocol::Tls => {
             tcp_endpoint_identity(&left.addr) == tcp_endpoint_identity(&right.addr)
         }
     }
 }
 
 fn merge_target_context(target: &mut Target, known: &Target) {
+    if known.protocol == TargetProtocol::Tls {
+        target.protocol = TargetProtocol::Tls;
+    }
     if target.alias.is_none() {
         target.alias.clone_from(&known.alias);
     }
@@ -596,6 +610,38 @@ mod tests {
         let cli = super::Cli::parse_from(["rtop", "--no-config"]);
         let launch = super::build_launch_config_from(cli).unwrap();
         assert_eq!(launch.settings.refresh_interval, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn tls_targets_and_cluster_seeds_preserve_transport() {
+        use crate::model::TargetProtocol;
+        for scheme in ["tls", "rediss"] {
+            let address = format!("{scheme}://localhost:16379");
+            for option in [None, Some("--tcp"), Some("--cluster")] {
+                let mut args = vec!["rtop", "--no-config", "--insecure"];
+                args.extend(option);
+                args.push(&address);
+                let launch = super::build_launch_config_from(super::Cli::parse_from(args)).unwrap();
+                assert_eq!(launch.targets[0].addr, "localhost:16379");
+                assert_eq!(launch.targets[0].protocol, TargetProtocol::Tls);
+                assert!(launch.settings.insecure_tls.allows("localhost:16379"));
+                if option == Some("--cluster") {
+                    assert_eq!(
+                        launch.discovery_seed_targets[0].protocol,
+                        TargetProtocol::Tls
+                    );
+                }
+            }
+        }
+        let launch = super::build_launch_config_from(super::Cli::parse_from([
+            "rtop",
+            "--no-config",
+            "localhost:16379",
+            "tls://localhost:16379",
+        ]))
+        .unwrap();
+        assert_eq!(launch.targets.len(), 1);
+        assert_eq!(launch.targets[0].protocol, TargetProtocol::Tls);
     }
 
     #[test]

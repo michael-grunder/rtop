@@ -221,7 +221,7 @@ fn read_file(path: &Path) -> Result<CredentialFile> {
 
 fn endpoint_key(protocol: TargetProtocol, addr: &str) -> String {
     match protocol {
-        TargetProtocol::Tcp => format!(
+        TargetProtocol::Tcp | TargetProtocol::Tls => format!(
             "tcp:{}",
             tcp_endpoint_identity(addr).unwrap_or_else(|| addr.to_owned())
         ),

@@ -33,6 +33,12 @@ still_autodiscover = true
 # on Unix) in the user config directory's generated rtop-auth.toml.
 # This does not rewrite this config; false disables both loading and saving.
 remember_auth = false
+# Certificate/hostname verification exceptions for TLS (off by default).
+# "local" allows localhost and loopback IP literals; an array matches exact hosts:
+# insecure_tls = ["localhost", "127.0.0.1", "::1", "192.168.1.10"]
+# true allows every host. --insecure overrides this for the current session.
+# Bare TCP endpoints try plaintext then TLS; tls:// or protocol="tls" requires TLS.
+insecure_tls = false
 # Keep servers in the overview after a successful kill action.
 leave_killed_servers = false
 
@@ -51,7 +57,7 @@ critical_color = "red"
 [[targets]]
 alias = "local"                 # Optional display name.
 addr = "127.0.0.1:6379"          # Required; ":6379" or "6379" also work.
-protocol = "tcp"                # "tcp" or "unix"; inferred if omitted.
+protocol = "tcp"                # "tcp", "tls", or "unix"; inferred if omitted.
 username = "default"            # Optional ACL username; "user" is an alias.
 password_env = "REDIS_PASSWORD"  # Read password from this environment variable.
 # password = "secret"           # Alternative: never set both password sources.
@@ -62,7 +68,8 @@ enabled = false                 # Default true; false skips this target entirely
 [[targets]]
 alias = "socket"
 addr = "/run/redis/redis.sock"
-# A slash in addr implies "unix" when protocol is omitted; otherwise "tcp".
+# Without protocol, tls:// or rediss:// implies "tls", other paths imply "unix",
+# and bare TCP addresses imply "tcp" (automatic plaintext-to-TLS fallback).
 protocol = "unix"
 enabled = false
 

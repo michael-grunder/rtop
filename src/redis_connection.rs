@@ -12,10 +12,12 @@ pub async fn connect(
     target: &Target,
     settings: &RuntimeSettings,
 ) -> redis::RedisResult<Connection> {
+    let mut target = target.clone();
+    let inner = open(&mut target, settings).await?;
     Ok(Connection {
-        target: target.clone(),
+        target,
         settings: settings.clone(),
-        inner: Some(open(target, settings).await?),
+        inner: Some(inner),
     })
 }
 
@@ -40,9 +42,13 @@ impl Connection {
         self.inner = None;
     }
 
+    pub const fn protocol(&self) -> TargetProtocol {
+        self.target.protocol
+    }
+
     async fn ready(&mut self) -> redis::RedisResult<&mut redis::aio::MultiplexedConnection> {
         if self.inner.is_none() {
-            self.inner = Some(open(&self.target, &self.settings).await?);
+            self.inner = Some(open(&mut self.target, &self.settings).await?);
         }
         Ok(self.inner.as_mut().expect("opened connection"))
     }
@@ -89,25 +95,51 @@ impl redis::aio::ConnectionLike for Connection {
 }
 
 async fn open(
+    target: &mut Target,
+    settings: &RuntimeSettings,
+) -> redis::RedisResult<redis::aio::MultiplexedConnection> {
+    let mut authenticated_target = target.clone();
+    if let Some(store) = &settings.credential_store {
+        store
+            .apply(&mut authenticated_target)
+            .map_err(|error| redis::RedisError::from(std::io::Error::other(error.to_string())))?;
+    }
+    let mut connection = match open_transport(target, settings).await {
+        Err(error) if target.protocol == TargetProtocol::Tcp && error.is_io_error() => {
+            let mut tls_target = target.clone();
+            tls_target.protocol = TargetProtocol::Tls;
+            let connection = open_transport(&tls_target, settings).await?;
+            target.protocol = TargetProtocol::Tls;
+            connection
+        }
+        result => result?,
+    };
+
+    authenticated_target.protocol = target.protocol;
+    authenticate_and_remember(
+        &mut connection,
+        &authenticated_target,
+        settings.credential_store.as_ref(),
+    )
+    .await?;
+    Ok(connection)
+}
+
+async fn open_transport(
     target: &Target,
     settings: &RuntimeSettings,
 ) -> redis::RedisResult<redis::aio::MultiplexedConnection> {
-    let mut target = target.clone();
-    if let Some(store) = &settings.credential_store {
-        store
-            .apply(&mut target)
-            .map_err(|error| redis::RedisError::from(std::io::Error::other(error.to_string())))?;
+    let mut url = connection_url(target);
+    if target.protocol == TargetProtocol::Tls && settings.insecure_tls.allows(&target.addr) {
+        url.push_str("#insecure");
     }
-    let client = Client::open(connection_url(&target))?;
+    let client = Client::open(url)?;
     let config = AsyncConnectionConfig::new()
         .set_connection_timeout(Some(settings.connect_timeout))
         .set_response_timeout(Some(settings.command_timeout));
-    let mut connection = client
+    client
         .get_multiplexed_async_connection_with_config(&config)
-        .await?;
-
-    authenticate_and_remember(&mut connection, &target, settings.credential_store.as_ref()).await?;
-    Ok(connection)
+        .await
 }
 
 async fn authenticate_and_remember(
@@ -166,6 +198,7 @@ fn should_try_legacy_auth(error: &redis::RedisError) -> bool {
 fn connection_url(target: &Target) -> String {
     match target.protocol {
         TargetProtocol::Tcp => format!("redis://{}/", target.addr),
+        TargetProtocol::Tls => format!("rediss://{}/", target.addr),
         TargetProtocol::Unix => format!("redis+unix://{}", target.addr),
     }
 }
@@ -220,12 +253,180 @@ mod tests {
     #[test]
     fn connection_url_never_contains_credentials() {
         assert_eq!(
+            connection_url(&target(TargetProtocol::Tls, "[::1]:16379")),
+            "rediss://[::1]:16379/"
+        );
+        assert_eq!(
             connection_url(&target(TargetProtocol::Tcp, "127.0.0.1:6380")),
             "redis://127.0.0.1:6380/"
         );
         assert_eq!(
             connection_url(&target(TargetProtocol::Unix, "/tmp/redis.sock")),
             "redis+unix:///tmp/redis.sock"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Keep isolated server setup and transport assertions together.
+    async fn tls_fallback_verification_authentication_and_reconnect() {
+        use std::net::TcpListener;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        use crate::config::{InsecureTls, LocalTls, default_settings};
+
+        struct Server(std::process::Child);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                self.0.kill().expect("stop isolated Redis");
+                self.0.wait().expect("reap isolated Redis");
+            }
+        }
+
+        for program in ["redis-server", "openssl"] {
+            if Command::new(program)
+                .arg("--version")
+                .output()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                eprintln!("skipping TLS integration test: {program} is not installed");
+                return;
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+        let generated = Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=wrong-host.example",
+                "-keyout",
+            ])
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .output()
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let plain_socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tls_socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let plain_port = plain_socket.local_addr().unwrap().port();
+        let tls_port = tls_socket.local_addr().unwrap().port();
+        drop((plain_socket, tls_socket));
+        let _server = Server(
+            Command::new("redis-server")
+                .args([
+                    "--bind",
+                    "127.0.0.1",
+                    "--port",
+                    &plain_port.to_string(),
+                    "--tls-port",
+                    &tls_port.to_string(),
+                    "--tls-cert-file",
+                ])
+                .arg(&cert)
+                .arg("--tls-key-file")
+                .arg(&key)
+                .args(["--tls-ca-cert-file"])
+                .arg(&cert)
+                .args([
+                    "--tls-auth-clients",
+                    "no",
+                    "--requirepass",
+                    "secret:/?",
+                    "--save",
+                    "",
+                    "--appendonly",
+                    "no",
+                ])
+                .current_dir(dir.path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let mut settings = default_settings();
+        settings.connect_timeout = Duration::from_secs(1);
+        let plain = target(TargetProtocol::Tcp, &format!("127.0.0.1:{plain_port}"));
+        let mut connection = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(connection) = super::connect(&plain, &settings).await {
+                    break connection;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("isolated Redis ready");
+        assert_eq!(connection.protocol(), TargetProtocol::Tcp);
+        let mut bad_auth = plain.clone();
+        bad_auth.password = Some("wrong".to_owned());
+        let error = super::connect(&bad_auth, &settings)
+            .await
+            .err()
+            .expect("bad plaintext auth fails");
+        assert!(!error.to_string().contains("TLS"));
+        assert_eq!(
+            redis::cmd("PING")
+                .query_async::<String>(&mut connection)
+                .await
+                .unwrap(),
+            "PONG"
+        );
+        let mut tls = target(TargetProtocol::Tcp, &format!("127.0.0.1:{tls_port}"));
+        assert!(
+            super::connect(&tls, &settings).await.is_err(),
+            "self-signed certificates must be rejected by default"
+        );
+        settings.insecure_tls = InsecureTls::Hosts(vec!["localhost".to_owned()]);
+        assert!(
+            super::connect(&tls, &settings).await.is_err(),
+            "a hostname exception must not authorize other addresses"
+        );
+        settings.insecure_tls = InsecureTls::Local(LocalTls::Local);
+        let mut connection = super::connect(&tls, &settings)
+            .await
+            .expect("plaintext falls back to TLS");
+        assert_eq!(connection.protocol(), TargetProtocol::Tls);
+        connection.disconnect();
+        assert_eq!(
+            redis::cmd("PING")
+                .query_async::<String>(&mut connection)
+                .await
+                .unwrap(),
+            "PONG"
+        );
+        assert_eq!(connection.protocol(), TargetProtocol::Tls);
+        tls.protocol = TargetProtocol::Tls;
+        super::connect(&tls, &settings)
+            .await
+            .expect("explicit TLS works");
+        tls.password = Some("wrong".to_owned());
+        let error = super::connect(&tls, &settings)
+            .await
+            .err()
+            .expect("bad auth fails");
+        assert!(!error.to_string().contains("plaintext"));
+        let explicit_tls_on_plain = Target {
+            protocol: TargetProtocol::Tls,
+            ..plain
+        };
+        assert!(
+            super::connect(&explicit_tls_on_plain, &settings)
+                .await
+                .is_err(),
+            "explicit TLS must not downgrade to plaintext"
         );
     }
 

@@ -73,7 +73,10 @@ impl SortDirection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TargetProtocol {
+    /// Try plaintext first, then TLS on transport failure.
     Tcp,
+    /// Require TLS without a plaintext downgrade.
+    Tls,
     Unix,
 }
 
@@ -144,6 +147,7 @@ pub struct Target {
 
 #[derive(Debug, Clone)]
 pub struct RuntimeSettings {
+    pub insecure_tls: crate::config::InsecureTls,
     pub credential_store: Option<std::sync::Arc<crate::credentials::CredentialStore>>,
     pub refresh_interval: Duration,
     pub connect_timeout: Duration,
