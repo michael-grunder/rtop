@@ -10,12 +10,12 @@ crossterm = "0.29"
 humantime = "2.4"
 indexmap = { version = "2.14", features = ["serde"] }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
-redis = { version = "1.7", features = ["tokio-rustls-comp", "tls-rustls-insecure"] }
+redis = { version = "1.8", features = ["tokio-rustls-comp", "tls-rustls-insecure"] }
 # Select a rustls crypto provider without a system OpenSSL dependency (musl builds).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tempfile = "3.27"
 toml = { version = "1.1", features = ["preserve_order"] }
 toml_edit = "0.25"
